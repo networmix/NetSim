@@ -19,10 +19,10 @@ ResourceCapacity = Union[int, float]
 
 
 class Process:
-    def __init__(self, ctx: SimContext, coro: Coroutine):
+    def __init__(self, ctx: SimContext, coro: Coro):
         self._ctx: SimContext = ctx
         self._proc_id: ProcessID = ctx.get_next_process_id()
-        self._coro: Coroutine = coro
+        self._coro: Coro = coro
         self._subscribers: List[Process] = [self]
         self._stopped: bool = False
         self._ctx.add_process(self)
@@ -37,7 +37,7 @@ class Process:
     def start(self) -> None:
         self._set_active()
         event = next(self._coro)
-        event.set_proc_id(self)
+
         for subscriber in self._subscribers:
             event.subscribe(subscriber)
         self._ctx.add_event(event)
@@ -47,15 +47,21 @@ class Process:
             self._set_active()
             try:
                 next_event = self._coro.send(event)
-                next_event.set_proc_id(self)
-                for subscriber in self._subscribers:
-                    next_event.subscribe(subscriber)
+                if not isinstance(next_event, NoOp):
+                    for subscriber in self._subscribers:
+                        next_event.subscribe(subscriber)
                 self._ctx.add_event(next_event)
             except StopIteration:
                 self._stopped = True
 
     def subscribe(self, process: Process) -> None:
         self._subscribers.append(process)
+
+    def timeout(self, delay: SimTime) -> Timeout:
+        return Timeout(self._ctx, delay=delay, process=self)
+
+    def noop(self) -> NoOp:
+        return NoOp(self._ctx, process=self)
 
 
 class Resource:
@@ -65,17 +71,39 @@ class Resource:
         self._put_queue: List[Put] = []
         self._get_queue: List[Get] = []
 
-    def put(self) -> None:
-        heappush(self._put_queue, Put(self._ctx, self))
+    def _put_admission_check(self, event: Put):
+        raise NotImplementedError(self)
 
-    def get(self) -> None:
-        heappush(self._get_queue, Get(self._ctx, self))
+    def _get_admission_check(self, event: Get):
+        raise NotImplementedError(self)
+
+    def put(self) -> None:
+        event = Put(self._ctx, self, process=self._ctx.active_process)
+        if self._put_admission_check(event):
+            event.run()
+        else:
+            heappush(self._put_queue, event)
+
+    def get(self) -> Any:
+        event = Get(self._ctx, self, process=self._ctx.active_process)
+        if self._get_admission_check(event):
+            event.run()
+        else:
+            heappush(self._get_queue, event)
 
     def _put(self, event: Put) -> None:
-        pass
+        self._do_put(event)
+        for get_event in self._get_queue:
+            if self._get_admission_check(get_event):
+                self._get_queue.remove(get_event)
+                get_event.run()
 
     def _get(self, event: Get) -> None:
-        pass
+        self._do_get(event)
+        for put_event in self._put_queue:
+            if self._put_admission_check(put_event):
+                self._put_queue.remove(put_event)
+                put_event.run()
 
     def _do_put(self, event: Put) -> None:
         raise NotImplementedError(self)
@@ -91,12 +119,12 @@ class Event:
         time: SimTime,
         func: Optional[Callable[[Event], None]] = None,
         priority: EventPriority = 10,
-        proc_id: ProcessID = 0,
+        process: Optional[Process] = None,
     ):
         self._time: SimTime = time
         self._priority: EventPriority = priority
         self._event_id: EventID = ctx.get_next_event_id()
-        self._proc_id: ProcessID = proc_id
+        self._process: Optional[Process] = process
         self._ctx: SimContext = ctx
         self._func: Callable[[Event], None] = func
         self._callbacks: List[EventCallback] = []
@@ -115,7 +143,9 @@ class Event:
         )
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(time={self._time}, event_id={self._event_id}, proc_id={self._proc_id})"
+        type_name = type(self).__name__
+        proc_id = self._process.proc_id if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id})"
 
     @property
     def time(self) -> SimTime:
@@ -128,9 +158,6 @@ class Event:
     @property
     def event_id(self) -> EventID:
         return self._event_id
-
-    def set_proc_id(self, proc: Process) -> None:
-        self._proc_id = proc.proc_id
 
     def subscribe(self, proc: Process) -> None:
         self.add_callback(callback=proc.resume)
@@ -148,6 +175,7 @@ class Event:
 
 
 EventCallback = Callable[[Event], None]
+Coro = Coroutine[Event, Any, None]
 
 
 class Timeout(Event):
@@ -156,13 +184,29 @@ class Timeout(Event):
         ctx: SimContext,
         delay: SimTime,
         priority: EventPriority = 10,
-        proc_id: ProcessID = 0,
+        process: Optional[Process] = None,
     ):
         self._delay = delay
-        super().__init__(ctx, ctx.now + delay, priority=priority, proc_id=proc_id)
+        super().__init__(ctx, ctx.now + delay, priority=priority, process=process)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}(time={self._time}, event_id={self._event_id}, proc_id={self._proc_id}, delay={self._delay})"
+        type_name = type(self).__name__
+        proc_id = self._process.proc_id if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+
+
+class NoOp(Event):
+    def __init__(
+        self,
+        ctx: SimContext,
+        process: Optional[Process] = None,
+    ):
+        super().__init__(ctx, ctx.now, priority=255, process=process)
+
+    def __repr__(self) -> str:
+        type_name = type(self).__name__
+        proc_id = self._process.proc_id if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id})"
 
 
 class Put(Event):
@@ -170,10 +214,10 @@ class Put(Event):
         self,
         ctx: SimContext,
         resource: Resource,
+        process: Process,
         priority: EventPriority = 10,
-        proc_id: ProcessID = 0,
     ):
-        super().__init__(ctx, ctx.now, priority=priority, proc_id=proc_id)
+        super().__init__(ctx, ctx.now, priority=priority, process=process)
         self._resource = resource
         self._callbacks.append(resource._put)
 
@@ -183,10 +227,10 @@ class Get(Event):
         self,
         ctx: SimContext,
         resource: Resource,
+        process: Process,
         priority: EventPriority = 10,
-        proc_id: ProcessID = 0,
     ):
-        super().__init__(ctx, ctx.now, priority=priority, proc_id=proc_id)
+        super().__init__(ctx, ctx.now, priority=priority, process=process)
         self._resource = resource
         self._callbacks.append(resource._get)
 
@@ -194,7 +238,7 @@ class Get(Event):
 class SimContext:
     def __init__(self, start_time: SimTime = 0):
         self._cur_simtime: SimTime = start_time
-        self._cur_active_process: ProcessID = 0
+        self._cur_active_process: Union[Process, None] = None
         self._event_queue: List[Event] = []
         self._procs: Dict[ProcessID, Process] = {}
         self._resources: Dict[ResourceID, Resource] = {}
@@ -229,6 +273,10 @@ class SimContext:
     def stopped(self) -> bool:
         return self._stopped
 
+    @property
+    def active_process(self) -> Process:
+        return self._cur_active_process
+
     def get_next_event_id(self) -> EventID:
         return self._next_event_id
 
@@ -252,7 +300,7 @@ class SimContext:
     def advance_simtime(self, new_time: SimTime) -> None:
         self._cur_simtime = new_time
 
-    def create_process(self, coro: Coroutine) -> Process:
+    def create_process(self, coro: Coro) -> Process:
         proc = Process(ctx=self, coro=coro)
         self._procs[proc.proc_id] = proc
         return proc
@@ -263,14 +311,8 @@ class SimContext:
     def get_process_iter(self) -> Iterator:
         return iter(self._procs.values())
 
-    def get_active_process(self) -> Process:
-        return self._procs[self._cur_active_process]
-
     def set_active_process(self, process: Process) -> None:
-        self._cur_active_process = process.proc_id
-
-    def timeout(self, delay: SimTime) -> Timeout:
-        return Timeout(self, delay=delay, proc_id=self._cur_active_process)
+        self._cur_active_process = process
 
 
 class Simulator:

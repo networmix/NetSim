@@ -86,7 +86,7 @@ def test_simulator_5():
 
     def coro(ctx: SimContext):
         for _ in range(10):
-            yield ctx.timeout(1)
+            yield ctx.active_process.timeout(1)
 
     proc = Process(ctx, coro(ctx))
     ctx.add_process(proc)
@@ -102,11 +102,11 @@ def test_simulator_6():
 
     def coro1(ctx: SimContext):
         for _ in range(10):
-            yield ctx.timeout(1)
+            yield ctx.active_process.timeout(1)
 
     def coro2(ctx: SimContext):
         for _ in range(10):
-            yield ctx.timeout(2)
+            yield ctx.active_process.timeout(2)
 
     ctx.add_process(Process(ctx, coro1(ctx)))
     ctx.add_process(Process(ctx, coro2(ctx)))
@@ -122,11 +122,11 @@ def test_simulator_7():
 
     def coro1(ctx: SimContext):
         for _ in range(10):
-            yield ctx.timeout(1)
+            yield ctx.active_process.timeout(1)
 
     def coro2(ctx: SimContext):
         for _ in range(10):
-            yield ctx.timeout(2)
+            yield ctx.active_process.timeout(2)
 
     ctx.add_process(Process(ctx, coro1(ctx)))
     ctx.add_process(Process(ctx, coro2(ctx)))
