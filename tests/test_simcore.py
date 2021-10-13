@@ -68,7 +68,7 @@ def test_simulator_4():
         Event(ctx, 2, lambda event: "TestEvent3", priority=1),
     ]
 
-    def coro(ctx):
+    def coro(ctx: SimContext):
         for event in events:
             yield event
 
@@ -76,3 +76,61 @@ def test_simulator_4():
     ctx.add_process(proc)
 
     sim.run()
+    assert ctx.now == 2
+    assert sim.event_counter == 3
+
+
+def test_simulator_5():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    def coro(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.timeout(1)
+
+    proc = Process(ctx, coro(ctx))
+    ctx.add_process(proc)
+
+    sim.run()
+    assert ctx.now == 10
+    assert sim.event_counter == 10
+
+
+def test_simulator_6():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    def coro1(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.timeout(1)
+
+    def coro2(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.timeout(2)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    ctx.add_process(Process(ctx, coro2(ctx)))
+
+    sim.run()
+    assert ctx.now == 20
+    assert sim.event_counter == 20
+
+
+def test_simulator_7():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    def coro1(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.timeout(1)
+
+    def coro2(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.timeout(2)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    ctx.add_process(Process(ctx, coro2(ctx)))
+
+    sim.run()
+    assert ctx.now == 20
+    assert sim.event_counter == 20

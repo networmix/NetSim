@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from heapq import heappop, heappush
-from typing import Iterator, List, Union, Optional, Type, Dict, Coroutine, Callable
+from typing import Iterator, List, Union, Optional, Type, Dict, Coroutine, Callable, Any
 import logging
 
 
-LOG_FMT = "%(levelname)s %(asctime)s - %(message)s"
-logging.basicConfig(level=logging.DEBUG, format=LOG_FMT)
+LOG_FMT = "%(levelname)s - %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 # defining useful type aliases
@@ -31,7 +31,11 @@ class Process:
     def proc_id(self) -> ProcessID:
         return self._proc_id
 
+    def _set_active(self) -> None:
+        self._ctx.set_active_process(self)
+
     def start(self) -> None:
+        self._set_active()
         event = next(self._coro)
         event.set_proc_id(self)
         for subscriber in self._subscribers:
@@ -40,6 +44,7 @@ class Process:
 
     def resume(self, event: Event) -> None:
         if not self._stopped:
+            self._set_active()
             try:
                 next_event = self._coro.send(event)
                 next_event.set_proc_id(self)
@@ -54,12 +59,29 @@ class Process:
 
 
 class Resource:
-    def __init__(self, ctx: SimContext, capacity: ResourceCapacity):
+    def __init__(self, ctx: SimContext):
         self._ctx = ctx
         self._res_id: ResourceID = ctx.get_next_resource_id()
-        self._capacity = capacity
-        self._put_queue: List[Event] = []
-        self._get_queue: List[Event] = []
+        self._put_queue: List[Put] = []
+        self._get_queue: List[Get] = []
+
+    def put(self) -> None:
+        heappush(self._put_queue, Put(self._ctx, self))
+
+    def get(self) -> None:
+        heappush(self._get_queue, Get(self._ctx, self))
+
+    def _put(self, event: Put) -> None:
+        pass
+
+    def _get(self, event: Get) -> None:
+        pass
+
+    def _do_put(self, event: Put) -> None:
+        raise NotImplementedError(self)
+
+    def _do_get(self, event: Get) -> None:
+        raise NotImplementedError(self)
 
 
 class Event:
@@ -67,7 +89,7 @@ class Event:
         self,
         ctx: SimContext,
         time: SimTime,
-        func: Optional[Callable] = None,
+        func: Optional[Callable[[Event], None]] = None,
         priority: EventPriority = 10,
         proc_id: ProcessID = 0,
     ):
@@ -76,7 +98,7 @@ class Event:
         self._event_id: EventID = ctx.get_next_event_id()
         self._proc_id: ProcessID = proc_id
         self._ctx: SimContext = ctx
-        self._func: Callable = func
+        self._func: Callable[[Event], None] = func
         self._callbacks: List[EventCallback] = []
 
     def __hash__(self):
@@ -111,7 +133,10 @@ class Event:
         self._proc_id = proc.proc_id
 
     def subscribe(self, proc: Process) -> None:
-        self._callbacks.append(proc.resume)
+        self.add_callback(callback=proc.resume)
+
+    def add_callback(self, callback: EventCallback) -> None:
+        self._callbacks.append(callback)
 
     def run(self) -> None:
         logger.debug("Executing %s at %s", self, self._ctx.now)
@@ -140,10 +165,37 @@ class Timeout(Event):
         return f"{type(self).__name__}(time={self._time}, event_id={self._event_id}, proc_id={self._proc_id}, delay={self._delay})"
 
 
+class Put(Event):
+    def __init__(
+        self,
+        ctx: SimContext,
+        resource: Resource,
+        priority: EventPriority = 10,
+        proc_id: ProcessID = 0,
+    ):
+        super().__init__(ctx, ctx.now, priority=priority, proc_id=proc_id)
+        self._resource = resource
+        self._callbacks.append(resource._put)
+
+
+class Get(Event):
+    def __init__(
+        self,
+        ctx: SimContext,
+        resource: Resource,
+        priority: EventPriority = 10,
+        proc_id: ProcessID = 0,
+    ):
+        super().__init__(ctx, ctx.now, priority=priority, proc_id=proc_id)
+        self._resource = resource
+        self._callbacks.append(resource._get)
+
+
 class SimContext:
     def __init__(self, start_time: SimTime = 0):
         self._cur_simtime: SimTime = start_time
-        self._eventq: List[Event] = []
+        self._cur_active_process: ProcessID = 0
+        self._event_queue: List[Event] = []
         self._procs: Dict[ProcessID, Process] = {}
         self._resources: Dict[ResourceID, Resource] = {}
         self._stopped: bool = False
@@ -187,12 +239,12 @@ class SimContext:
         return self._next_resource_id
 
     def get_event(self) -> Union[Event, None]:
-        if self._eventq:
-            return heappop(self._eventq)
+        if self._event_queue:
+            return heappop(self._event_queue)
         return None
 
     def add_event(self, event: Event) -> None:
-        heappush(self._eventq, event)
+        heappush(self._event_queue, event)
 
     def stop(self) -> None:
         self._stopped = True
@@ -211,20 +263,33 @@ class SimContext:
     def get_process_iter(self) -> Iterator:
         return iter(self._procs.values())
 
-    def timeout(self, delay: SimTime, process: Process) -> None:
-        event = Timeout(self, delay=delay, proc_id=process.proc_id)
-        event.subscribe(process)
-        self.add_event(event)
+    def get_active_process(self) -> Process:
+        return self._procs[self._cur_active_process]
+
+    def set_active_process(self, process: Process) -> None:
+        self._cur_active_process = process.proc_id
+
+    def timeout(self, delay: SimTime) -> Timeout:
+        return Timeout(self, delay=delay, proc_id=self._cur_active_process)
 
 
 class Simulator:
     def __init__(self, ctx: Optional[SimContext] = None):
         self._ctx: SimContext = ctx if ctx is not None else SimContext()
+        self._event_counter = 0
 
-    def run(self) -> None:
+    @property
+    def event_counter(self) -> int:
+        return self._event_counter
+
+    def run(self, until_time: Optional[SimTime] = None) -> None:
         for proc in self._ctx.get_process_iter():
             proc.start()
         while (event := self._ctx.get_event()) and not self._ctx.stopped:
             logger.debug("Dequeued %s", event)
             self._ctx.advance_simtime(event.time)
+            if until_time is not None and self._ctx.now >= until_time:
+                break
+            self._event_counter += 1
             event.run()
+        logger.info("Simulation ended at %d", self._ctx.now)
