@@ -1,10 +1,9 @@
-from netsim.simcore import QueueFIFO, SimContext, SimTime, Simulator
+from netsim.simcore import SimTime
 from netsim.netsim import (
     PacketQueue,
     PacketSink,
     PacketSource,
     PacketSize,
-    Packet,
     NetSim,
 )
 

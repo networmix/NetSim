@@ -5,7 +5,6 @@ from collections import deque
 from heapq import heappop, heappush
 from typing import (
     Deque,
-    Generator,
     Iterator,
     List,
     Union,
