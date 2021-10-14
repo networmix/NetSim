@@ -6,7 +6,7 @@ from typing import Coroutine, DefaultDict, List, Optional, Union, Generator, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from netsim.simcore import Process, SimContext, SimTime, Resource, Coro
+from netsim.simcore import SimTime, Coro, Process, QueueFIFO, SimContext
 
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -106,6 +106,28 @@ class Receiver(ABC):
         raise NotImplementedError(self)
 
 
+class SenderReceiver(ABC):
+    def __init__(
+        self,
+        ctx: SimContext,
+    ):
+        self._env: SimContext = ctx
+        self._process: Process = ctx.create_process(self.run())
+        self._subscribers: List[Receiver] = []
+        self.stat: PacketStat = PacketStat(ctx)
+
+    @abstractmethod
+    def run(self) -> Coro:
+        raise NotImplementedError(self)
+
+    @abstractmethod
+    def put(self, item: Any):
+        raise NotImplementedError(self)
+
+    def subscribe(self, receiver: Receiver):
+        self._subscribers.append(receiver)
+
+
 class PacketSource(Sender):
     def __init__(
         self,
@@ -160,29 +182,33 @@ class PacketSink(Receiver):
         yield self._process.noop()
 
 
-class Queue:
-    def __init__(self, env, bw, gap=0, propagation_delay=0):
-        self.env = env
-        self.queue = Resource(env)
-        self.subscribers = []
-        self.propagation_delay = propagation_delay
-        self.arrival = {}
-        self.pkt_count = 0
-        self.bw = bw
-        self.gap = gap
-        self.process = env.process(self.run())
-        self.max_q = 0
+class PacketQueue(SenderReceiver):
+    def __init__(self, ctx: SimContext):
+        super().__init__(ctx)
+        self._queue = QueueFIFO(ctx)
 
-    def run(self):
+    def run(self) -> Coro:
         while True:
-            p = yield self.queue.get()
-            if p:
-                yield self.env.timeout((self.gap + p.size) / self.bw)
-                for subscriber in self.subscribers:
-                    subscriber.put(p)
+            packet: Packet = yield self._queue.get()
+            if packet:
+                for subscriber in self._subscribers:
+                    subscriber.put(packet)
+                self.stat.packet_sent(packet)
+                logger.debug(
+                    "Packet sent by %s_%s at %s",
+                    type(self).__name__,
+                    self._process.proc_id,
+                    self._env.now,
+                )
+            else:
+                raise RuntimeError(f"{packet}")
 
-    # def put(self, packet):
-    #     self.arrival[self.env.now + self.propagation_delay - packet.ts] = packet
-    #     self.pkt_count += 1
-    #     self.queue.put(packet)
-    #     self.max_q = max(len(self.queue.items), self.max_q)
+    def put(self, item: Packet):
+        self._queue.put(item)
+        self.stat.packet_received(item)
+        logger.debug(
+            "Packet received by %s_%s at %s",
+            type(self).__name__,
+            self._process.proc_id,
+            self._env.now,
+        )
