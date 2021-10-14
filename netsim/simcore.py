@@ -448,6 +448,10 @@ class Simulator:
     def event_counter(self) -> int:
         return self._event_counter
 
+    @property
+    def ctx(self) -> SimContext:
+        return self._ctx
+
     def run(self, until_time: Optional[SimTime] = None) -> None:
         for proc in self._ctx.get_process_iter():
             proc.start()

@@ -6,7 +6,7 @@ from typing import Coroutine, DefaultDict, List, Optional, Union, Generator, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from netsim.simcore import SimTime, Coro, Process, QueueFIFO, SimContext
+from netsim.simcore import SimTime, Coro, Process, QueueFIFO, SimContext, Simulator
 
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 # defining useful type aliases
+PacketID = int
 PacketSize = Union[int, float]
 PacketSrcDst = int
 PacketFlowID = int
@@ -54,6 +55,8 @@ class PacketStat:
 
 
 class Packet:
+    _next_packet_id: PacketID = 0
+
     def __init__(
         self,
         ctx: SimContext,
@@ -61,13 +64,21 @@ class Packet:
         flow_id: PacketFlowID = 0,
     ):
         self.ctx = ctx
+        self.packet_id, Packet._next_packet_id = (
+            Packet._next_packet_id,
+            Packet._next_packet_id + 1,
+        )
         self.flow_id = flow_id
         self.size = size
         self.timestamp = ctx.now
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        return f"{type_name}(flow_id={self.flow_id} size={self.size} timestamp={self.timestamp})"
+        return f"{type_name}(packet_id={self.packet_id}, flow_id={self.flow_id}, size={self.size}, timestamp={self.timestamp})"
+
+    @classmethod
+    def reset_packet_id(cls):
+        cls.next_packet_id: PacketID = 0
 
 
 class Sender(ABC):
@@ -212,3 +223,9 @@ class PacketQueue(SenderReceiver):
             self._process.proc_id,
             self._env.now,
         )
+
+
+class NetSim(Simulator):
+    def __init__(self):
+        super().__init__()
+        Packet.reset_packet_id()
