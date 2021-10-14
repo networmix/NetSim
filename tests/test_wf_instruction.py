@@ -1,7 +1,5 @@
-from netsim.netgraph.graph import MultiDiGraph
-
-import tests.test_data as test_data
-from netsim.netbuilder.wf_instructions import BuildGraph
+from tests import test_data
+from netsim.wf_instructions import BuildGraph
 from netsim.utils import load_resource, yaml_to_dict
 from netsim.netbuilder.builder_instructions import (
     CreateGraph,
@@ -9,7 +7,7 @@ from netsim.netbuilder.builder_instructions import (
     CreateAdjacencyMesh,
     ExecutionContext,
 )
-from netsim.netbuilder.dict_path import PathExpr, Path
+from netsim.dict_path import PathExpr, Path
 
 
 def test_buildgraph_create_instr_1():

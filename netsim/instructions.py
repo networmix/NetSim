@@ -8,7 +8,7 @@ from typing import Dict, Set, Any, List
 
 from netsim.netgraph.graph import MultiDiGraph
 
-from netsim.netbuilder.dict_path import (
+from netsim.dict_path import (
     Path,
     PathExpr,
     check_scope_level,

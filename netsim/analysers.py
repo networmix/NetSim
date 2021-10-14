@@ -3,9 +3,9 @@ from dataclasses import dataclass, field
 
 from netsim.netalgo.spf import spf
 
-from netsim.netbuilder.dict_path import Path
-from netsim.netbuilder.wf_instructions import WorkflowInstruction
-from netsim.netbuilder.instructions import ExecutionContext, DataContainer
+from netsim.dict_path import Path
+from netsim.wf_instructions import WorkflowInstruction
+from netsim.instructions import ExecutionContext, DataContainer
 
 
 ALGORITHMS = {"spf": spf}

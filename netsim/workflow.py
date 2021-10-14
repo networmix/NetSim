@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 import logging
 
-from netsim.netbuilder.wf_instructions import (
+from netsim.wf_instructions import (
     Instruction,
     ExecutionContext,
     BuildGraph,
@@ -12,7 +12,7 @@ from netsim.netbuilder.wf_instructions import (
     LogGraphLinks,
     LogContextData,
 )
-from netsim.netbuilder.analysers import ShortestPath
+from netsim.analysers import ShortestPath
 
 
 logging.basicConfig(

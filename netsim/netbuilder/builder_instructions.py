@@ -9,9 +9,9 @@ import logging
 
 from netsim.netgraph.graph import MultiDiGraph
 
-from netsim.netbuilder.dict_path import Path, PathExpr, check_scope_level
+from netsim.dict_path import Path, PathExpr, check_scope_level
 from netsim.netbuilder.filter import bool_filter
-from netsim.netbuilder.instructions import ExecutionContext, Instruction
+from netsim.instructions import ExecutionContext, Instruction
 
 
 logging.basicConfig(

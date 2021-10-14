@@ -1,5 +1,5 @@
-import tests.test_data as test_data
-from netsim.netbuilder.workflow import Workflow
+from tests import test_data
+from netsim.workflow import Workflow
 from netsim.utils import load_resource, yaml_to_dict
 
 

@@ -7,7 +7,7 @@ from netsim.netbuilder.builder_instructions import (
     CreateNodes,
     CreateAdjacencyMesh,
 )
-from netsim.netbuilder.dict_path import Path, ROOT
+from netsim.dict_path import Path, ROOT
 
 
 def test_CreateGraph1():

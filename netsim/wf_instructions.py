@@ -9,12 +9,12 @@ import json
 import jq
 from netsim.netgraph.io import graph_to_node_link
 
-from netsim.netbuilder.dict_path import (
+from netsim.dict_path import (
     Path,
     dict_to_paths,
     process_dict,
 )
-from netsim.netbuilder.instructions import Instruction, ExecutionContext
+from netsim.instructions import Instruction, ExecutionContext
 from netsim.netbuilder.builder_instructions import BUILDER_INSTRUCTIONS
 
 

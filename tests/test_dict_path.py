@@ -1,4 +1,4 @@
-from netsim.netbuilder import dict_path as path
+from netsim import dict_path as path
 
 
 def test_path_1():
