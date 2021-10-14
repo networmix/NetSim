@@ -1,0 +1,99 @@
+instructions:
+  - BuildGraph:
+      graphs:
+        3tierClos:
+          - Create:
+              name: 3tierClos
+
+      groups:
+        $graphs:
+          b1:
+            t1:
+              - Create:
+                  name_template: "{path[2]}-{path[3]}-r{node_num}"
+                  node_count: 4
+                  node_attr:
+                    role: t1
+
+            t2:
+              - Create:
+                  name_template: "{path[2]}-{path[3]}-r{node_num}"
+                  node_count: 4
+
+          b2:
+            t1:
+              - Create:
+                  name_template: "{path[2]}-{path[3]}-r{node_num}"
+                  node_count: 4
+                  node_attr:
+                    role: t1
+
+            t2:
+              - Create:
+                  name_template: "{path[2]}-{path[3]}-r{node_num}"
+                  node_count: 4
+
+          spine:
+            s1:
+              - Create:
+                  name_template: "{path[3]}-t3-r{node_num}"
+                  node_count: 4      
+
+            s2:
+              - Create:
+                  name_template: "{path[3]}-t3-r{node_num}"
+                  node_count: 4
+          
+          agg:
+            - Create:
+                name_template: "{path[2]}01-0{node_num}"
+                node_count: 2
+
+      adjacency:
+        $graphs:
+          - Mesh:
+              group_lhs: t1
+              group_rhs: t2
+              scope_level: 1
+              bidirectional: True
+              edge_attr:
+                capacity: 100000
+                metric: 1
+
+          - Ladder:
+              group_lhs: t2
+              group_rhs: spine
+              bidirectional: True
+              edge_attr:
+                capacity: 100000
+                metric: 1
+
+          - Mesh:
+              group_lhs: spine
+              group_rhs: agg
+              filter:
+                lhs_regex: s(\d+)-t3
+                lhs_transform: int
+                rhs_regex: agg\d+-(\d+)
+                rhs_transform: int
+                condition: eq
+              bidirectional: True
+              edge_attr:
+                capacity: 100000
+                metric: 1
+
+
+  - ValidateGraphJQ:
+      3tierClos:
+        - jq_expr: ".nodes | length"
+          expected: 26
+
+        - jq_expr: ".links | length"
+          expected: 176
+
+  - LogGraphNodeLink: [3tierClos]
+  - LogGraphLinks: [3tierClos]
+  - ShortestPath:
+      graphs: [3tierClos]
+      algorithm: spf
+  - LogContextData: ""

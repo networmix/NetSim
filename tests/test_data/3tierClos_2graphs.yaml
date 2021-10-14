@@ -1,0 +1,50 @@
+# In this section we are creating graphs
+graphs:
+  3tierClos:
+    - Create:
+        name: 3tierClos
+  3tierClos_CP:
+    - Create:
+        name: 3tierClos_CP
+
+# In this section we are defining node groups
+groups:
+  $graphs:
+    b[1-8]:
+      t1:
+        - Create:
+            name_template: "{path[2]}-{path[3]}-r{node_num}"
+            node_count: 4
+            node_attr:
+              role: t1
+
+      t2:
+        - Create:
+            name_template: "{path[2]}-{path[3]}-r{node_num}"
+            node_count: 4
+
+    spine:
+      s[1-2]:
+        - Create:
+            name_template: "{path[3]}-t3-r{node_num}"
+            node_count: 4      
+
+# In this section we are defining adjacencies between groups
+adjacency:
+  $graphs:
+    - Mesh:
+        group_lhs: t1
+        group_rhs: t2
+        scope_level: 1
+        bidirectional: True
+        edge_attr:
+          capacity: 100000
+          metric: 10
+
+    - Ladder:
+        group_lhs: t2
+        group_rhs: spine
+        bidirectional: True
+        edge_attr:
+          capacity: 100000
+          metric: 10

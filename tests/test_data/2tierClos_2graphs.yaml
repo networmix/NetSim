@@ -1,0 +1,29 @@
+graphs:
+  2tierClos:
+    - Create:
+        name: 2tierClos
+  2tierClos-CP:
+    - Create:
+        name: 2tierClos-CP
+
+groups:
+  $graphs:
+    t1:
+      - Create:
+          name_template: "{path[2]}-r{node_num}"
+          node_count: 4
+          node_attr:
+            role: t1
+    t2:
+      - Create:
+          name_template: "{path[2]}-r{node_num}"
+          node_count: 4
+
+adjacency:
+  $graphs:
+    - Mesh:
+        group_lhs: t1
+        group_rhs: t2
+        bidirectional: True
+        edge_attr:
+          capacity: 100000
