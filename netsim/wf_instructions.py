@@ -1,3 +1,4 @@
+# pylint: disable=c-extension-no-member
 from __future__ import annotations
 
 from collections import deque
@@ -5,8 +6,8 @@ from copy import deepcopy
 from typing import Dict, Any, List, Optional
 import logging
 import json
-
 import jq
+
 from netsim.netgraph.io import graph_to_node_link
 
 from netsim.dict_path import (

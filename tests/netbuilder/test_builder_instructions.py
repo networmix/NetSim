@@ -1,3 +1,4 @@
+# pylint: disable=protected-access,invalid-name
 from netsim.netgraph.graph import MultiDiGraph
 from netsim.netgraph.io import graph_to_node_link
 

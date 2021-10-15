@@ -1,3 +1,4 @@
+# pylint: disable=protected-access,invalid-name
 from netsim import dict_path as path
 
 
@@ -26,8 +27,6 @@ def test_path_3():
 
 
 def test_path_4():
-    path_set = set()
-
     p1 = path.Path(["b", "c"])
     p2 = path.Path(["a", "b", "c"])
 

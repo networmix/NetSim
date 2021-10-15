@@ -1,4 +1,4 @@
-import tests.test_data as test_data
+from tests import test_data
 
 from netsim.utils import load_resource, yaml_to_dict
 

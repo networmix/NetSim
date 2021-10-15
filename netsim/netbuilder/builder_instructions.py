@@ -154,9 +154,7 @@ class CreateAdjacencyLadder(BuilderInstruction):
             != 0
         ):
             raise ValueError(
-                "Can't create a ladder connection between groups of size {} and {}".format(
-                    len(nodes_lhs), len(nodes_rhs)
-                )
+                f"Can't create a ladder connection between groups of size {len(nodes_lhs)} and {len(nodes_rhs)}"
             )
 
         if len(nodes_lhs) < len(nodes_rhs):

@@ -1,3 +1,4 @@
+# pylint: disable=protected-access,invalid-name
 from tests import test_data
 from netsim.workflow import Workflow
 from netsim.utils import load_resource, yaml_to_dict
