@@ -452,6 +452,9 @@ class Simulator:
         return self._ctx
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
+        self._run(until_time)
+
+    def _run(self, until_time: Optional[SimTime] = None) -> None:
         for proc in self._ctx.get_process_iter():
             proc.start()
         while (event := self._ctx.get_event()) and not self._ctx.stopped:
