@@ -162,7 +162,7 @@ class Resource(ABC):
                 logger.debug(
                     "get_event %s passed admission at %s", get_event, self._ctx.now
                 )
-                self._increase_runtime_len(event)
+                self._decrease_runtime_len(event)
                 triggered.append(get_event)
                 get_event.add_callback(self._trigger_put)
                 self._ctx.schedule_event(get_event, self._ctx.now)
@@ -185,7 +185,7 @@ class Resource(ABC):
                 logger.debug(
                     "put_event %s passed admission at %s", put_event, self._ctx.now
                 )
-                self._decrease_runtime_len(event)
+                self._increase_runtime_len(event)
                 triggered.append(put_event)
                 put_event.add_callback(self._trigger_get)
                 self._ctx.schedule_event(put_event, self._ctx.now)
@@ -217,8 +217,8 @@ class Resource(ABC):
 
 
 class QueueFIFO(Resource):
-    def __init__(self, ctx: SimContext):
-        super().__init__(ctx)
+    def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
+        super().__init__(ctx, capacity)
         self._queue: Deque[Any] = deque()
         self._queue_runtime_len: int = 0
 
@@ -616,6 +616,10 @@ class Simulator:
     @property
     def ctx(self) -> SimContext:
         return self._ctx
+
+    @property
+    def now(self) -> SimTime:
+        return self._ctx.now
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
         self._run(until_time)

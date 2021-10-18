@@ -71,6 +71,8 @@ def test_simulator_basics_2():
     sim = Simulator()
     sim.run()
 
+    assert sim.now == 0
+
 
 def test_simulator_basics_3():
     ctx = SimContext()
@@ -86,6 +88,7 @@ def test_simulator_basics_3():
         ctx.schedule_event(event)
     sim.run()
     assert ctx.now == 2
+    assert sim.now == ctx.now
     assert sim.event_counter == 3
 
 
@@ -180,7 +183,28 @@ def test_queue_fifo_put_1():
 
     ctx.add_process(Process(ctx, coro1(ctx)))
     sim.run()
+    assert ctx.now == 10
     assert len(queue) == 10
+    assert sim.event_counter == 20
+
+
+def test_queue_fifo_put_2():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+    queue = QueueFIFO(ctx)
+    item = "test_item"
+
+    def coro1(ctx: SimContext):
+        for _ in range(10):
+            queue.put(item)
+            yield ctx.active_process.timeout(1)
+            queue.put(item)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    sim.run()
+    assert ctx.now == 10
+    assert len(queue) == 20
+    assert sim.event_counter == 30
 
 
 def test_queue_fifo_get_1():
@@ -199,4 +223,136 @@ def test_queue_fifo_get_1():
 
     ctx.add_process(Process(ctx, coro1(ctx)))
     sim.run()
+    assert ctx.now == 0
     assert len(queue) == 0
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 0
+
+
+def test_queue_fifo_get_2():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+    queue = QueueFIFO(ctx)
+    item = "test_item"
+
+    queue._queue = deque([item, item, item])
+    queue._queue_runtime_len = len(queue._queue)
+
+    def coro1(ctx: SimContext):
+        for _ in range(5):
+            ret_item = yield queue.get()
+            assert ret_item == item
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    sim.run()
+    assert ctx.now == 0
+    assert len(queue) == 0
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 1
+
+
+def test_queue_fifo_get_3():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+    queue = QueueFIFO(ctx)
+    item = "test_item"
+
+    queue._queue = deque([item, item, item])
+    queue._queue_runtime_len = len(queue._queue)
+
+    def coro1(ctx: SimContext):
+        for _ in range(5):
+            ret_item = yield queue.get()
+            assert ret_item == item
+            yield ctx.active_process.timeout(1)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    sim.run()
+    assert ctx.now == 3
+    assert len(queue) == 0
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 1
+
+
+def test_queue_fifo_1():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    queue = QueueFIFO(ctx)
+    item = "test_item"
+
+    def coro1(ctx: SimContext):
+        for _ in range(20):
+            ret_item = yield queue.get()
+            assert ret_item == item
+            yield ctx.active_process.timeout(1)
+
+    def coro2(ctx: SimContext):
+        for _ in range(10):
+            yield queue.put(item)
+            yield ctx.active_process.timeout(2)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    ctx.add_process(Process(ctx, coro2(ctx)))
+
+    sim.run()
+    assert ctx.now == 20
+    assert len(queue) == 0
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 1
+
+
+def test_queue_fifo_2():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    queue = QueueFIFO(ctx)
+    item = "test_item"
+
+    def coro1(ctx: SimContext):
+        for _ in range(10):
+            ret_item = yield queue.get()
+            assert ret_item == item
+            yield ctx.active_process.timeout(2)
+
+    def coro2(ctx: SimContext):
+        for _ in range(20):
+            yield queue.put(item)
+            yield ctx.active_process.timeout(1)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    ctx.add_process(Process(ctx, coro2(ctx)))
+
+    sim.run()
+    assert ctx.now == 20
+    assert len(queue) == 10
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 0
+
+
+def test_queue_fifo_3():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+
+    queue = QueueFIFO(ctx, capacity=2)
+    item = "test_item"
+
+    def coro1(ctx: SimContext):
+        for _ in range(5):
+            ret_item = yield queue.get()
+            assert ret_item == item
+            yield ctx.active_process.timeout(2)
+
+    def coro2(ctx: SimContext):
+        for _ in range(10):
+            yield queue.put(item)
+            yield ctx.active_process.timeout(1)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    ctx.add_process(Process(ctx, coro2(ctx)))
+
+    sim.run()
+    assert ctx.now == 10
+    assert len(queue) == 4
+    assert len(queue._put_queue) == 0
+    assert len(queue._get_queue) == 1
