@@ -197,6 +197,8 @@ class MultiDiGraph:
     def get_edges(self) -> Dict:
         """
         Get a dictionary with all edges and their attributes.
+        Edges are stored as tuples indexed by their unique ids:
+            {edge_id: (src_node, dst_node, edge_id, {**edge_attr})}
         Returns:
             A dict with all edge_ids maped into their attributes.
         """
