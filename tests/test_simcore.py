@@ -207,6 +207,24 @@ def test_queue_fifo_put_2():
     assert sim.event_counter == 30
 
 
+def test_queue_fifo_put_3():
+    ctx = SimContext()
+    sim = Simulator(ctx)
+    queue = QueueFIFO(ctx, capacity=2)
+    item = "test_item"
+
+    def coro1(ctx: SimContext):
+        for _ in range(10):
+            yield ctx.active_process.timeout(1)
+            queue.put(item)
+
+    ctx.add_process(Process(ctx, coro1(ctx)))
+    sim.run()
+    assert ctx.now == 10
+    assert len(queue) == 2
+    assert sim.event_counter == 12
+
+
 def test_queue_fifo_get_1():
     ctx = SimContext()
     sim = Simulator(ctx)
@@ -353,6 +371,6 @@ def test_queue_fifo_3():
 
     sim.run()
     assert ctx.now == 10
-    assert len(queue) == 4
-    assert len(queue._put_queue) == 0
-    assert len(queue._get_queue) == 1
+    assert len(queue) == 2
+    assert len(queue._put_queue) == 1
+    assert len(queue._get_queue) == 0

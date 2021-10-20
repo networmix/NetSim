@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 from netsim.simcore import Simulator, SimTime
 from netsim.netsim_base import (
     Packet,
+    PacketInterfaceRx,
+    PacketInterfaceTx,
     PacketSource,
     PacketSink,
     PacketQueue,
@@ -25,6 +27,8 @@ NS_TYPE_MAP: Dict[str, NetSimObject] = {
     "PacketSource": PacketSource,
     "PacketSink": PacketSink,
     "PacketQueue": PacketQueue,
+    "PacketInterfaceRx": PacketInterfaceRx,
+    "PacketInterfaceTx": PacketInterfaceTx,
 }
 
 

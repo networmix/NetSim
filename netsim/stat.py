@@ -77,11 +77,24 @@ def sample_stdev(sample: Sample) -> float:
     """
     Standard deviation of a sample:
     sigma = sqrt(sum(ai - mu)^2/(n - 1))
+
     Note: denominator is (n - 1) because we don't have a complete population.
     Dividing by n would underestimate the variability.
     Standard deviation for a complete population is called "sigma"
     """
     return statistics.stdev(sample)
+
+
+def sample_variance(sample: Sample) -> float:
+    """
+    Variance of a sample:
+    sigma^2 = sum(ai - mu)^2/(n - 1)
+
+    Note: denominator is (n - 1) because we don't have a complete population.
+    Dividing by n would underestimate the variability.
+    Variance is the square of a standard deviation and is called "sigma squared"
+    """
+    return (statistics.stdev(sample)) ** 2
 
 
 def chi_square_critical(df: int, p: float = 0.05) -> float:

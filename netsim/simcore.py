@@ -138,14 +138,6 @@ class Resource(ABC):
     def _get_admission_check(self, event: Get) -> bool:
         raise NotImplementedError(self)
 
-    @abstractmethod
-    def _increase_runtime_len(self, event: Put) -> bool:
-        raise NotImplementedError(self)
-
-    @abstractmethod
-    def _decrease_runtime_len(self, event: Get) -> bool:
-        raise NotImplementedError(self)
-
     def add_put(self, event: Put) -> None:
         self._put_queue.append(event)
         logger.debug("%s added to put_queue of %s at %s", event, self, self._ctx.now)
@@ -153,8 +145,8 @@ class Resource(ABC):
         self._trigger_put(event)
 
     def _trigger_get(self, event: Event) -> None:
+        _ = event
         logger.debug("_trigger_get on %s at %s", self, self._ctx.now)
-        triggered: List[Get] = []
 
         for _ in range(len(self._get_queue)):
             get_event = self._get_queue.popleft()
@@ -162,12 +154,10 @@ class Resource(ABC):
                 logger.debug(
                     "get_event %s passed admission at %s", get_event, self._ctx.now
                 )
-                self._decrease_runtime_len(event)
-                triggered.append(get_event)
                 get_event.add_callback(self._trigger_put)
                 self._ctx.schedule_event(get_event, self._ctx.now)
-            else:
-                self._get_queue.append(get_event)
+                break
+            self._get_queue.append(get_event)
         logger.debug("_get_queue of %s at %s: %s", self, self._ctx.now, self._get_queue)
 
     def add_get(self, event: Get) -> None:
@@ -177,20 +167,19 @@ class Resource(ABC):
         self._trigger_get(event)
 
     def _trigger_put(self, event: Event) -> None:
+        _ = event
         logger.debug("_trigger_put on %s at %s", self, self._ctx.now)
-        triggered: List[Put] = []
+
         for _ in range(len(self._put_queue)):
             put_event = self._put_queue.popleft()
             if self._put_admission_check(put_event):
                 logger.debug(
                     "put_event %s passed admission at %s", put_event, self._ctx.now
                 )
-                self._increase_runtime_len(event)
-                triggered.append(put_event)
                 put_event.add_callback(self._trigger_get)
                 self._ctx.schedule_event(put_event, self._ctx.now)
-            else:
-                self._get_queue.append(put_event)
+                break
+            self._put_queue.append(put_event)
         logger.debug("_put_queue of %s at %s: %s", self, self._ctx.now, self._put_queue)
 
     def request(self) -> Get:
@@ -220,30 +209,35 @@ class QueueFIFO(Resource):
     def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
         super().__init__(ctx, capacity)
         self._queue: Deque[Any] = deque()
-        self._queue_runtime_len: int = 0
 
     def __len__(self):
         return len(self._queue)
 
-    def _increase_runtime_len(self, event: PutQueueFIFO) -> bool:
-        self._queue_runtime_len += 1
-
-    def _decrease_runtime_len(self, event: GetQueueFIFO) -> bool:
-        self._queue_runtime_len -= 1
-
     def _put_admission_check(self, event: PutQueueFIFO) -> bool:
         if event.process.in_timeout:
+            logger.debug(
+                "put_event %s did not passed admission at %s. Process %s is in timeout",
+                event,
+                self._ctx.now,
+                event.process,
+            )
             return False
         if self._capacity is None:
             return True
-        if self._queue_runtime_len < self._capacity:
+        if len(self._queue) < self._capacity:
             return True
+        logger.debug(
+            "put_event %s did not passed admission at %s. Queue len: %s",
+            event,
+            self._ctx.now,
+            len(self._queue),
+        )
         return False
 
     def _get_admission_check(self, event: GetQueueFIFO) -> bool:
         if event.process.in_timeout:
             return False
-        if self._queue_runtime_len:
+        if self._queue:
             return True
         return False
 
@@ -259,11 +253,23 @@ class QueueFIFO(Resource):
 
     def _put_callback(self, event: PutQueueFIFO) -> None:
         self._queue.append(event.item)
-        logger.debug("%s was put into %s at %s", event.item, self, self._ctx.now)
+        logger.debug(
+            "%s was put into %s at %s. Queue len is: %s",
+            event.item,
+            self,
+            self._ctx.now,
+            len(self._queue),
+        )
 
     def _get_callback(self, event: GetQueueFIFO) -> None:
         event.item = self._queue.popleft()
-        logger.debug("%s was gotten from %s at %s", event.item, self, self._ctx.now)
+        logger.debug(
+            "%s was gotten from %s at %s. Queue len is: %s",
+            event.item,
+            self,
+            self._ctx.now,
+            len(self._queue),
+        )
 
 
 class Event:

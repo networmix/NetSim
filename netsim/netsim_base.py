@@ -193,6 +193,15 @@ class Sender(NetSimObject):
         _, _ = args, kwargs
         self._subscribers.append(receiver)
 
+    def _packet_sent(self, packet: Packet) -> None:
+        self.stat.packet_sent(packet)
+
+    def _packet_received(self, packet: Packet) -> None:
+        self.stat.packet_received(packet)
+
+    def _packet_dropped(self, packet: Packet) -> None:
+        self.stat.packet_dropped(packet)
+
 
 class Receiver(NetSimObject):
     def __init__(
@@ -205,6 +214,12 @@ class Receiver(NetSimObject):
     @abstractmethod
     def put(self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]):
         raise NotImplementedError(self)
+
+    def _packet_received(self, packet: Packet) -> None:
+        self.stat.packet_received(packet)
+
+    def _packet_dropped(self, packet: Packet) -> None:
+        self.stat.packet_dropped(packet)
 
 
 class SenderReceiver(NetSimObject):
@@ -223,6 +238,15 @@ class SenderReceiver(NetSimObject):
     def subscribe(self, receiver: Receiver, *args: List[Any], **kwargs: Dict[str, Any]):
         _, _ = args, kwargs
         self._subscribers.append(receiver)
+
+    def _packet_sent(self, packet: Packet) -> None:
+        self.stat.packet_sent(packet)
+
+    def _packet_received(self, packet: Packet) -> None:
+        self.stat.packet_received(packet)
+
+    def _packet_dropped(self, packet: Packet) -> None:
+        self.stat.packet_dropped(packet)
 
 
 class PacketSource(Sender):
@@ -254,7 +278,7 @@ class PacketSource(Sender):
             if size is None:
                 return
             packet = Packet(self._ctx, size, flow_id=flow)
-            self.stat.packet_sent(packet)
+            self._packet_sent(packet)
             logger.debug(
                 "Packet created by %s_%s at %s",
                 type(self).__name__,
@@ -267,7 +291,7 @@ class PacketSource(Sender):
 
 class PacketSink(Receiver):
     def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]):
-        self.stat.packet_received(item)
+        self._packet_received(item)
         logger.debug(
             "Packet received by %s_%s at %s",
             type(self).__name__,
@@ -280,9 +304,9 @@ class PacketSink(Receiver):
 
 
 class PacketQueue(SenderReceiver):
-    def __init__(self, ctx: SimContext):
+    def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
         super().__init__(ctx)
-        self._queue = QueueFIFO(ctx)
+        self._queue = QueueFIFO(ctx, capacity)
         self.queue_stat: PacketQueueStat = PacketQueueStat(ctx, self._queue)
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
@@ -291,8 +315,7 @@ class PacketQueue(SenderReceiver):
             if packet:
                 for subscriber in self._subscribers:
                     subscriber.put(packet)
-                self.queue_stat.packet_get(packet)
-                self.stat.packet_sent(packet)
+                self._packet_sent(packet)
                 logger.debug(
                     "Packet sent by %s_%s at %s",
                     type(self).__name__,
@@ -313,9 +336,75 @@ class PacketQueue(SenderReceiver):
             self._ctx.now,
         )
 
+    def _packet_get(self, packet: Packet) -> None:
+        self.queue_stat.packet_get(packet)
 
-class PacketInterfaceRx(Receiver):
-    pass
+    def _packet_put(self, packet: Packet) -> None:
+        self.queue_stat.packet_put(packet)
+
+    def _packet_dropped(self, packet: Packet) -> None:
+        self.queue_stat.packet_dropped(packet)
+        super()._packet_dropped(packet)
+
+
+class PacketInterfaceRx(PacketQueue):
+    def __init__(
+        self,
+        ctx: SimContext,
+        queue_len_limit: Optional[int] = None,
+        propagation_delay: Optional[SimTime] = None,
+    ):
+        super().__init__(ctx)
+        self._propagation_delay: Optional[SimTime] = propagation_delay
+        self._queue_len_limit: Optional[int] = queue_len_limit
+
+    def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
+        while True:
+            packet: Packet = yield self._queue.get()
+            if packet:
+                self._packet_get(packet)
+                for subscriber in self._subscribers:
+                    subscriber.put(packet)
+                self._packet_sent(packet)
+                logger.debug(
+                    "Packet sent by %s_%s at %s",
+                    type(self).__name__,
+                    self._process.proc_id,
+                    self._ctx.now,
+                )
+            else:
+                raise RuntimeError(
+                    f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
+                )
+
+    def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]):
+        if self._propagation_delay is not None:
+            yield self._process.timeout(self._propagation_delay)
+
+        if self._queue_admission_tail_drop(packet=item):
+            self._queue.put(item)
+            self._packet_put(item)
+            self._packet_received(item)
+            logger.debug(
+                "Packet received by %s_%s at %s",
+                type(self).__name__,
+                self._process.proc_id,
+                self._ctx.now,
+            )
+        else:
+            self._packet_dropped(item)
+            logger.debug(
+                "Packet dropped by %s_%s at %s",
+                type(self).__name__,
+                self._process.proc_id,
+                self._ctx.now,
+            )
+
+    def _queue_admission_tail_drop(self, packet: Packet):
+        _ = packet
+        if not self._queue_len_limit or len(self._queue) < self._queue_len_limit:
+            return True
+        return False
 
 
 class PacketInterfaceTx(PacketQueue):
@@ -324,7 +413,6 @@ class PacketInterfaceTx(PacketQueue):
     ):
         super().__init__(ctx)
         self._bw: InterfaceBW = bw
-        self.queue_stat = PacketQueueStat(ctx, self._queue)
         self._queue_len_limit: Optional[int] = queue_len_limit
         self._busy: bool = False
 
@@ -332,9 +420,8 @@ class PacketInterfaceTx(PacketQueue):
         while True:
             packet: Packet = yield self._queue.get()
             if packet:
-                self._awaiting_packet = False
                 self._busy = True
-                self.queue_stat.packet_get(packet)
+                self._packet_get(packet)
                 logger.debug(
                     "Packet serialization started by %s_%s at %s",
                     type(self).__name__,
@@ -344,7 +431,7 @@ class PacketInterfaceTx(PacketQueue):
                 yield self._process.timeout(packet.size * 8 / self._bw)
                 for subscriber in self._subscribers:
                     subscriber.put(packet)
-                self.stat.packet_sent(packet)
+                self._packet_sent(packet)
                 self._busy = False
                 logger.debug(
                     "Packet serialization finished by %s_%s at %s",
@@ -360,8 +447,8 @@ class PacketInterfaceTx(PacketQueue):
     def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]):
         if self._queue_admission_tail_drop(packet=item):
             self._queue.put(item)
-            self.queue_stat.packet_put(item)
-            self.stat.packet_received(item)
+            self._packet_put(item)
+            self._packet_received(item)
             logger.debug(
                 "Packet received by %s_%s at %s",
                 type(self).__name__,
@@ -369,8 +456,7 @@ class PacketInterfaceTx(PacketQueue):
                 self._ctx.now,
             )
         else:
-            self.stat.packet_dropped(item)
-            self.queue_stat.packet_dropped(item)
+            self._packet_dropped(item)
             logger.debug(
                 "Packet dropped by %s_%s at %s",
                 type(self).__name__,
