@@ -38,6 +38,9 @@ class NetSim(Simulator):
         Packet.reset_packet_id()
         self._ns: Dict[NetSimObjectName, NetSimObject] = {}
 
+    def get(self, ns_obj_name: NetSimObjectName) -> NetSimObject:
+        return self._ns[ns_obj_name]
+
     def load_graph(self, graph: MultiDiGraph):
         for node, node_attr in graph.get_nodes().items():
             ns_type = NS_TYPE_MAP[node_attr["ns_type"]]
