@@ -22,6 +22,8 @@ PacketFlowID = int
 NetSimObjectID = int
 NetSimObjectName = str
 InterfaceBW = float  # in bits per second
+RatePPS = float  # in packets per second
+RateBPS = float  # in bits per second
 
 
 @dataclass
@@ -51,24 +53,41 @@ class PacketStat:  # pylint: disable=too-many-instance-attributes
     dropped_size_hist: DefaultDict[SimTime, PacketSize] = field(
         repr=False, default_factory=lambda: defaultdict(int)
     )
+    avg_send_rate_pps: RatePPS = 0
+    avg_receive_rate_pps: RatePPS = 0
+    avg_drop_rate_pps: RatePPS = 0
+    avg_send_rate_bps: RateBPS = 0
+    avg_receive_rate_bps: RateBPS = 0
+    avg_drop_rate_bps: RateBPS = 0
 
     def packet_sent(self, packet: Packet):
         self.total_sent_pkts += 1
         self.sent_pkts_hist[self._ctx.now] += 1
         self.total_sent_bytes += packet.size
         self.sent_size_hist[self._ctx.now] += packet.size
+        self.update_avg()
 
     def packet_received(self, packet: Packet):
         self.total_received_pkts += 1
         self.received_pkts_hist[self._ctx.now] += 1
         self.total_received_bytes += packet.size
         self.received_size_hist[self._ctx.now] += packet.size
+        self.update_avg()
 
     def packet_dropped(self, packet: Packet):
         self.total_dropped_pkts += 1
         self.dropped_pkts_hist[self._ctx.now] += 1
         self.total_dropped_bytes += packet.size
         self.dropped_size_hist[self._ctx.now] += packet.size
+        self.update_avg()
+
+    def update_avg(self):
+        self.avg_send_rate_pps = self.total_sent_pkts / self._ctx.now
+        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self._ctx.now
+        self.avg_receive_rate_pps = self.total_received_pkts / self._ctx.now
+        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self._ctx.now
+        self.avg_drop_rate_pps = self.total_dropped_pkts / self._ctx.now
+        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self._ctx.now
 
 
 @dataclass

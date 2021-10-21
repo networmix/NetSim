@@ -1,6 +1,8 @@
+# pylint: disable=too-many-instance-attributes
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from enum import IntEnum
 from collections import deque
 from heapq import heappop, heappush
@@ -29,6 +31,7 @@ EventID = int
 ProcessID = int
 ResourceID = int
 ResourceCapacity = Union[int, float]
+StatCallback = Callable[[None], None]
 
 
 class EventStatus(IntEnum):
@@ -48,6 +51,107 @@ class EventStatus(IntEnum):
     PROCESSED = 5
 
 
+@dataclass
+class ProcessStat:
+    _ctx: SimContext = field(repr=False)
+    prev_timestamp: SimTime = 0
+    cur_timestamp: SimTime = 0
+    event_count: int = 0
+    avg_event_rate: float = 0
+
+    def _update_timestamp(self) -> None:
+        if self._ctx.now != self.cur_timestamp:
+            self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
+
+    def event_generated(self, event: Event) -> None:
+        _ = event
+        self.event_count += 1
+
+    def _update_avg(self) -> None:
+        self.avg_event_rate = self.event_count / self.cur_timestamp
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+        self._update_avg()
+
+
+@dataclass
+class ResourceStat:
+    _ctx: SimContext = field(repr=False)
+    prev_timestamp: SimTime = 0
+    cur_timestamp: SimTime = 0
+
+    put_requested_count: int = 0
+    get_requested_count: int = 0
+    put_processed_count: int = 0
+    get_processed_count: int = 0
+
+    avg_put_requested_rate: float = 0
+    avg_get_requested_rate: float = 0
+    avg_put_processed_rate: float = 0
+    avg_get_processed_rate: float = 0
+
+    def _update_timestamp(self) -> None:
+        if self._ctx.now != self.cur_timestamp:
+            self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
+
+    def put_requested(self, put_event: Put) -> None:
+        _ = put_event
+        self.put_requested_count += 1
+
+    def get_requested(self, get_event: Get) -> None:
+        _ = get_event
+        self.get_requested_count += 1
+
+    def put_processed(self, put_event: Put) -> None:
+        _ = put_event
+        self.put_processed_count += 1
+
+    def get_processed(self, get_event: Get) -> None:
+        _ = get_event
+        self.get_processed_count += 1
+
+    def _update_avg(self) -> None:
+        self.avg_put_requested_rate = self.put_requested_count / self.cur_timestamp
+        self.avg_get_requested_rate = self.get_requested_count / self.cur_timestamp
+        self.avg_put_processed_rate = self.put_processed_count / self.cur_timestamp
+        self.avg_get_processed_rate = self.get_processed_count / self.cur_timestamp
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+        self._update_avg()
+
+
+@dataclass
+class QueueStat(ResourceStat):
+    prev_queue_len: int = 0
+    cur_queue_len: int = 0
+    avg_queue_len: float = 0
+    max_queue_len: int = 0
+
+    def put_processed(self, put_event: Put) -> None:
+        _ = put_event
+        self.put_processed_count += 1
+        self.cur_queue_len += 1
+
+    def get_processed(self, get_event: Get) -> None:
+        _ = get_event
+        self.get_processed_count += 1
+        self.cur_queue_len -= 1
+
+    def _update_queue_len(self) -> None:
+        self.avg_queue_len += self.cur_queue_len * (
+            self.cur_timestamp - self.prev_timestamp
+        )
+        self.prev_queue_len = self.cur_queue_len
+        self.max_queue_len = max(self.max_queue_len, self.cur_queue_len)
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+        self._update_avg()
+        self._update_queue_len()
+
+
 class Process:
     def __init__(self, ctx: SimContext, coro: Coro):
         self._ctx: SimContext = ctx
@@ -57,6 +161,8 @@ class Process:
         self._stopped: bool = False
         self._timeout: Optional[EventID] = None
         self._ctx.add_process(self)
+        self.stat: ProcessStat = ProcessStat(ctx)
+        self.stat_callbacks: List[StatCallback] = [self.stat.update_stat]
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
@@ -80,6 +186,7 @@ class Process:
         self._set_active()
         event: Optional[Event] = next(self._coro)
         if event is not None:
+            self.stat.event_generated(event)
             if not isinstance(event, NoOp):
                 for subscriber in self._subscribers:
                     event.subscribe(subscriber)
@@ -96,6 +203,7 @@ class Process:
             try:
                 next_event: Optional[Event] = self._coro.send(event.value)
                 if next_event is not None:
+                    self.stat.event_generated(event)
                     if not isinstance(next_event, NoOp):
                         for subscriber in self._subscribers:
                             next_event.subscribe(subscriber)
@@ -121,6 +229,13 @@ class Process:
     def noop(self) -> NoOp:
         return NoOp(self._ctx, process=self)
 
+    def update_stat(self) -> None:
+        for stat_callback in self.stat_callbacks:
+            stat_callback()
+
+    def add_stat_callback(self, callback: StatCallback) -> None:
+        self.stat_callbacks.append(callback)
+
 
 class Resource(ABC):
     def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
@@ -129,6 +244,8 @@ class Resource(ABC):
         self._res_id: ResourceID = ctx.get_next_resource_id()
         self._put_queue: Deque[Put] = deque()
         self._get_queue: Deque[Get] = deque()
+        self.stat = ResourceStat(ctx)
+        self.stat_callbacks: List[StatCallback] = [self.stat.update_stat]
 
     @abstractmethod
     def _put_admission_check(self, event: Put) -> bool:
@@ -204,11 +321,19 @@ class Resource(ABC):
     def _get_callback(self, event: Get) -> None:
         raise NotImplementedError
 
+    def update_stat(self) -> None:
+        for stat_callback in self.stat_callbacks:
+            stat_callback()
+
+    def add_stat_callback(self, callback: StatCallback) -> None:
+        self.stat_callbacks.append(callback)
+
 
 class QueueFIFO(Resource):
     def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
         super().__init__(ctx, capacity)
         self._queue: Deque[Any] = deque()
+        self.stat = QueueStat(ctx)
 
     def __len__(self):
         return len(self._queue)
@@ -244,15 +369,20 @@ class QueueFIFO(Resource):
     def put(
         self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]
     ) -> PutQueueFIFO:
-        return PutQueueFIFO(
+        put_event = PutQueueFIFO(
             self._ctx, self, process=self._ctx.active_process, item=item
         )
+        self.stat.put_requested(put_event)
+        return put_event
 
     def get(self, *args: List[Any], **kwargs: Dict[str, Any]) -> GetQueueFIFO:
-        return GetQueueFIFO(self._ctx, self, process=self._ctx.active_process)
+        get_event = GetQueueFIFO(self._ctx, self, process=self._ctx.active_process)
+        self.stat.get_requested(get_event)
+        return get_event
 
     def _put_callback(self, event: PutQueueFIFO) -> None:
         self._queue.append(event.item)
+        self.stat.put_processed(event)
         logger.debug(
             "%s was put into %s at %s. Queue len is: %s",
             event.item,
@@ -263,6 +393,7 @@ class QueueFIFO(Resource):
 
     def _get_callback(self, event: GetQueueFIFO) -> None:
         event.item = self._queue.popleft()
+        self.stat.get_processed(event)
         logger.debug(
             "%s was gotten from %s at %s. Queue len is: %s",
             event.item,
@@ -609,6 +740,13 @@ class SimContext:
     def set_active_process(self, process: Process) -> None:
         self._cur_active_process = process
 
+    def update_stat(self) -> None:
+        for proc in self._procs.values():
+            proc.update_stat()
+
+        for resource in self._resources.values():
+            resource.update_stat()
+
 
 class Simulator:
     def __init__(self, ctx: Optional[SimContext] = None):
@@ -636,6 +774,8 @@ class Simulator:
         while (event := self._ctx.get_event()) and not self._ctx.stopped:
             logger.debug("Dequeued %s\nEvent queue: %s", event, self._ctx._event_queue)
             self._ctx.advance_simtime(event.time)
+            if self._ctx.now:
+                self._ctx.update_stat()
             if until_time is not None and self._ctx.now >= until_time:
                 break
             self._event_counter += 1

@@ -88,6 +88,7 @@ def test_netsim_run_2():
     r1_tx = sim.get("R1_TX")
     r2_rx = sim.get("R2_RX")
 
+    print(r1_tx.stat)
     print(r2_rx.stat)
     assert r1_tx.stat.total_sent_pkts == 10
     assert r1_tx.stat.total_received_pkts == 10
@@ -95,6 +96,9 @@ def test_netsim_run_2():
     assert r1_tx.stat.total_sent_bytes == 10000
     assert r1_tx.stat.total_received_bytes == 10000
     assert r1_tx.stat.total_dropped_bytes == 0
+    # assert r1_tx.stat.avg_send_rate_pps == 0.9090909090909091
+    # assert r1_tx.stat.avg_receive_rate_pps == 0.9090909090909091
+    # assert r1_tx.stat.avg_drop_rate_pps == 0
 
     assert r2_rx.stat.total_sent_pkts == 10
     assert r2_rx.stat.total_received_pkts == 10
@@ -102,3 +106,6 @@ def test_netsim_run_2():
     assert r2_rx.stat.total_sent_bytes == 10000
     assert r2_rx.stat.total_received_bytes == 10000
     assert r2_rx.stat.total_dropped_bytes == 0
+    # assert r2_rx.stat.avg_send_rate_pps == 0.9090909090909091
+    # assert r2_rx.stat.avg_receive_rate_pps == 0.9090909090909091
+    # assert r2_rx.stat.avg_drop_rate_pps == 0
