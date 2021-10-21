@@ -112,6 +112,8 @@ def test_simulator_basics_4():
     sim.run()
     assert ctx.now == 2
     assert sim.event_counter == 3
+    assert proc.stat.event_count == 3
+    assert proc.stat.avg_event_rate == 1.5
 
 
 def test_simulator_basics_5():
@@ -128,6 +130,8 @@ def test_simulator_basics_5():
     sim.run()
     assert ctx.now == 10
     assert sim.event_counter == 10
+    assert proc.stat.event_count == 10
+    assert proc.stat.avg_event_rate == 1
 
 
 def test_simulator_basics_6():
@@ -142,12 +146,19 @@ def test_simulator_basics_6():
         for _ in range(10):
             yield ctx.active_process.timeout(2)
 
-    ctx.add_process(Process(ctx, coro1(ctx)))
-    ctx.add_process(Process(ctx, coro2(ctx)))
+    proc1 = Process(ctx, coro1(ctx))
+    proc2 = Process(ctx, coro2(ctx))
+
+    ctx.add_process(proc1)
+    ctx.add_process(proc2)
 
     sim.run()
     assert ctx.now == 20
     assert sim.event_counter == 20
+    assert proc1.stat.event_count == 10
+    assert proc1.stat.avg_event_rate == 1.0
+    assert proc2.stat.event_count == 10
+    assert proc2.stat.avg_event_rate == 0.5
 
 
 def test_simulator_basics_7():

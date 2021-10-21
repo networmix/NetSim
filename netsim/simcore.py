@@ -230,8 +230,9 @@ class Process:
         return NoOp(self._ctx, process=self)
 
     def update_stat(self) -> None:
-        for stat_callback in self.stat_callbacks:
-            stat_callback()
+        if not self._stopped:
+            for stat_callback in self.stat_callbacks:
+                stat_callback()
 
     def add_stat_callback(self, callback: StatCallback) -> None:
         self.stat_callbacks.append(callback)
@@ -778,6 +779,6 @@ class Simulator:
                 self._ctx.update_stat()
             if until_time is not None and self._ctx.now >= until_time:
                 break
-            self._event_counter += 1
             event.run()
+            self._event_counter += 1
         logger.info("Simulation ended at %s", self._ctx.now)
