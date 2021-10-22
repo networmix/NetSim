@@ -233,7 +233,13 @@ class Receiver(NetSimObject):
         self._process.add_stat_callback(self.stat.update_stat)
 
     @abstractmethod
-    def put(self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    def put(
+        self,
+        item: Any,
+        source: NetSimObject,
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ) -> None:
         raise NotImplementedError(self)
 
     def _packet_received(self, packet: Packet) -> None:
@@ -310,11 +316,17 @@ class PacketSource(Sender):
                 self._ctx.now,
             )
             for subscriber in self._subscribers:
-                subscriber.put(packet)
+                subscriber.put(packet, self)
 
 
 class PacketSink(Receiver):
-    def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    def put(
+        self,
+        item: Packet,
+        source: Union[Sender, SenderReceiver],
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ) -> None:
         self._packet_received(item)
         logger.debug(
             "Packet received by %s_%s at %s",
@@ -340,7 +352,7 @@ class PacketQueue(SenderReceiver):
             if packet:
                 self._packet_get(packet)
                 for subscriber in self._subscribers:
-                    subscriber.put(packet)
+                    subscriber.put(packet, self)
                 self._packet_sent(packet)
                 logger.debug(
                     "Packet sent by %s_%s at %s",
@@ -351,7 +363,13 @@ class PacketQueue(SenderReceiver):
             else:
                 raise RuntimeError(f"{packet}")
 
-    def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    def put(
+        self,
+        item: Packet,
+        source: Union[Sender, SenderReceiver],
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ) -> None:
         self._queue.put(item)
         self._packet_received(item)
         self._packet_put(item)
@@ -392,7 +410,7 @@ class PacketInterfaceRx(PacketQueue):
                     yield self._process.timeout(self._propagation_delay)
                 self._packet_get(packet)
                 for subscriber in self._subscribers:
-                    subscriber.put(packet)
+                    subscriber.put(packet, self)
                 self._packet_sent(packet)
                 logger.debug(
                     "Packet sent by %s_%s at %s",
@@ -405,7 +423,13 @@ class PacketInterfaceRx(PacketQueue):
                     f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
                 )
 
-    def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    def put(
+        self,
+        item: Packet,
+        source: Union[Sender, SenderReceiver],
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ) -> None:
         # this is effectively a transmission media
 
         if self._queue_admission_tail_drop(packet=item):
@@ -460,7 +484,7 @@ class PacketInterfaceTx(PacketQueue):
                 )
                 yield self._process.timeout(packet.size * 8 / self._bw)
                 for subscriber in self._subscribers:
-                    subscriber.put(packet)
+                    subscriber.put(packet, self)
                     logger.debug(
                         "Packet put into %s_%s by %s_%s at %s",
                         type(self).__name__,
@@ -482,7 +506,13 @@ class PacketInterfaceTx(PacketQueue):
                     f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
                 )
 
-    def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]):
+    def put(
+        self,
+        item: Packet,
+        source: Union[Sender, SenderReceiver],
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ):
         self._packet_received(item)
         if self._queue_admission_tail_drop(packet=item):
             self._queue.put(item)
