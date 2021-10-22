@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from netsim.simcore import Simulator, SimTime
 from netsim.netsim_base import (
@@ -13,6 +13,9 @@ from netsim.netsim_base import (
     PacketQueue,
     NetSimObject,
     NetSimObjectName,
+    Receiver,
+    Sender,
+    SenderReceiver,
 )
 from netsim.netgraph.graph import MultiDiGraph
 
@@ -45,14 +48,16 @@ class NetSim(Simulator):
         for node, node_attr in graph.get_nodes().items():
             ns_type = NS_TYPE_MAP[node_attr["ns_type"]]
             ns_attr = node_attr["ns_attr"]
-            self._ns[node] = ns_type(self.ctx, **ns_attr)
+            ns_node_obj: NetSimObject = ns_type(self.ctx, **ns_attr)
+            ns_node_obj.name = node
+            self._ns[node] = ns_node_obj
 
         for src_node, dst_node, edge_id, edge_attr in graph.get_edges().values():
-            src_ns_obj: NetSimObject = self._ns[src_node]
-            dst_ns_obj: NetSimObject = self._ns[dst_node]
+            src_ns_obj: Union[Sender, SenderReceiver] = self._ns[src_node]
+            dst_ns_obj: Union[Receiver, SenderReceiver] = self._ns[dst_node]
             ns_edge_attr: Dict[str, Any] = edge_attr["ns_attr"]
 
-            src_ns_obj.subscribe(dst_ns_obj)
+            src_ns_obj.subscribe(dst_ns_obj, ns_edge_attr)
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
         super().run(until_time)

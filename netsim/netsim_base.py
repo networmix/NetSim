@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import logging
-from typing import DefaultDict, Dict, List, Optional, Union, Generator, Any
+from typing import DefaultDict, Dict, List, Optional, Set, Union, Generator, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -212,6 +212,7 @@ class Sender(NetSimObject):
     ) -> None:
         _, _ = args, kwargs
         self._subscribers.append(receiver)
+        receiver.add_subscription(self)
 
     def _packet_sent(self, packet: Packet) -> None:
         self.stat.packet_sent(packet)
@@ -231,6 +232,7 @@ class Receiver(NetSimObject):
         super().__init__(ctx)
         self.stat: PacketStat = PacketStat(ctx)
         self._process.add_stat_callback(self.stat.update_stat)
+        self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
 
     @abstractmethod
     def put(
@@ -241,6 +243,12 @@ class Receiver(NetSimObject):
         **kwargs: Dict[str, Any],
     ) -> None:
         raise NotImplementedError(self)
+
+    def add_subscription(self, ns_obj: Union[Sender, SenderReceiver]) -> None:
+        self._subscriptions.add(ns_obj)
+
+    def get_subscriptions(self) -> Set[Union[Sender, SenderReceiver]]:
+        return self._subscriptions
 
     def _packet_received(self, packet: Packet) -> None:
         self.stat.packet_received(packet)
@@ -256,11 +264,18 @@ class SenderReceiver(NetSimObject):
     ):
         super().__init__(ctx)
         self._subscribers: List[Receiver] = []
+        self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
         self.stat: PacketStat = PacketStat(ctx)
         self._process.add_stat_callback(self.stat.update_stat)
 
     @abstractmethod
-    def put(self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    def put(
+        self,
+        item: Any,
+        source: NetSimObject,
+        *args: List[Any],
+        **kwargs: Dict[str, Any],
+    ) -> None:
         raise NotImplementedError(self)
 
     def subscribe(
@@ -268,6 +283,13 @@ class SenderReceiver(NetSimObject):
     ) -> None:
         _, _ = args, kwargs
         self._subscribers.append(receiver)
+        receiver.add_subscription(self)
+
+    def add_subscription(self, ns_obj: Union[Sender, SenderReceiver]) -> None:
+        self._subscriptions.add(ns_obj)
+
+    def get_subscriptions(self) -> Set[Union[Sender, SenderReceiver]]:
+        return self._subscriptions
 
     def _packet_sent(self, packet: Packet) -> None:
         self.stat.packet_sent(packet)
@@ -395,8 +417,8 @@ class PacketInterfaceRx(PacketQueue):
     def __init__(
         self,
         ctx: SimContext,
-        transmission_len_limit: Optional[int] = None,
         propagation_delay: Optional[SimTime] = None,
+        transmission_len_limit: Optional[int] = None,
     ):
         super().__init__(ctx)
         self._propagation_delay: Optional[SimTime] = propagation_delay
