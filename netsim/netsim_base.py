@@ -29,6 +29,9 @@ RateBPS = float  # in bits per second
 @dataclass
 class PacketStat:  # pylint: disable=too-many-instance-attributes
     _ctx: SimContext = field(repr=False)
+    prev_timestamp: SimTime = 0
+    cur_timestamp: SimTime = 0
+
     total_sent_pkts: int = 0
     total_received_pkts: int = 0
     total_dropped_pkts: int = 0
@@ -60,90 +63,85 @@ class PacketStat:  # pylint: disable=too-many-instance-attributes
     avg_receive_rate_bps: RateBPS = 0
     avg_drop_rate_bps: RateBPS = 0
 
+    def _update_timestamp(self) -> None:
+        if self._ctx.now != self.cur_timestamp:
+            self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
+
     def packet_sent(self, packet: Packet):
         self.total_sent_pkts += 1
-        self.sent_pkts_hist[self._ctx.now] += 1
+        self.sent_pkts_hist[self.cur_timestamp] += 1
         self.total_sent_bytes += packet.size
-        self.sent_size_hist[self._ctx.now] += packet.size
-        self.update_avg()
+        self.sent_size_hist[self.cur_timestamp] += packet.size
 
     def packet_received(self, packet: Packet):
         self.total_received_pkts += 1
-        self.received_pkts_hist[self._ctx.now] += 1
+        self.received_pkts_hist[self.cur_timestamp] += 1
         self.total_received_bytes += packet.size
-        self.received_size_hist[self._ctx.now] += packet.size
-        self.update_avg()
+        self.received_size_hist[self.cur_timestamp] += packet.size
 
     def packet_dropped(self, packet: Packet):
         self.total_dropped_pkts += 1
-        self.dropped_pkts_hist[self._ctx.now] += 1
+        self.dropped_pkts_hist[self.cur_timestamp] += 1
         self.total_dropped_bytes += packet.size
-        self.dropped_size_hist[self._ctx.now] += packet.size
-        self.update_avg()
+        self.dropped_size_hist[self.cur_timestamp] += packet.size
 
-    def update_avg(self):
-        self.avg_send_rate_pps = self.total_sent_pkts / self._ctx.now
-        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self._ctx.now
-        self.avg_receive_rate_pps = self.total_received_pkts / self._ctx.now
-        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self._ctx.now
-        self.avg_drop_rate_pps = self.total_dropped_pkts / self._ctx.now
-        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self._ctx.now
+    def _update_avg(self):
+        self.avg_send_rate_pps = self.total_sent_pkts / self.cur_timestamp
+        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.cur_timestamp
+        self.avg_receive_rate_pps = self.total_received_pkts / self.cur_timestamp
+        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.cur_timestamp
+        self.avg_drop_rate_pps = self.total_dropped_pkts / self.cur_timestamp
+        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.cur_timestamp
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+        self._update_avg()
 
 
 @dataclass
 class PacketQueueStat:  # pylint: disable=too-many-instance-attributes
     _ctx: SimContext = field(repr=False)
     _queue: QueueFIFO = field(repr=False)
-    total_sent_pkts: int = 0
-    total_received_pkts: int = 0
+    prev_timestamp: SimTime = 0
+    cur_timestamp: SimTime = 0
+
+    total_get_pkts: int = 0
+    total_put_pkts: int = 0
     total_dropped_pkts: int = 0
-    total_sent_bytes: PacketSize = 0
-    total_received_bytes: PacketSize = 0
-    total_dropped_bytes: PacketSize = 0
-    received_pkts_hist: DefaultDict[SimTime, int] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    sent_pkts_hist: DefaultDict[SimTime, int] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    dropped_pkts_hist: DefaultDict[SimTime, int] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    received_size_hist: DefaultDict[SimTime, PacketSize] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    sent_size_hist: DefaultDict[SimTime, PacketSize] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    dropped_size_hist: DefaultDict[SimTime, PacketSize] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    queue_len_hist: DefaultDict[SimTime, int] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
-    queue_size_hist: DefaultDict[SimTime, PacketSize] = field(
-        repr=False, default_factory=lambda: defaultdict(int)
-    )
+
+    prev_queue_len: int = 0
+    cur_queue_len: int = 0
+    avg_queue_len: float = 0
+    max_queue_len: int = 0
+
+    def _update_timestamp(self) -> None:
+        if self._ctx.now != self.cur_timestamp:
+            self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
 
     def packet_get(self, packet: Packet):
-        self.total_sent_pkts += 1
-        self.sent_pkts_hist[self._ctx.now] += 1
-        self.total_sent_bytes += packet.size
-        self.sent_size_hist[self._ctx.now] += packet.size
-        self.queue_len_hist[self._ctx.now] = len(self._queue) - 1
+        _ = packet
+        self.total_get_pkts += 1
+        self.cur_queue_len -= 1
 
     def packet_put(self, packet: Packet):
-        self.total_received_pkts += 1
-        self.received_pkts_hist[self._ctx.now] += 1
-        self.total_received_bytes += packet.size
-        self.received_size_hist[self._ctx.now] += packet.size
-        self.queue_len_hist[self._ctx.now] = len(self._queue) + 1
+        _ = packet
+        self.total_put_pkts += 1
+        self.cur_queue_len += 1
 
     def packet_dropped(self, packet: Packet):
+        _ = packet
         self.total_dropped_pkts += 1
-        self.dropped_pkts_hist[self._ctx.now] += 1
-        self.total_dropped_bytes += packet.size
-        self.dropped_size_hist[self._ctx.now] += packet.size
+
+    def _update_queue_len(self) -> None:
+        self.avg_queue_len += self.cur_queue_len * (
+            self.cur_timestamp - self.prev_timestamp
+        )
+        self.prev_queue_len = self.cur_queue_len
+        self.max_queue_len = max(self.max_queue_len, self.cur_queue_len)
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+        self._update_queue_len()
 
 
 class NetSimObject(ABC):
@@ -207,6 +205,7 @@ class Sender(NetSimObject):
         super().__init__(ctx)
         self._subscribers: List[Receiver] = []
         self.stat: PacketStat = PacketStat(ctx)
+        self._process.add_stat_callback(self.stat.update_stat)
 
     def subscribe(
         self, receiver: Receiver, *args: List[Any], **kwargs: Dict[str, Any]
@@ -231,6 +230,7 @@ class Receiver(NetSimObject):
     ):
         super().__init__(ctx)
         self.stat: PacketStat = PacketStat(ctx)
+        self._process.add_stat_callback(self.stat.update_stat)
 
     @abstractmethod
     def put(self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
@@ -251,6 +251,7 @@ class SenderReceiver(NetSimObject):
         super().__init__(ctx)
         self._subscribers: List[Receiver] = []
         self.stat: PacketStat = PacketStat(ctx)
+        self._process.add_stat_callback(self.stat.update_stat)
 
     @abstractmethod
     def put(self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
@@ -331,11 +332,13 @@ class PacketQueue(SenderReceiver):
         super().__init__(ctx)
         self._queue = QueueFIFO(ctx, capacity)
         self.queue_stat: PacketQueueStat = PacketQueueStat(ctx, self._queue)
+        self._process.add_stat_callback(self.queue_stat.update_stat)
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
         while True:
             packet: Packet = yield self._queue.get()
             if packet:
+                self._packet_get(packet)
                 for subscriber in self._subscribers:
                     subscriber.put(packet)
                 self._packet_sent(packet)
@@ -350,8 +353,8 @@ class PacketQueue(SenderReceiver):
 
     def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
         self._queue.put(item)
-        self.queue_stat.packet_put(item)
-        self.stat.packet_received(item)
+        self._packet_received(item)
+        self._packet_put(item)
         logger.debug(
             "Packet received by %s_%s at %s",
             type(self).__name__,
@@ -359,15 +362,15 @@ class PacketQueue(SenderReceiver):
             self._ctx.now,
         )
 
-    def _packet_get(self, packet: Packet) -> None:
-        self.queue_stat.packet_get(packet)
-
     def _packet_put(self, packet: Packet) -> None:
         self.queue_stat.packet_put(packet)
 
+    def _packet_get(self, packet: Packet) -> None:
+        self.queue_stat.packet_get(packet)
+
     def _packet_dropped(self, packet: Packet) -> None:
+        self.stat.packet_dropped(packet)
         self.queue_stat.packet_dropped(packet)
-        super()._packet_dropped(packet)
 
 
 class PacketInterfaceRx(PacketQueue):
@@ -480,10 +483,10 @@ class PacketInterfaceTx(PacketQueue):
                 )
 
     def put(self, item: Packet, *args: List[Any], **kwargs: Dict[str, Any]):
+        self._packet_received(item)
         if self._queue_admission_tail_drop(packet=item):
             self._queue.put(item)
             self._packet_put(item)
-            self._packet_received(item)
             logger.debug(
                 "Packet received by %s_%s at %s",
                 type(self).__name__,

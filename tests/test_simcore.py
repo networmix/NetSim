@@ -128,8 +128,13 @@ def test_simulator_basics_5():
     ctx.add_process(proc)
 
     sim.run()
+
+    print(proc.stat)
+
     assert ctx.now == 10
     assert sim.event_counter == 10
+    assert sim.avg_event_rate == 1
+    assert proc.stat.cur_timestamp == 10
     assert proc.stat.event_count == 10
     assert proc.stat.avg_event_rate == 1
 
@@ -155,8 +160,10 @@ def test_simulator_basics_6():
     sim.run()
     assert ctx.now == 20
     assert sim.event_counter == 20
+    assert proc1.stat.cur_timestamp == 10
     assert proc1.stat.event_count == 10
     assert proc1.stat.avg_event_rate == 1.0
+    assert proc2.stat.cur_timestamp == 20
     assert proc2.stat.event_count == 10
     assert proc2.stat.avg_event_rate == 0.5
 

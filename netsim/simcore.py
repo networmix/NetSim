@@ -210,6 +210,8 @@ class Process:
                     if next_event.planned and not next_event.scheduled:
                         self._ctx.schedule_event(next_event)
             except StopIteration:
+                if self._ctx.now:
+                    self.update_stat()
                 self._stopped = True
 
         else:
@@ -579,6 +581,24 @@ class NoOp(Event):
         return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id})"
 
 
+class StopSim(Timeout):
+    def __init__(
+        self,
+        ctx: SimContext,
+        delay: SimTime,
+        priority: EventPriority = 0,
+        process: Optional[Process] = None,
+    ):
+        super().__init__(ctx, ctx.now + delay, priority=priority, process=process)
+        self._auto_trigger = True
+        self._callbacks.append(self._ctx.stop)
+
+    def __repr__(self) -> str:
+        type_name = type(self).__name__
+        proc_id = self._process.proc_id if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+
+
 class Put(Event):
     def __init__(
         self,
@@ -719,7 +739,8 @@ class SimContext:
             )
         event.schedule(time)
 
-    def stop(self) -> None:
+    def stop(self, event: Optional[Event] = None) -> None:
+        _ = event
         self._stopped = True
 
     def advance_simtime(self, new_time: SimTime) -> None:
@@ -759,6 +780,10 @@ class Simulator:
         return self._event_counter
 
     @property
+    def avg_event_rate(self) -> float:
+        return self._event_counter / self._ctx.now
+
+    @property
     def ctx(self) -> SimContext:
         return self._ctx
 
@@ -767,18 +792,18 @@ class Simulator:
         return self._ctx.now
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
-        self._run(until_time)
+        if until_time is not None:
+            self._ctx.schedule_event(StopSim(self._ctx, delay=until_time))
+        self._run()
 
-    def _run(self, until_time: Optional[SimTime] = None) -> None:
+    def _run(self) -> None:
         for proc in self._ctx.get_process_iter():
             proc.start()
         while (event := self._ctx.get_event()) and not self._ctx.stopped:
             logger.debug("Dequeued %s\nEvent queue: %s", event, self._ctx._event_queue)
             self._ctx.advance_simtime(event.time)
-            if self._ctx.now:
-                self._ctx.update_stat()
-            if until_time is not None and self._ctx.now >= until_time:
-                break
             event.run()
             self._event_counter += 1
+            if self._ctx.now:
+                self._ctx.update_stat()
         logger.info("Simulation ended at %s", self._ctx.now)

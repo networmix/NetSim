@@ -55,4 +55,4 @@ class NetSim(Simulator):
             src_ns_obj.subscribe(dst_ns_obj)
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
-        self._run(until_time)
+        super().run(until_time)
