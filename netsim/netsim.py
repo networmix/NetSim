@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, Union
+from copy import deepcopy
+from typing import Any, Dict, Iterable, Iterator, Optional, Union
 from netsim.netsim_switch import PacketSwitch
 
-from netsim.simcore import Simulator, SimTime
+from netsim.simcore import (
+    CollectStat,
+    Event,
+    Process,
+    SimContext,
+    Simulator,
+    SimTime,
+    StatCollector,
+    TimeInterval,
+)
 from netsim.netsim_base import (
+    NetSimStat,
     Packet,
     PacketInterfaceRx,
     PacketInterfaceTx,
@@ -37,14 +48,65 @@ NS_TYPE_MAP: Dict[str, NetSimObject] = {
 }
 
 
+class NetStatCollector(Process):
+    def __init__(
+        self,
+        ctx: SimContext,
+        nsim: NetSim,
+        stat_interval: SimTime,
+        stat_container: NetSimStat,
+    ):
+        self._stat_interval = stat_interval
+        self._stat_container = stat_container
+        self._nsim = nsim
+        super().__init__(ctx, self._collection_trigger())
+
+    def _collection_trigger(self) -> Event:
+        while True:
+            yield CollectStat(
+                self._ctx, stat_interval=self._stat_interval, process=self
+            )
+            self._stat_container.update_stat()
+            for ns_obj in self._nsim.get_ns_obj_iter():
+                ns_obj.stat.update_stat()
+                interval: TimeInterval = (
+                    self._stat_container.prev_timestamp,
+                    self._stat_container.cur_timestamp,
+                )
+
+                self._stat_container.stat_samples.setdefault(ns_obj.name, {})[
+                    interval
+                ] = deepcopy(ns_obj.stat)
+                ns_obj.stat.reset_stat()
+
+
 class NetSim(Simulator):
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        ctx: Optional[SimContext] = None,
+        stat_interval: Optional[float] = None,
+        nstat_interval: Optional[float] = None,
+    ):
+        super().__init__(ctx, stat_interval=stat_interval)
         Packet.reset_packet_id()
         self._ns: Dict[NetSimObjectName, NetSimObject] = {}
+        self.nstat: NetSimStat = NetSimStat(self._ctx)
+        self._nstat_collector = (
+            NetStatCollector(
+                self._ctx,
+                nsim=self,
+                stat_interval=nstat_interval,
+                stat_container=self.nstat,
+            )
+            if nstat_interval
+            else None
+        )
 
-    def get(self, ns_obj_name: NetSimObjectName) -> NetSimObject:
+    def get_ns_obj(self, ns_obj_name: NetSimObjectName) -> NetSimObject:
         return self._ns[ns_obj_name]
+
+    def get_ns_obj_iter(self) -> Iterator[NetSimObject]:
+        return iter(self._ns.values())
 
     def load_graph(self, graph: MultiDiGraph):
         for node, node_attr in graph.get_nodes().items():

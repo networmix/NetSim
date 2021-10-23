@@ -40,18 +40,18 @@ def test_ee509_scenario_1():
     sim.load_graph(graph)
     sim.run()
 
-    sw1: PacketSwitch = sim.get("SW1")
+    sw1: PacketSwitch = sim.get_ns_obj("SW1")
 
-    print(sw1.switch_stat)
-    assert sw1.switch_stat.total_sent_pkts == 21
-    assert sw1.switch_stat.total_received_pkts == 100
-    assert sw1.switch_stat.total_dropped_pkts == 79
-    assert sw1.switch_stat.total_sent_bytes == 21000
-    assert sw1.switch_stat.total_received_bytes == 100000
-    assert sw1.switch_stat.total_dropped_bytes == 79000
-    assert sw1.switch_stat.avg_send_rate_pps == 2.0
-    assert sw1.switch_stat.avg_receive_rate_pps == 9.523809523809524
-    assert sw1.switch_stat.avg_drop_rate_pps == 7.523809523809524
-    assert sw1.switch_stat.avg_send_rate_bps == 16000.0
-    assert sw1.switch_stat.avg_receive_rate_bps == 76190.47619047618
-    assert sw1.switch_stat.avg_drop_rate_bps == 60190.47619047619
+    print(sw1.stat)
+    assert sw1.stat.total_sent_pkts == 21
+    assert sw1.stat.total_received_pkts == 100
+    assert sw1.stat.total_dropped_pkts == 79
+    assert sw1.stat.total_sent_bytes == 21000
+    assert sw1.stat.total_received_bytes == 100000
+    assert sw1.stat.total_dropped_bytes == 79000
+    assert sw1.stat.avg_send_rate_pps == 2.0
+    assert sw1.stat.avg_receive_rate_pps == 9.523809523809524
+    assert sw1.stat.avg_drop_rate_pps == 7.523809523809524
+    assert sw1.stat.avg_send_rate_bps == 16000.0
+    assert sw1.stat.avg_receive_rate_bps == 76190.47619047618
+    assert sw1.stat.avg_drop_rate_bps == 60190.47619047619

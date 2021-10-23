@@ -13,7 +13,7 @@ from typing import (
     Union,
 )
 
-from netsim.simcore import Coro, SimTime, SimContext
+from netsim.simcore import Coro, SimTime, SimContext, Stat
 from netsim.netsim_base import (
     InterfaceBW,
     Packet,
@@ -52,7 +52,7 @@ class PacketProcessingOutput(NamedTuple):
 
 
 @dataclass
-class PacketSwitchStat:
+class PacketSwitchStat(Stat):
     _ctx: SimContext = field(repr=False)
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
@@ -122,6 +122,21 @@ class PacketSwitchStat:
         self._update_timestamp()
         self._update_total()
         self._update_avg()
+
+    def reset_stat(self) -> None:
+        self.total_sent_pkts: int = 0
+        self.total_received_pkts: int = 0
+        self.total_dropped_pkts: int = 0
+        self.total_sent_bytes: PacketSize = 0
+        self.total_received_bytes: PacketSize = 0
+        self.total_dropped_bytes: PacketSize = 0
+
+        self.avg_send_rate_pps: RatePPS = 0
+        self.avg_receive_rate_pps: RatePPS = 0
+        self.avg_drop_rate_pps: RatePPS = 0
+        self.avg_send_rate_bps: RateBPS = 0
+        self.avg_receive_rate_bps: RateBPS = 0
+        self.avg_drop_rate_bps: RateBPS = 0
 
 
 class PacketProcessor(PacketQueue):
@@ -236,24 +251,20 @@ class PacketSwitch(SenderReceiver):
         self._packet_processors: Dict[PacketProcessorName, PacketProcessor] = {}
         self._rx_interfaces: Dict[InterfaceName, PacketInterfaceRx] = {}
         self._tx_interfaces: Dict[InterfaceName, PacketInterfaceTx] = {}
-        self.switch_stat: PacketSwitchStat = PacketSwitchStat(ctx)
-        self._process.add_stat_callback(self.switch_stat.update_stat)
+        self.stat: PacketSwitchStat = PacketSwitchStat(ctx)
+        self._process.add_stat_callback(self.stat.update_stat)
 
-    def _init_switch_stat(self):
+    def _init_stat(self):
         for processor_name, processor in self._packet_processors.items():
-            self.switch_stat.packet_processors[processor_name] = processor.stat
+            self.stat.packet_processors[processor_name] = processor.stat
 
         for rx_interface_name, rx_interface in self._rx_interfaces.items():
-            self.switch_stat.rx_interfaces[rx_interface_name] = rx_interface.stat
-            self.switch_stat.rx_interface_queues[
-                rx_interface_name
-            ] = rx_interface._queue.stat
+            self.stat.rx_interfaces[rx_interface_name] = rx_interface.stat
+            self.stat.rx_interface_queues[rx_interface_name] = rx_interface._queue.stat
 
         for tx_interface_name, tx_interface in self._tx_interfaces.items():
-            self.switch_stat.tx_interfaces[tx_interface_name] = tx_interface.stat
-            self.switch_stat.tx_interface_queues[
-                tx_interface_name
-            ] = tx_interface._queue.stat
+            self.stat.tx_interfaces[tx_interface_name] = tx_interface.stat
+            self.stat.tx_interface_queues[tx_interface_name] = tx_interface._queue.stat
 
     def create_interface_tx(
         self,
@@ -291,7 +302,7 @@ class PacketSwitch(SenderReceiver):
         for interface_name in sorted(self._tx_interfaces):
             packet_processor.add_interface_tx(self._tx_interfaces[interface_name])
 
-        self._init_switch_stat()
+        self._init_stat()
         return packet_processor
 
     def subscribe(

@@ -6,7 +6,15 @@ from typing import DefaultDict, Dict, List, Optional, Set, Union, Generator, Any
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from netsim.simcore import SimTime, Coro, Process, QueueFIFO, SimContext
+from netsim.simcore import (
+    SimTime,
+    Coro,
+    Process,
+    QueueFIFO,
+    SimContext,
+    Stat,
+    StatSamples,
+)
 
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -14,21 +22,8 @@ logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
 
 
-# defining useful type aliases
-PacketID = int
-PacketSize = Union[int, float]  # in bytes
-PacketAddress = int
-PacketFlowID = int
-NetSimObjectID = int
-NetSimObjectName = str
-InterfaceBW = float  # in bits per second
-RatePPS = float  # in packets per second
-RateBPS = float  # in bits per second
-
-
 @dataclass
-class PacketStat:  # pylint: disable=too-many-instance-attributes
-    _ctx: SimContext = field(repr=False)
+class PacketStat(Stat):  # pylint: disable=too-many-instance-attributes
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
 
@@ -97,11 +92,29 @@ class PacketStat:  # pylint: disable=too-many-instance-attributes
         self._update_timestamp()
         self._update_avg()
 
+    def reset_stat(self) -> None:
+        self.total_sent_pkts: int = 0
+        self.total_received_pkts: int = 0
+        self.total_dropped_pkts: int = 0
+        self.total_sent_bytes: PacketSize = 0
+        self.total_received_bytes: PacketSize = 0
+        self.total_dropped_bytes: PacketSize = 0
+        self.received_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
+        self.sent_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
+        self.dropped_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
+        self.received_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
+        self.sent_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
+        self.dropped_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
+        self.avg_send_rate_pps: RatePPS = 0
+        self.avg_receive_rate_pps: RatePPS = 0
+        self.avg_drop_rate_pps: RatePPS = 0
+        self.avg_send_rate_bps: RateBPS = 0
+        self.avg_receive_rate_bps: RateBPS = 0
+        self.avg_drop_rate_bps: RateBPS = 0
+
 
 @dataclass
-class PacketQueueStat:  # pylint: disable=too-many-instance-attributes
-    _ctx: SimContext = field(repr=False)
-    _queue: QueueFIFO = field(repr=False)
+class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
 
@@ -146,6 +159,39 @@ class PacketQueueStat:  # pylint: disable=too-many-instance-attributes
         self._update_timestamp()
         self._update_queue_len()
 
+    def reset_stat(self) -> None:
+        self.total_get_pkts: int = 0
+        self.total_put_pkts: int = 0
+        self.total_dropped_pkts: int = 0
+        self.total_get_bytes: PacketSize = 0
+        self.total_put_bytes: PacketSize = 0
+        self.total_dropped_bytes: PacketSize = 0
+
+        self.prev_queue_len: int = 0
+        self.cur_queue_len: int = 0
+        self.avg_queue_len: float = 0
+        self.max_queue_len: int = 0
+
+
+@dataclass
+class NetSimStat(Stat):
+    stat_samples: Dict[NetSimObjectName, StatSamples] = field(default_factory=dict)
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+
+    def reset_stat(self) -> None:
+        raise NotImplementedError
+
+    def todict(self) -> Dict[str, Any]:
+        ret = defaultdict(dict)
+        for proc_id, statsamples in self.stat_samples.items():
+            for interval, statsample in statsamples.items():
+                ret["stat_samples"].setdefault(proc_id, {})[
+                    interval
+                ] = statsample.todict()
+        return dict(ret)
+
 
 class NetSimObject(ABC):
     _next_netsim_id: NetSimObjectID = 0
@@ -158,10 +204,13 @@ class NetSimObject(ABC):
             NetSimObject._next_netsim_id + 1,
         )
         self._process: Process = ctx.create_process(self.run())
+        self.stat: Stat = Stat(self._ctx)
 
     @property
     def name(self) -> str:
-        return self._name
+        if self._name:
+            return self._name
+        return f"{type(self).__name__}_{self._id}"
 
     @name.setter
     def name(self, name: str) -> None:
@@ -562,3 +611,15 @@ class PacketInterfaceTx(PacketQueue):
         if not self._queue_len_limit or len(self._queue) < self._queue_len_limit:
             return True
         return False
+
+
+# defining useful type aliases
+PacketID = int
+PacketSize = Union[int, float]  # in bytes
+PacketAddress = int
+PacketFlowID = int
+NetSimObjectID = int
+NetSimObjectName = str
+InterfaceBW = float  # in bits per second
+RatePPS = float  # in packets per second
+RateBPS = float  # in bits per second

@@ -88,8 +88,8 @@ def test_netsim_scenario_2():
     sim.load_graph(graph)
     sim.run()
 
-    r1_tx = sim.get("R1_TX")
-    r2_rx = sim.get("R2_RX")
+    r1_tx = sim.get_ns_obj("R1_TX")
+    r2_rx = sim.get_ns_obj("R2_RX")
 
     print(r1_tx.stat)
     print(r2_rx.stat)
@@ -144,8 +144,8 @@ def test_netsim_scenario_3():
     sim.load_graph(graph)
     sim.run()
 
-    r1_tx = sim.get("R1_TX")
-    r2_rx = sim.get("R2_RX")
+    r1_tx = sim.get_ns_obj("R1_TX")
+    r2_rx = sim.get_ns_obj("R2_RX")
 
     print(r1_tx.stat)
     print(r2_rx.stat)
@@ -200,8 +200,8 @@ def test_netsim_scenario_4():
     sim.load_graph(graph)
     sim.run()
 
-    r1_tx = sim.get("R1_TX")
-    r2_rx = sim.get("R2_RX")
+    r1_tx = sim.get_ns_obj("R1_TX")
+    r2_rx = sim.get_ns_obj("R2_RX")
 
     print(r1_tx.stat)
     print(r2_rx.stat)
@@ -256,8 +256,8 @@ def test_netsim_scenario_5():
     sim.load_graph(graph)
     sim.run(until_time=10)
 
-    r1_tx = sim.get("R1_TX")
-    r2_rx = sim.get("R2_RX")
+    r1_tx = sim.get_ns_obj("R1_TX")
+    r2_rx = sim.get_ns_obj("R2_RX")
 
     print(r1_tx.stat)
     print(r2_rx.stat)
@@ -311,21 +311,21 @@ def test_netsim_scenario_6():
     sim.load_graph(graph)
     sim.run()
 
-    sw1: PacketSwitch = sim.get("SW1")
+    sw1: PacketSwitch = sim.get_ns_obj("SW1")
 
-    print(sw1.switch_stat)
-    assert sw1.switch_stat.total_sent_pkts == 21
-    assert sw1.switch_stat.total_received_pkts == 100
-    assert sw1.switch_stat.total_dropped_pkts == 79
-    assert sw1.switch_stat.total_sent_bytes == 21000
-    assert sw1.switch_stat.total_received_bytes == 100000
-    assert sw1.switch_stat.total_dropped_bytes == 79000
-    assert sw1.switch_stat.avg_send_rate_pps == 2.0
-    assert sw1.switch_stat.avg_receive_rate_pps == 9.523809523809524
-    assert sw1.switch_stat.avg_drop_rate_pps == 7.523809523809524
-    assert sw1.switch_stat.avg_send_rate_bps == 16000.0
-    assert sw1.switch_stat.avg_receive_rate_bps == 76190.47619047618
-    assert sw1.switch_stat.avg_drop_rate_bps == 60190.47619047619
+    print(sw1.stat)
+    assert sw1.stat.total_sent_pkts == 21
+    assert sw1.stat.total_received_pkts == 100
+    assert sw1.stat.total_dropped_pkts == 79
+    assert sw1.stat.total_sent_bytes == 21000
+    assert sw1.stat.total_received_bytes == 100000
+    assert sw1.stat.total_dropped_bytes == 79000
+    assert sw1.stat.avg_send_rate_pps == 2.0
+    assert sw1.stat.avg_receive_rate_pps == 9.523809523809524
+    assert sw1.stat.avg_drop_rate_pps == 7.523809523809524
+    assert sw1.stat.avg_send_rate_bps == 16000.0
+    assert sw1.stat.avg_receive_rate_bps == 76190.47619047618
+    assert sw1.stat.avg_drop_rate_bps == 60190.47619047619
 
 
 def test_netsim_scenario_7():
@@ -361,16 +361,52 @@ def test_netsim_scenario_7():
     sim.load_graph(graph)
     sim.run()
 
-    sw1: PacketSwitch = sim.get("SW1")
+    sw1: PacketSwitch = sim.get_ns_obj("SW1")
 
-    print(sw1.switch_stat)
-    assert sw1.switch_stat.total_sent_pkts == 21
-    assert sw1.switch_stat.total_received_pkts == 100
-    assert sw1.switch_stat.total_dropped_pkts == 79
+    print(sw1.stat)
+    assert sw1.stat.total_sent_pkts == 21
+    assert sw1.stat.total_received_pkts == 100
+    assert sw1.stat.total_dropped_pkts == 79
 
-    sw2: PacketSwitch = sim.get("SW2")
+    sw2: PacketSwitch = sim.get_ns_obj("SW2")
 
-    print(sw2.switch_stat)
-    assert sw2.switch_stat.total_sent_pkts == 21
-    assert sw2.switch_stat.total_received_pkts == 21
-    assert sw2.switch_stat.total_dropped_pkts == 0
+    print(sw2.stat)
+    assert sw2.stat.total_sent_pkts == 21
+    assert sw2.stat.total_received_pkts == 21
+    assert sw2.stat.total_dropped_pkts == 0
+
+
+def test_netsim_scenario_8():
+    sim = NetSim(nstat_interval=10)
+
+    def arrival_gen() -> SimTime:
+        while True:
+            yield 0.1
+
+    def size_gen() -> PacketSize:
+        while True:
+            yield 1000
+
+    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
+    d_attr = {}
+    sw_attr = {}
+    link_attr = {
+        "tx": {"bw": 16000, "queue_len_limit": 1},
+        "rx": {"propagation_delay": 0.0},
+    }
+
+    graph = MultiDiGraph()
+    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
+    graph.add_node("SW1", ns_type="PacketSwitch", ns_attr=sw_attr)
+    graph.add_node("SW2", ns_type="PacketSwitch", ns_attr=sw_attr)
+    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
+
+    graph.add_edge("S", "SW1", ns_attr=link_attr)
+    graph.add_edge("SW1", "SW2", ns_attr=link_attr)
+    graph.add_edge("SW2", "D", ns_attr=link_attr)
+
+    sim.load_graph(graph)
+    sim.run(until_time=100)
+
+    assert len(sim.nstat.stat_samples["SW1"]) == 10
+    assert len(sim.nstat.stat_samples["SW2"]) == 10
