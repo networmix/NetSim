@@ -128,9 +128,6 @@ def test_simulator_basics_5():
     ctx.add_process(proc)
 
     sim.run()
-
-    print(proc.stat)
-
     assert ctx.now == 10
     assert sim.event_counter == 10
     assert sim.avg_event_rate == 1
@@ -186,6 +183,64 @@ def test_simulator_basics_7():
     sim.run()
     assert ctx.now == 20
     assert sim.event_counter == 20
+
+
+def test_simulator_stat_1():
+    ctx = SimContext()
+    sim = Simulator(ctx, stat_interval=3)
+
+    events = [
+        Event(ctx, 0, lambda event: "TestEvent1"),
+        Event(ctx, 1, lambda event: "TestEvent2"),
+        Event(ctx, 2, lambda event: "TestEvent3"),
+        Event(ctx, 3, lambda event: "TestEvent4"),
+        Event(ctx, 4, lambda event: "TestEvent5"),
+        Event(ctx, 5, lambda event: "TestEvent6"),
+    ]
+
+    def coro(ctx: SimContext):
+        for event in events:
+            yield event
+
+    proc = Process(ctx, coro(ctx))
+    ctx.add_process(proc)
+
+    sim.run(until_time=6)
+
+    assert ctx.now == 6
+    assert sim.event_counter == 9
+    assert sim.stat.todict() == {
+        "process_stat_samples": {
+            1: {
+                (0, 3): {
+                    "prev_timestamp": 2,
+                    "cur_timestamp": 3,
+                    "event_count": 1,
+                    "avg_event_rate": 0.3333333333333333,
+                },
+                (3, 6): {
+                    "prev_timestamp": 5,
+                    "cur_timestamp": 6,
+                    "event_count": 1,
+                    "avg_event_rate": 0.16666666666666666,
+                },
+            },
+            2: {
+                (0, 3): {
+                    "prev_timestamp": 2,
+                    "cur_timestamp": 3,
+                    "event_count": 4,
+                    "avg_event_rate": 1.3333333333333333,
+                },
+                (3, 6): {
+                    "prev_timestamp": 5,
+                    "cur_timestamp": 6,
+                    "event_count": 2,
+                    "avg_event_rate": 0.3333333333333333,
+                },
+            },
+        }
+    }
 
 
 def test_queue_fifo_put_1():

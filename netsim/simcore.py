@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
 from enum import IntEnum
-from collections import deque
+from collections import defaultdict, deque
 from heapq import heappop, heappush
 from typing import (
     Deque,
     Iterator,
     List,
+    Tuple,
     Union,
     Optional,
     Dict,
@@ -23,15 +25,6 @@ import logging
 LOG_FMT = "%(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
-
-# defining useful type aliases
-SimTime = Union[int, float]
-EventPriority = int
-EventID = int
-ProcessID = int
-ResourceID = int
-ResourceCapacity = Union[int, float]
-StatCallback = Callable[[None], None]
 
 
 class EventStatus(IntEnum):
@@ -52,16 +45,61 @@ class EventStatus(IntEnum):
 
 
 @dataclass
-class ProcessStat:
+class Stat:
     _ctx: SimContext = field(repr=False)
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
-    event_count: int = 0
-    avg_event_rate: float = 0
+
+    def update_stat(self) -> None:
+        raise NotImplementedError
+
+    def reset_stat(self) -> None:
+        raise NotImplementedError
 
     def _update_timestamp(self) -> None:
         if self._ctx.now != self.cur_timestamp:
             self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
+
+    def todict(self) -> Dict[str, Any]:
+        return {
+            field.name: deepcopy(getattr(self, field.name))
+            for field in fields(self)
+            if not field.name.startswith("_")
+        }
+
+
+@dataclass
+class SimStat(Stat):
+    process_stat_samples: Dict[ProcessID, StatSamples] = field(default_factory=dict)
+    resource_stat_samples: Dict[ProcessID, StatSamples] = field(default_factory=dict)
+
+    def update_stat(self) -> None:
+        self._update_timestamp()
+
+    def reset_stat(self) -> None:
+        raise NotImplementedError
+
+    def todict(self) -> Dict[str, Any]:
+        ret = defaultdict(dict)
+        for proc_id, statsamples in self.process_stat_samples.items():
+            for interval, statsample in statsamples.items():
+                ret["process_stat_samples"].setdefault(proc_id, {})[
+                    interval
+                ] = statsample.todict()
+
+        for proc_id, statsamples in self.resource_stat_samples.items():
+            for interval, statsample in statsamples.items():
+                ret["resource_stat_samples"].setdefault(proc_id, {})[
+                    interval
+                ] = statsample.todict()
+
+        return dict(ret)
+
+
+@dataclass
+class ProcessStat(Stat):
+    event_count: int = 0
+    avg_event_rate: float = 0
 
     def event_generated(self, event: Event) -> None:
         _ = event
@@ -74,13 +112,13 @@ class ProcessStat:
         self._update_timestamp()
         self._update_avg()
 
+    def reset_stat(self) -> None:
+        self.event_count: int = 0
+        self.avg_event_rate: float = 0
+
 
 @dataclass
-class ResourceStat:
-    _ctx: SimContext = field(repr=False)
-    prev_timestamp: SimTime = 0
-    cur_timestamp: SimTime = 0
-
+class ResourceStat(Stat):
     put_requested_count: int = 0
     get_requested_count: int = 0
     put_processed_count: int = 0
@@ -90,10 +128,6 @@ class ResourceStat:
     avg_get_requested_rate: float = 0
     avg_put_processed_rate: float = 0
     avg_get_processed_rate: float = 0
-
-    def _update_timestamp(self) -> None:
-        if self._ctx.now != self.cur_timestamp:
-            self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
 
     def put_requested(self, put_event: Put) -> None:
         _ = put_event
@@ -120,6 +154,17 @@ class ResourceStat:
     def update_stat(self) -> None:
         self._update_timestamp()
         self._update_avg()
+
+    def reset_stat(self) -> None:
+        self.put_requested_count: int = 0
+        self.get_requested_count: int = 0
+        self.put_processed_count: int = 0
+        self.get_processed_count: int = 0
+
+        self.avg_put_requested_rate: float = 0
+        self.avg_get_requested_rate: float = 0
+        self.avg_put_processed_rate: float = 0
+        self.avg_get_processed_rate: float = 0
 
 
 @dataclass
@@ -150,6 +195,13 @@ class QueueStat(ResourceStat):
         self._update_timestamp()
         self._update_avg()
         self._update_queue_len()
+
+    def reset_stat(self) -> None:
+        super().reset_stat()
+        self.prev_queue_len: int = 0
+        self.cur_queue_len: int = 0
+        self.avg_queue_len: float = 0
+        self.max_queue_len: int = 0
 
 
 class Process:
@@ -238,6 +290,44 @@ class Process:
 
     def add_stat_callback(self, callback: StatCallback) -> None:
         self.stat_callbacks.append(callback)
+
+
+class StatCollector(Process):
+    def __init__(
+        self, ctx: SimContext, stat_interval: SimTime, stat_container: SimStat
+    ):
+        self._stat_interval = stat_interval
+        self._stat_container = stat_container
+        super().__init__(ctx, self._collection_trigger())
+
+    def _collection_trigger(self) -> Event:
+        while True:
+            yield CollectStat(
+                self._ctx, stat_interval=self._stat_interval, process=self
+            )
+            self._stat_container.update_stat()
+            for process in self._ctx.get_process_iter():
+                process.stat.update_stat()
+                interval: TimeInterval = (
+                    self._stat_container.prev_timestamp,
+                    self._stat_container.cur_timestamp,
+                )
+
+                self._stat_container.process_stat_samples.setdefault(
+                    process.proc_id, {}
+                )[interval] = deepcopy(process.stat)
+                process.stat.reset_stat()
+
+            for resource in self._ctx.get_resource_iter():
+                resource.stat.update_stat()
+                interval: TimeInterval = (
+                    self._stat_container.prev_timestamp,
+                    self._stat_container.cur_timestamp,
+                )
+                self._stat_container.process_stat_samples.setdefault(
+                    resource.proc_id, {}
+                )[interval] = deepcopy(resource.stat)
+                resource.stat.reset_stat()
 
 
 class Resource(ABC):
@@ -544,10 +634,6 @@ class Event:
             callback(self)
 
 
-EventCallback = Callable[[Event], None]
-Coro = Coroutine[Optional[Event], Any, Optional[Event]]
-
-
 class Timeout(Event):
     def __init__(
         self,
@@ -586,12 +672,29 @@ class StopSim(Timeout):
         self,
         ctx: SimContext,
         delay: SimTime,
-        priority: EventPriority = 0,
+        priority: EventPriority = 2,
         process: Optional[Process] = None,
     ):
         super().__init__(ctx, ctx.now + delay, priority=priority, process=process)
         self._auto_trigger = True
         self._callbacks.append(self._ctx.stop)
+
+    def __repr__(self) -> str:
+        type_name = type(self).__name__
+        proc_id = self._process.proc_id if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+
+
+class CollectStat(Timeout):
+    def __init__(
+        self,
+        ctx: SimContext,
+        stat_interval: SimTime,
+        priority: EventPriority = 1,
+        process: Optional[Process] = None,
+    ):
+        super().__init__(ctx, stat_interval, priority=priority, process=process)
+        self._auto_trigger = True
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
@@ -664,6 +767,14 @@ class SimContext:
         self.__next_event_id: EventID = 0
         self.__next_process_id: ProcessID = 1  # 0 is reserved for the simulator
         self.__next_resource_id: ResourceID = 0
+        self.stat = None
+
+    def __deepcopy__(self, memo: Dict[Any, Any]) -> None:
+        """
+        There is no real point in making a deep copy of the SimContext.
+        Moreover, it breaks copying of Stat objects. Hence, making it a no-op.
+        """
+        return None
 
     @property
     def _next_event_id(self) -> EventID:
@@ -759,6 +870,9 @@ class SimContext:
     def get_process_iter(self) -> Iterator[Process]:
         return iter(self._procs.values())
 
+    def get_resource_iter(self) -> Iterator[Process]:
+        return iter(self._resources.values())
+
     def set_active_process(self, process: Process) -> None:
         self._cur_active_process = process
 
@@ -771,9 +885,17 @@ class SimContext:
 
 
 class Simulator:
-    def __init__(self, ctx: Optional[SimContext] = None):
+    def __init__(
+        self, ctx: Optional[SimContext] = None, stat_interval: Optional[float] = None
+    ):
         self._ctx: SimContext = ctx if ctx is not None else SimContext()
         self._event_counter = 0
+        self.stat: SimStat = SimStat(ctx)
+        self._stat_collector = (
+            StatCollector(ctx, stat_interval=stat_interval, stat_container=self.stat)
+            if stat_interval
+            else None
+        )
 
     @property
     def event_counter(self) -> int:
@@ -807,3 +929,17 @@ class Simulator:
             if self._ctx.now:
                 self._ctx.update_stat()
         logger.info("Simulation ended at %s", self._ctx.now)
+
+
+# defining useful type aliases
+SimTime = Union[int, float]
+EventPriority = int
+EventID = int
+ProcessID = int
+ResourceID = int
+ResourceCapacity = Union[int, float]
+StatCallback = Callable[[None], None]
+TimeInterval = Tuple[SimTime]
+EventCallback = Callable[[Event], None]
+Coro = Coroutine[Optional[Event], Any, Optional[Event]]
+StatSamples = Dict[TimeInterval, Stat]

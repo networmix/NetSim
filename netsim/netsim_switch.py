@@ -301,8 +301,7 @@ class PacketSwitch(SenderReceiver):
         raise NotImplementedError
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
-        while True:
-            yield self._process.noop()
+        yield self._process.noop()
 
     def put(
         self,
