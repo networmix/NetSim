@@ -108,6 +108,9 @@ class PacketQueueStat:  # pylint: disable=too-many-instance-attributes
     total_get_pkts: int = 0
     total_put_pkts: int = 0
     total_dropped_pkts: int = 0
+    total_get_bytes: PacketSize = 0
+    total_put_bytes: PacketSize = 0
+    total_dropped_bytes: PacketSize = 0
 
     prev_queue_len: int = 0
     cur_queue_len: int = 0
@@ -119,18 +122,18 @@ class PacketQueueStat:  # pylint: disable=too-many-instance-attributes
             self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
 
     def packet_get(self, packet: Packet):
-        _ = packet
         self.total_get_pkts += 1
+        self.total_get_bytes += packet.size
         self.cur_queue_len -= 1
 
     def packet_put(self, packet: Packet):
-        _ = packet
         self.total_put_pkts += 1
+        self.total_put_bytes += packet.size
         self.cur_queue_len += 1
 
     def packet_dropped(self, packet: Packet):
-        _ = packet
         self.total_dropped_pkts += 1
+        self.total_dropped_bytes += packet.size
 
     def _update_queue_len(self) -> None:
         self.avg_queue_len += self.cur_queue_len * (

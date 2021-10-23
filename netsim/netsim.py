@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, Optional, Union
+from netsim.netsim_switch import PacketSwitch
 
 from netsim.simcore import Simulator, SimTime
 from netsim.netsim_base import (
@@ -32,6 +33,7 @@ NS_TYPE_MAP: Dict[str, NetSimObject] = {
     "PacketQueue": PacketQueue,
     "PacketInterfaceRx": PacketInterfaceRx,
     "PacketInterfaceTx": PacketInterfaceTx,
+    "PacketSwitch": PacketSwitch,
 }
 
 
@@ -56,8 +58,24 @@ class NetSim(Simulator):
             src_ns_obj: Union[Sender, SenderReceiver] = self._ns[src_node]
             dst_ns_obj: Union[Receiver, SenderReceiver] = self._ns[dst_node]
             ns_edge_attr: Dict[str, Any] = edge_attr["ns_attr"]
+            ns_edge_attr_rx: Dict[str, Any] = ns_edge_attr.get("rx", {})
+            ns_edge_attr_tx: Dict[str, Any] = ns_edge_attr.get("tx", {})
 
-            src_ns_obj.subscribe(dst_ns_obj, ns_edge_attr)
+            if isinstance(src_ns_obj, PacketSwitch):
+                src_ns_obj = src_ns_obj.create_interface_tx(
+                    f"{dst_node}%{edge_id}", **ns_edge_attr_tx
+                )
+
+            if isinstance(dst_ns_obj, PacketSwitch):
+                dst_ns_obj = dst_ns_obj.create_interface_rx(
+                    f"{src_node}%{edge_id}", **ns_edge_attr_rx
+                )
+
+            src_ns_obj.subscribe(dst_ns_obj)
+
+        for ns_node_obj in self._ns.values():
+            if isinstance(ns_node_obj, PacketSwitch):
+                ns_node_obj.create_packet_processor()
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
         super().run(until_time)
