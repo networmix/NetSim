@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import logging
 from copy import deepcopy
-from typing import Any, Dict, Iterable, Iterator, Optional, Union
+from typing import Any, Dict, Iterator, Optional, Union
 from netsim.netsim_switch import PacketSwitch
 
 from netsim.simcore import (
-    CollectStat,
     Event,
-    Process,
     SimContext,
     Simulator,
     SimTime,
@@ -48,7 +46,7 @@ NS_TYPE_MAP: Dict[str, NetSimObject] = {
 }
 
 
-class NetStatCollector(Process):
+class NetStatCollector(StatCollector):
     def __init__(
         self,
         ctx: SimContext,
@@ -56,27 +54,23 @@ class NetStatCollector(Process):
         stat_interval: SimTime,
         stat_container: NetSimStat,
     ):
-        self._stat_interval = stat_interval
-        self._stat_container = stat_container
+        super().__init__(ctx, stat_interval, stat_container)
         self._nsim = nsim
-        super().__init__(ctx, self._collection_trigger())
+        self._stat_container: NetSimStat = self._stat_container
 
-    def _collection_trigger(self) -> Event:
-        while True:
-            yield CollectStat(
-                self._ctx, stat_interval=self._stat_interval, process=self
+    def _collect(self, reset: bool) -> Event:
+        self._stat_container.update_stat()
+        for ns_obj in self._nsim.get_ns_obj_iter():
+            ns_obj.stat.update_stat()
+            interval: TimeInterval = (
+                self._stat_container.prev_timestamp,
+                self._stat_container.cur_timestamp,
             )
-            self._stat_container.update_stat()
-            for ns_obj in self._nsim.get_ns_obj_iter():
-                ns_obj.stat.update_stat()
-                interval: TimeInterval = (
-                    self._stat_container.prev_timestamp,
-                    self._stat_container.cur_timestamp,
-                )
 
-                self._stat_container.stat_samples.setdefault(ns_obj.name, {})[
-                    interval
-                ] = deepcopy(ns_obj.stat)
+            self._stat_container.stat_samples.setdefault(ns_obj.name, {})[
+                interval
+            ] = deepcopy(ns_obj.stat)
+            if reset:
                 ns_obj.stat.reset_stat()
 
 
@@ -85,21 +79,18 @@ class NetSim(Simulator):
         self,
         ctx: Optional[SimContext] = None,
         stat_interval: Optional[float] = None,
-        nstat_interval: Optional[float] = None,
     ):
         super().__init__(ctx, stat_interval=stat_interval)
         Packet.reset_packet_id()
         self._ns: Dict[NetSimObjectName, NetSimObject] = {}
         self.nstat: NetSimStat = NetSimStat(self._ctx)
-        self._nstat_collector = (
+        self.add_stat_collector(
             NetStatCollector(
                 self._ctx,
                 nsim=self,
-                stat_interval=nstat_interval,
+                stat_interval=stat_interval,
                 stat_container=self.nstat,
             )
-            if nstat_interval
-            else None
         )
 
     def get_ns_obj(self, ns_obj_name: NetSimObjectName) -> NetSimObject:
@@ -108,7 +99,7 @@ class NetSim(Simulator):
     def get_ns_obj_iter(self) -> Iterator[NetSimObject]:
         return iter(self._ns.values())
 
-    def load_graph(self, graph: MultiDiGraph):
+    def _parse_graph_nodes(self, graph: MultiDiGraph) -> None:
         for node, node_attr in graph.get_nodes().items():
             ns_type = NS_TYPE_MAP[node_attr["ns_type"]]
             ns_attr = node_attr["ns_attr"]
@@ -116,6 +107,7 @@ class NetSim(Simulator):
             ns_node_obj.name = node
             self._ns[node] = ns_node_obj
 
+    def _parse_graph_edges(self, graph: MultiDiGraph) -> None:
         for src_node, dst_node, edge_id, edge_attr in graph.get_edges().values():
             src_ns_obj: Union[Sender, SenderReceiver] = self._ns[src_node]
             dst_ns_obj: Union[Receiver, SenderReceiver] = self._ns[dst_node]
@@ -135,9 +127,12 @@ class NetSim(Simulator):
 
             src_ns_obj.subscribe(dst_ns_obj)
 
+    def _postprocess_ns_obj(self) -> None:
         for ns_node_obj in self._ns.values():
             if isinstance(ns_node_obj, PacketSwitch):
                 ns_node_obj.create_packet_processor()
 
-    def run(self, until_time: Optional[SimTime] = None) -> None:
-        super().run(until_time)
+    def load_graph(self, graph: MultiDiGraph) -> None:
+        self._parse_graph_nodes(graph)
+        self._parse_graph_edges(graph)
+        self._postprocess_ns_obj()

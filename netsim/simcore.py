@@ -9,13 +9,13 @@ from collections import defaultdict, deque
 from heapq import heappop, heappush
 from typing import (
     Deque,
+    Generator,
     Iterator,
     List,
     Tuple,
     Union,
     Optional,
     Dict,
-    Coroutine,
     Callable,
     Any,
 )
@@ -300,34 +300,44 @@ class StatCollector(Process):
         self._stat_container = stat_container
         super().__init__(ctx, self._collection_trigger())
 
-    def _collection_trigger(self) -> Event:
-        while True:
-            yield CollectStat(
-                self._ctx, stat_interval=self._stat_interval, process=self
+    def _collect(self, reset: bool) -> None:
+        self._stat_container.update_stat()
+        for process in self._ctx.get_process_iter():
+            process.stat.update_stat()
+            interval: TimeInterval = (
+                self._stat_container.prev_timestamp,
+                self._stat_container.cur_timestamp,
             )
-            self._stat_container.update_stat()
-            for process in self._ctx.get_process_iter():
-                process.stat.update_stat()
-                interval: TimeInterval = (
-                    self._stat_container.prev_timestamp,
-                    self._stat_container.cur_timestamp,
-                )
 
-                self._stat_container.process_stat_samples.setdefault(
-                    process.proc_id, {}
-                )[interval] = deepcopy(process.stat)
+            self._stat_container.process_stat_samples.setdefault(process.proc_id, {})[
+                interval
+            ] = deepcopy(process.stat)
+            if reset:
                 process.stat.reset_stat()
 
-            for resource in self._ctx.get_resource_iter():
-                resource.stat.update_stat()
-                interval: TimeInterval = (
-                    self._stat_container.prev_timestamp,
-                    self._stat_container.cur_timestamp,
-                )
-                self._stat_container.process_stat_samples.setdefault(
-                    resource.proc_id, {}
-                )[interval] = deepcopy(resource.stat)
+        for resource in self._ctx.get_resource_iter():
+            resource.stat.update_stat()
+            interval: TimeInterval = (
+                self._stat_container.prev_timestamp,
+                self._stat_container.cur_timestamp,
+            )
+            self._stat_container.process_stat_samples.setdefault(resource.proc_id, {})[
+                interval
+            ] = deepcopy(resource.stat)
+            if reset:
                 resource.stat.reset_stat()
+
+    def _collection_trigger(self) -> Event:
+        if self._stat_interval:
+            while True:
+                yield CollectStat(self._ctx, delay=self._stat_interval, process=self)
+                self._collect(reset=True)
+        else:
+            yield
+
+    def collect_now(self) -> Event:
+        yield CollectStat(self._ctx, delay=0, process=self)
+        self._collect(reset=False)
 
 
 class Resource(ABC):
@@ -689,11 +699,11 @@ class CollectStat(Timeout):
     def __init__(
         self,
         ctx: SimContext,
-        stat_interval: SimTime,
+        delay: SimTime,
         priority: EventPriority = 1,
         process: Optional[Process] = None,
     ):
-        super().__init__(ctx, stat_interval, priority=priority, process=process)
+        super().__init__(ctx, delay, priority=priority, process=process)
         self._auto_trigger = True
 
     def __repr__(self) -> str:
@@ -890,11 +900,13 @@ class Simulator:
     ):
         self._ctx: SimContext = ctx if ctx is not None else SimContext()
         self._event_counter = 0
-        self.stat: SimStat = SimStat(ctx)
-        self._stat_collector = (
-            StatCollector(ctx, stat_interval=stat_interval, stat_container=self.stat)
-            if stat_interval
-            else None
+        self.stat: SimStat = SimStat(self._ctx)
+        self._stat_interval: Optional[float] = stat_interval
+        self._stat_collectors: List[StatCollector] = []
+        self.add_stat_collector(
+            StatCollector(
+                self._ctx, stat_interval=stat_interval, stat_container=self.stat
+            )
         )
 
     @property
@@ -913,6 +925,9 @@ class Simulator:
     def now(self) -> SimTime:
         return self._ctx.now
 
+    def add_stat_collector(self, stat_collector: StatCollector) -> None:
+        self._stat_collectors.append(stat_collector)
+
     def run(self, until_time: Optional[SimTime] = None) -> None:
         if until_time is not None:
             self._ctx.schedule_event(StopSim(self._ctx, delay=until_time))
@@ -928,6 +943,9 @@ class Simulator:
             self._event_counter += 1
             if self._ctx.now:
                 self._ctx.update_stat()
+        if not self._stat_interval:
+            for stat_collector in self._stat_collectors:
+                stat_collector.collect_now()
         logger.info("Simulation ended at %s", self._ctx.now)
 
 
@@ -941,5 +959,5 @@ ResourceCapacity = Union[int, float]
 StatCallback = Callable[[None], None]
 TimeInterval = Tuple[SimTime]
 EventCallback = Callable[[Event], None]
-Coro = Coroutine[Optional[Event], Any, Optional[Event]]
+Coro = Generator[Optional[Event], Any, Optional[Event]]
 StatSamples = Dict[TimeInterval, Stat]

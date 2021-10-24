@@ -2,9 +2,6 @@
 from netsim.netsim_switch import PacketSwitch
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
-    PacketQueue,
-    PacketSink,
-    PacketSource,
     PacketSize,
 )
 from netsim.netsim import NetSim
@@ -377,7 +374,7 @@ def test_netsim_scenario_7():
 
 
 def test_netsim_scenario_8():
-    sim = NetSim(nstat_interval=10)
+    sim = NetSim(stat_interval=10)
 
     def arrival_gen() -> SimTime:
         while True:

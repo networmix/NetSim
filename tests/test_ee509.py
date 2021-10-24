@@ -2,9 +2,6 @@
 from netsim.netsim_switch import PacketSwitch
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
-    PacketQueue,
-    PacketSink,
-    PacketSource,
     PacketSize,
 )
 from netsim.netsim import NetSim
@@ -42,7 +39,6 @@ def test_ee509_scenario_1():
 
     sw1: PacketSwitch = sim.get_ns_obj("SW1")
 
-    print(sw1.stat)
     assert sw1.stat.total_sent_pkts == 21
     assert sw1.stat.total_received_pkts == 100
     assert sw1.stat.total_dropped_pkts == 79

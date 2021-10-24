@@ -1,7 +1,7 @@
 # pylint: disable=protected-access,invalid-name
 from itertools import islice
 
-from netsim import stat
+from netsim import stat_base
 
 
 SAMPLE_UNIFORM = [
@@ -126,43 +126,43 @@ def test_uniform_1():
     a = 10
     b = 20
     n = 100
-    sample = list(islice(stat.uniform(a, b), 0, n))
+    sample = list(islice(stat_base.uniform(a, b), 0, n))
     assert len(sample) == n
 
 
 def test_df_1():
-    assert stat.sample_df(SAMPLE_UNIFORM, r=0) == 99
+    assert stat_base.sample_df(SAMPLE_UNIFORM, r=0) == 99
 
 
 def test_chi_sq_critical():
-    assert stat.chi_square_critical(10, 0.05) == 18.307038053275146
+    assert stat_base.chi_square_critical(10, 0.05) == 18.307038053275146
 
 
 def test_hist_1():
-    hist, bin_edges = stat.histogram(SAMPLE_UNIFORM, 10)
+    hist, bin_edges = stat_base.histogram(SAMPLE_UNIFORM, 10)
     assert hist[0] == 8
     assert [round(v, 3) for v in bin_edges] == SAMPLE_UNIFORM_BINS
 
 
 def test_chi_square_1():
-    assert stat.chi_square(8, 10) == 0.4
+    assert stat_base.chi_square(8, 10) == 0.4
 
 
 def test_chi_square_sample_1():
     sample = SAMPLE_UNIFORM
-    assert stat.sample_chi_square(sample, exp_distr="uniform") == 5.2
+    assert stat_base.sample_chi_square(sample, exp_distr="uniform") == 5.2
 
 
 def test_chi_square_sample_2():
     sample = SAMPLE_UNIFORM
-    assert stat.sample_chi_square(sample, exp_distr="normal") == 13040.443719539066
+    assert stat_base.sample_chi_square(sample, exp_distr="normal") == 13040.443719539066
 
 
 def test_chi_square_test_1():
     sample = SAMPLE_UNIFORM
-    assert stat.sample_chi_square_test(sample, exp_distr="uniform", p=0.05)
+    assert stat_base.sample_chi_square_test(sample, exp_distr="uniform", p=0.05)
 
 
 def test_chi_square_test_2():
     sample = SAMPLE_UNIFORM
-    assert not stat.sample_chi_square_test(sample, exp_distr="normal", p=0.05)
+    assert not stat_base.sample_chi_square_test(sample, exp_distr="normal", p=0.05)

@@ -53,7 +53,6 @@ class PacketProcessingOutput(NamedTuple):
 
 @dataclass
 class PacketSwitchStat(Stat):
-    _ctx: SimContext = field(repr=False)
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
 
@@ -130,13 +129,6 @@ class PacketSwitchStat(Stat):
         self.total_sent_bytes: PacketSize = 0
         self.total_received_bytes: PacketSize = 0
         self.total_dropped_bytes: PacketSize = 0
-
-        self.avg_send_rate_pps: RatePPS = 0
-        self.avg_receive_rate_pps: RatePPS = 0
-        self.avg_drop_rate_pps: RatePPS = 0
-        self.avg_send_rate_bps: RateBPS = 0
-        self.avg_receive_rate_bps: RateBPS = 0
-        self.avg_drop_rate_bps: RateBPS = 0
 
 
 class PacketProcessor(PacketQueue):
@@ -229,7 +221,7 @@ class PacketProcessor(PacketQueue):
     def put(
         self,
         item: Packet,
-        source: Union[Sender, SenderReceiver] = None,
+        source: Union[Sender, SenderReceiver],
         *args: List[Any],
         **kwargs: Dict[str, Any],
     ):
@@ -317,7 +309,7 @@ class PacketSwitch(SenderReceiver):
     def put(
         self,
         item: Packet,
-        source: Optional[Union[Sender, SenderReceiver]] = None,
+        source: Union[Sender, SenderReceiver],
         *args: List[Any],
         **kwargs: Dict[str, Any],
     ):

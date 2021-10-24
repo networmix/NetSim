@@ -33,6 +33,7 @@ class PacketStat(Stat):  # pylint: disable=too-many-instance-attributes
     total_sent_bytes: PacketSize = 0
     total_received_bytes: PacketSize = 0
     total_dropped_bytes: PacketSize = 0
+
     received_pkts_hist: DefaultDict[SimTime, int] = field(
         repr=False, default_factory=lambda: defaultdict(int)
     )
@@ -51,6 +52,7 @@ class PacketStat(Stat):  # pylint: disable=too-many-instance-attributes
     dropped_size_hist: DefaultDict[SimTime, PacketSize] = field(
         repr=False, default_factory=lambda: defaultdict(int)
     )
+
     avg_send_rate_pps: RatePPS = 0
     avg_receive_rate_pps: RatePPS = 0
     avg_drop_rate_pps: RatePPS = 0
@@ -99,22 +101,19 @@ class PacketStat(Stat):  # pylint: disable=too-many-instance-attributes
         self.total_sent_bytes: PacketSize = 0
         self.total_received_bytes: PacketSize = 0
         self.total_dropped_bytes: PacketSize = 0
+
         self.received_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
         self.sent_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
         self.dropped_pkts_hist: DefaultDict[SimTime, int] = defaultdict(int)
         self.received_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
         self.sent_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
         self.dropped_size_hist: DefaultDict[SimTime, PacketSize] = defaultdict(int)
-        self.avg_send_rate_pps: RatePPS = 0
-        self.avg_receive_rate_pps: RatePPS = 0
-        self.avg_drop_rate_pps: RatePPS = 0
-        self.avg_send_rate_bps: RateBPS = 0
-        self.avg_receive_rate_bps: RateBPS = 0
-        self.avg_drop_rate_bps: RateBPS = 0
 
 
 @dataclass
 class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
+    _wait_tracker: Dict[PacketID, SimTime] = field(default_factory=dict)
+
     prev_timestamp: SimTime = 0
     cur_timestamp: SimTime = 0
 
@@ -125,10 +124,18 @@ class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
     total_put_bytes: PacketSize = 0
     total_dropped_bytes: PacketSize = 0
 
+    avg_put_rate_pps: RatePPS = 0
+    avg_get_rate_pps: RatePPS = 0
+
     prev_queue_len: int = 0
     cur_queue_len: int = 0
     avg_queue_len: float = 0
     max_queue_len: int = 0
+
+    prev_wait_time_sum: SimTime = 0
+    cur_wait_time_sum: SimTime = 0
+    avg_wait_time: SimTime = 0
+    max_wait_time: SimTime = 0
 
     def _update_timestamp(self) -> None:
         if self._ctx.now != self.cur_timestamp:
@@ -138,11 +145,15 @@ class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
         self.total_get_pkts += 1
         self.total_get_bytes += packet.size
         self.cur_queue_len -= 1
+        wait_time = self.cur_timestamp - self._wait_tracker[packet.packet_id]
+        self.max_wait_time = max(self.max_wait_time, wait_time)
+        self.cur_wait_time_sum += wait_time
 
     def packet_put(self, packet: Packet):
         self.total_put_pkts += 1
         self.total_put_bytes += packet.size
         self.cur_queue_len += 1
+        self._wait_tracker[packet.packet_id] = self.cur_timestamp
 
     def packet_dropped(self, packet: Packet):
         self.total_dropped_pkts += 1
@@ -155,9 +166,16 @@ class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
         self.prev_queue_len = self.cur_queue_len
         self.max_queue_len = max(self.max_queue_len, self.cur_queue_len)
 
+    def _update_wait_time(self) -> None:
+        self.avg_wait_time += self.cur_wait_time_sum * (
+            self.cur_timestamp - self.prev_timestamp
+        )
+        self.prev_wait_time_sum, self.cur_wait_time_sum = self.cur_wait_time_sum, 0
+
     def update_stat(self) -> None:
         self._update_timestamp()
         self._update_queue_len()
+        self._update_wait_time()
 
     def reset_stat(self) -> None:
         self.total_get_pkts: int = 0
@@ -167,10 +185,8 @@ class PacketQueueStat(Stat):  # pylint: disable=too-many-instance-attributes
         self.total_put_bytes: PacketSize = 0
         self.total_dropped_bytes: PacketSize = 0
 
-        self.prev_queue_len: int = 0
-        self.cur_queue_len: int = 0
-        self.avg_queue_len: float = 0
         self.max_queue_len: int = 0
+        self.max_wait_time: int = 0
 
 
 @dataclass
