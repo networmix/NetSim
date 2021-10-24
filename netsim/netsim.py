@@ -58,10 +58,11 @@ class NetStatCollector(StatCollector):
         self._nsim = nsim
         self._stat_container: NetSimStat = self._stat_container
 
-    def _collect(self, reset: bool) -> Event:
+    def _collect(self, update: bool, reset: bool) -> Event:
         self._stat_container.update_stat()
         for ns_obj in self._nsim.get_ns_obj_iter():
-            ns_obj.stat.update_stat()
+            if update:
+                ns_obj.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
                 self._stat_container.cur_timestamp,
@@ -103,8 +104,7 @@ class NetSim(Simulator):
         for node, node_attr in graph.get_nodes().items():
             ns_type = NS_TYPE_MAP[node_attr["ns_type"]]
             ns_attr = node_attr["ns_attr"]
-            ns_node_obj: NetSimObject = ns_type(self.ctx, **ns_attr)
-            ns_node_obj.name = node
+            ns_node_obj: NetSimObject = ns_type(self.ctx, name=node, **ns_attr)
             self._ns[node] = ns_node_obj
 
     def _parse_graph_edges(self, graph: MultiDiGraph) -> None:
@@ -117,12 +117,12 @@ class NetSim(Simulator):
 
             if isinstance(src_ns_obj, PacketSwitch):
                 src_ns_obj = src_ns_obj.create_interface_tx(
-                    f"{dst_node}%{edge_id}", **ns_edge_attr_tx
+                    f"to_{dst_node}", **ns_edge_attr_tx
                 )
 
             if isinstance(dst_ns_obj, PacketSwitch):
                 dst_ns_obj = dst_ns_obj.create_interface_rx(
-                    f"{src_node}%{edge_id}", **ns_edge_attr_rx
+                    f"from_{src_node}", **ns_edge_attr_rx
                 )
 
             src_ns_obj.subscribe(dst_ns_obj)

@@ -33,6 +33,7 @@ def test_packet_sink_1():
     sim = NetSim()
 
     def arrival_gen() -> SimTime:
+        yield 0
         while True:
             yield 1
 
@@ -48,8 +49,8 @@ def test_packet_sink_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 12
 
-    assert source.stat.total_sent_pkts == 9
-    assert sink.stat.total_received_pkts == 9
+    assert source.stat.total_sent_pkts == 10
+    assert sink.stat.total_received_pkts == 10
 
 
 def test_packet_queue_1():

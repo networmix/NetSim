@@ -6,6 +6,7 @@ from netsim.netsim_base import (
 )
 from netsim.netsim import NetSim
 from netsim.netgraph.graph import MultiDiGraph
+from .test_data.ee509_data import SCENARIO_1_STAT
 
 
 def test_ee509_scenario_1():
@@ -13,8 +14,8 @@ def test_ee509_scenario_1():
 
     def arrival_gen() -> SimTime:
         yield 0
-        for _ in range(99):
-            yield 0.1
+        while True:
+            yield 1
 
     def size_gen() -> PacketSize:
         while True:
@@ -35,19 +36,18 @@ def test_ee509_scenario_1():
     graph.add_edge("SW1", "D", ns_attr=sw1_tx_attr)
 
     sim.load_graph(graph)
-    sim.run()
+    sim.run(until_time=10)
 
     sw1: PacketSwitch = sim.get_ns_obj("SW1")
 
-    assert sw1.stat.total_sent_pkts == 21
-    assert sw1.stat.total_received_pkts == 100
-    assert sw1.stat.total_dropped_pkts == 79
-    assert sw1.stat.total_sent_bytes == 21000
-    assert sw1.stat.total_received_bytes == 100000
-    assert sw1.stat.total_dropped_bytes == 79000
-    assert sw1.stat.avg_send_rate_pps == 2.0
-    assert sw1.stat.avg_receive_rate_pps == 9.523809523809524
-    assert sw1.stat.avg_drop_rate_pps == 7.523809523809524
-    assert sw1.stat.avg_send_rate_bps == 16000.0
-    assert sw1.stat.avg_receive_rate_bps == 76190.47619047618
-    assert sw1.stat.avg_drop_rate_bps == 60190.47619047619
+    assert sw1.stat.total_sent_pkts == 10
+    assert sw1.stat.total_received_pkts == 10
+    assert sw1.stat.total_dropped_pkts == 0
+    assert sw1.stat.total_sent_bytes == 10000
+    assert sw1.stat.total_received_bytes == 10000
+    assert sw1.stat.total_dropped_bytes == 0
+
+    import pprint
+
+    pprint.pprint(sim.nstat.todict())
+    assert sim.nstat.todict() == SCENARIO_1_STAT

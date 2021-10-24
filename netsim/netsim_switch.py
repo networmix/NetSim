@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 import logging
@@ -16,6 +17,7 @@ from typing import (
 from netsim.simcore import Coro, SimTime, SimContext, Stat
 from netsim.netsim_base import (
     InterfaceBW,
+    NetSimObjectName,
     Packet,
     PacketInterfaceRx,
     PacketInterfaceTx,
@@ -110,6 +112,8 @@ class PacketSwitchStat(Stat):
             self.total_dropped_bytes += processor.total_dropped_bytes
 
     def _update_avg(self) -> None:
+        if not self.cur_timestamp:
+            return
         self.avg_send_rate_pps = self.total_sent_pkts / self.cur_timestamp
         self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.cur_timestamp
         self.avg_receive_rate_pps = self.total_received_pkts / self.cur_timestamp
@@ -130,23 +134,40 @@ class PacketSwitchStat(Stat):
         self.total_received_bytes: PacketSize = 0
         self.total_dropped_bytes: PacketSize = 0
 
+    def todict(self) -> Dict[str, Any]:
+        ret = defaultdict(dict)
+
+        for item_dict_name in [
+            "rx_interfaces",
+            "tx_interfaces",
+            "rx_interface_queues",
+            "tx_interface_queues",
+            "packet_processors",
+        ]:
+            for name, stat in getattr(self, item_dict_name).items():
+                ret[item_dict_name][name] = stat.todict()
+        return dict(ret)
+
 
 class PacketProcessor(PacketQueue):
     def __init__(
         self,
         ctx: SimContext,
         processing_delay: Optional[Generator] = None,
+        name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx)
+        super().__init__(ctx, name=name)
         self._processing_delay: Optional[Generator] = processing_delay
         self._rx_interfaces: List[PacketInterfaceIn] = []
         self._tx_interfaces: List[PacketInterfaceOut] = []
 
     def add_interface_tx(self, tx_interface: PacketInterfaceOut) -> None:
         self._tx_interfaces.append(tx_interface)
+        tx_interface.extend_name(f"{self.name}_", prepend=True)
 
     def add_interface_rx(self, rx_interface: PacketInterfaceIn) -> None:
         self._rx_interfaces.append(rx_interface)
+        rx_interface.extend_name(f"{self.name}_", prepend=True)
         rx_interface.subscribe(self)
 
     def _process_packet(
@@ -179,9 +200,8 @@ class PacketProcessor(PacketQueue):
                 self._busy = True
                 self._packet_get(packet)
                 logger.debug(
-                    "Packet processing started by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet processing started by %s at %s",
+                    self,
                     self._ctx.now,
                 )
                 if self._processing_delay:
@@ -196,11 +216,9 @@ class PacketProcessor(PacketQueue):
                             packet_processing_item_out.packet, self
                         )
                         logger.debug(
-                            "Packet put into %s_%s by %s_%s at %s",
-                            type(self).__name__,
-                            self._process.proc_id,
-                            type(packet_processing_item_out.interface).__name__,
-                            packet_processing_item_out.interface._process.proc_id,
+                            "Packet put into %s by %s at %s",
+                            self,
+                            packet_processing_item_out.interface,
                             self._ctx.now,
                         )
                         self._packet_sent(packet_processing_item_out.packet)
@@ -208,14 +226,13 @@ class PacketProcessor(PacketQueue):
                     self._packet_dropped(packet)
                 self._busy = False
                 logger.debug(
-                    "Packet processing finished by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet processing finished by %s at %s",
+                    self,
                     self._ctx.now,
                 )
             else:
                 raise RuntimeError(
-                    f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self._ctx.now}",
                 )
 
     def put(
@@ -230,16 +247,15 @@ class PacketProcessor(PacketQueue):
         self._queue.put(packet_processing_item)
         self._packet_put(item)
         logger.debug(
-            "Packet received by %s_%s at %s",
-            type(self).__name__,
-            self._process.proc_id,
+            "Packet received by %s at %s",
+            self,
             self._ctx.now,
         )
 
 
 class PacketSwitch(SenderReceiver):
-    def __init__(self, ctx: SimContext):
-        super().__init__(ctx)
+    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+        super().__init__(ctx, name=name)
         self._packet_processors: Dict[PacketProcessorName, PacketProcessor] = {}
         self._rx_interfaces: Dict[InterfaceName, PacketInterfaceRx] = {}
         self._tx_interfaces: Dict[InterfaceName, PacketInterfaceTx] = {}
@@ -264,7 +280,8 @@ class PacketSwitch(SenderReceiver):
         bw: InterfaceBW,
         queue_len_limit: Optional[int] = None,
     ) -> PacketInterfaceTx:
-        tx_interface = PacketInterfaceTx(self._ctx, bw, queue_len_limit)
+        name = f"{self.name}_interface_TX_{interface_name}"
+        tx_interface = PacketInterfaceTx(self._ctx, bw, queue_len_limit, name=name)
         self._tx_interfaces[interface_name] = tx_interface
         return tx_interface
 
@@ -274,19 +291,26 @@ class PacketSwitch(SenderReceiver):
         propagation_delay: Optional[SimTime],
         transmission_len_limit: Optional[int] = None,
     ) -> PacketInterfaceRx:
+        name = f"{self.name}_interface_RX_{interface_name}"
         rx_interface = PacketInterfaceRx(
-            self._ctx, propagation_delay, transmission_len_limit
+            self._ctx, propagation_delay, transmission_len_limit, name=name
         )
         self._rx_interfaces[interface_name] = rx_interface
         return rx_interface
 
     def create_packet_processor(
         self,
-        processor_name: Optional[PacketProcessorName] = "0",
+        processor_name: Optional[PacketProcessorName] = None,
         processing_delay: Optional[SimTime] = None,
     ) -> PacketProcessor:
-        packet_processor = PacketProcessor(self._ctx, processing_delay)
-        self._packet_processors[processor_name] = packet_processor
+        if not processor_name:
+            processor_name = "PacketProcessor"
+        if processor_name not in self._packet_processors:
+            packet_processor = PacketProcessor(
+                self._ctx, processing_delay, name=processor_name
+            )
+            packet_processor.extend_name(f"{self.name}_", prepend=True)
+            self._packet_processors[processor_name] = packet_processor
 
         for interface_name in sorted(self._rx_interfaces):
             packet_processor.add_interface_rx(self._rx_interfaces[interface_name])
@@ -304,7 +328,7 @@ class PacketSwitch(SenderReceiver):
         raise NotImplementedError
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
-        yield self._process.noop()
+        yield
 
     def put(
         self,

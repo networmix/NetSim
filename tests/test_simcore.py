@@ -207,11 +207,12 @@ def test_simulator_stat_1():
 
     sim.run(until_time=6)
 
+    print(sim.stat)
     assert ctx.now == 6
     assert sim.event_counter == 9
     assert sim.stat.todict() == {
         "process_stat_samples": {
-            1: {
+            "StatCollector_1": {
                 (0, 3): {
                     "prev_timestamp": 2,
                     "cur_timestamp": 3,
@@ -225,7 +226,7 @@ def test_simulator_stat_1():
                     "avg_event_rate": 0.16666666666666666,
                 },
             },
-            2: {
+            "Process_2": {
                 (0, 3): {
                     "prev_timestamp": 2,
                     "cur_timestamp": 3,

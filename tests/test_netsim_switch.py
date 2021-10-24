@@ -57,7 +57,7 @@ def test_packet_processor_2():
 
     sim.run(until_time=10)
     assert sim.ctx.now == 10
-    assert sim.event_counter == 33
+    assert sim.event_counter == 32
 
     assert source.stat.total_sent_pkts == 10
     assert packet_processor.stat.total_received_pkts == 10
@@ -90,7 +90,7 @@ def test_packet_switch_1():
     sim.run(until_time=10)
 
     assert sim.ctx.now == 10
-    assert sim.event_counter == 84
+    assert sim.event_counter == 82
 
     assert source.stat.total_sent_pkts == 10
 

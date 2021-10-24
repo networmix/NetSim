@@ -1,4 +1,4 @@
-# pylint: disable=too-many-instance-attributes
+# pylint: disable=too-many-instance-attributes,too-many-lines
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -63,6 +63,8 @@ class Stat:
     def todict(self) -> Dict[str, Any]:
         return {
             field.name: deepcopy(getattr(self, field.name))
+            if not isinstance(getattr(self, field.name), defaultdict)
+            else dict(deepcopy(getattr(self, field.name)))
             for field in fields(self)
             if not field.name.startswith("_")
         }
@@ -70,8 +72,8 @@ class Stat:
 
 @dataclass
 class SimStat(Stat):
-    process_stat_samples: Dict[ProcessID, StatSamples] = field(default_factory=dict)
-    resource_stat_samples: Dict[ProcessID, StatSamples] = field(default_factory=dict)
+    process_stat_samples: Dict[ProcessName, StatSamples] = field(default_factory=dict)
+    resource_stat_samples: Dict[ResourceName, StatSamples] = field(default_factory=dict)
 
     def update_stat(self) -> None:
         self._update_timestamp()
@@ -81,18 +83,13 @@ class SimStat(Stat):
 
     def todict(self) -> Dict[str, Any]:
         ret = defaultdict(dict)
-        for proc_id, statsamples in self.process_stat_samples.items():
-            for interval, statsample in statsamples.items():
-                ret["process_stat_samples"].setdefault(proc_id, {})[
-                    interval
-                ] = statsample.todict()
 
-        for proc_id, statsamples in self.resource_stat_samples.items():
-            for interval, statsample in statsamples.items():
-                ret["resource_stat_samples"].setdefault(proc_id, {})[
-                    interval
-                ] = statsample.todict()
-
+        for item_dict_name in ["process_stat_samples", "resource_stat_samples"]:
+            for name, stat in getattr(self, item_dict_name).items():
+                for interval, statsample in stat.items():
+                    ret[item_dict_name].setdefault(name, {})[
+                        interval
+                    ] = statsample.todict()
         return dict(ret)
 
 
@@ -106,6 +103,8 @@ class ProcessStat(Stat):
         self.event_count += 1
 
     def _update_avg(self) -> None:
+        if not self.cur_timestamp:
+            return
         self.avg_event_rate = self.event_count / self.cur_timestamp
 
     def update_stat(self) -> None:
@@ -146,6 +145,8 @@ class ResourceStat(Stat):
         self.get_processed_count += 1
 
     def _update_avg(self) -> None:
+        if not self.cur_timestamp:
+            return
         self.avg_put_requested_rate = self.put_requested_count / self.cur_timestamp
         self.avg_get_requested_rate = self.get_requested_count / self.cur_timestamp
         self.avg_put_processed_rate = self.put_processed_count / self.cur_timestamp
@@ -205,9 +206,10 @@ class QueueStat(ResourceStat):
 
 
 class Process:
-    def __init__(self, ctx: SimContext, coro: Coro):
+    def __init__(self, ctx: SimContext, coro: Coro, name: Optional[ProcessName] = None):
         self._ctx: SimContext = ctx
         self._proc_id: ProcessID = ctx.get_next_process_id()
+        self._name = name if name else f"{type(self).__name__}_{self._proc_id}"
         self._coro: Coro = coro
         self._subscribers: List[Process] = [self]
         self._stopped: bool = False
@@ -217,12 +219,21 @@ class Process:
         self.stat_callbacks: List[StatCallback] = [self.stat.update_stat]
 
     def __repr__(self) -> str:
-        type_name = type(self).__name__
-        return f"{type_name}(proc_id={self._proc_id}, coro={self._coro})"
+        return f"{self._name}(proc_id={self._proc_id}, coro={self._coro})"
 
     @property
     def proc_id(self) -> ProcessID:
         return self._proc_id
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def extend_name(self, extension: str, prepend: bool = False) -> None:
+        if prepend:
+            self._name = extension + self._name
+        else:
+            self._name = self._name + extension
 
     @property
     def in_timeout(self) -> bool:
@@ -294,34 +305,41 @@ class Process:
 
 class StatCollector(Process):
     def __init__(
-        self, ctx: SimContext, stat_interval: SimTime, stat_container: SimStat
+        self,
+        ctx: SimContext,
+        stat_interval: SimTime,
+        stat_container: SimStat,
+        name: Optional[ProcessName] = None,
     ):
         self._stat_interval = stat_interval
         self._stat_container = stat_container
-        super().__init__(ctx, self._collection_trigger())
+        super().__init__(ctx, self._collection_trigger(), name=name)
 
-    def _collect(self, reset: bool) -> None:
+    def _collect(self, update: bool, reset: bool) -> None:
         self._stat_container.update_stat()
+
         for process in self._ctx.get_process_iter():
-            process.stat.update_stat()
+            if update:
+                process.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
                 self._stat_container.cur_timestamp,
             )
 
-            self._stat_container.process_stat_samples.setdefault(process.proc_id, {})[
+            self._stat_container.process_stat_samples.setdefault(process.name, {})[
                 interval
             ] = deepcopy(process.stat)
             if reset:
                 process.stat.reset_stat()
 
         for resource in self._ctx.get_resource_iter():
-            resource.stat.update_stat()
+            if update:
+                resource.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
                 self._stat_container.cur_timestamp,
             )
-            self._stat_container.process_stat_samples.setdefault(resource.proc_id, {})[
+            self._stat_container.process_stat_samples.setdefault(resource.name, {})[
                 interval
             ] = deepcopy(resource.stat)
             if reset:
@@ -331,24 +349,49 @@ class StatCollector(Process):
         if self._stat_interval:
             while True:
                 yield CollectStat(self._ctx, delay=self._stat_interval, process=self)
-                self._collect(reset=True)
+                self._collect(update=True, reset=True)
         else:
             yield
 
-    def collect_now(self) -> Event:
-        yield CollectStat(self._ctx, delay=0, process=self)
-        self._collect(reset=False)
+    def collect_now(self) -> None:
+        self._collect(
+            update=False,
+            reset=False,
+        )
 
 
 class Resource(ABC):
-    def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
+    def __init__(
+        self,
+        ctx: SimContext,
+        capacity: Optional[int] = None,
+        name: Optional[ResourceName] = None,
+    ):
         self._ctx = ctx
         self._capacity: Optional[int] = capacity
         self._res_id: ResourceID = ctx.get_next_resource_id()
+        self._name = name if name else f"{type(self).__name__}_{self._res_id}"
         self._put_queue: Deque[Put] = deque()
         self._get_queue: Deque[Get] = deque()
         self.stat = ResourceStat(ctx)
         self.stat_callbacks: List[StatCallback] = [self.stat.update_stat]
+
+    def __repr__(self) -> str:
+        return f"{self._name}(res_id={self._res_id}, capacity={self._capacity})"
+
+    @property
+    def res_id(self) -> ResourceID:
+        return self._res_id
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def extend_name(self, extension: str, prepend: bool = False) -> None:
+        if prepend:
+            self._name = extension + self._name
+        else:
+            self._name = self._name + extension
 
     @abstractmethod
     def _put_admission_check(self, event: Put) -> bool:
@@ -433,8 +476,13 @@ class Resource(ABC):
 
 
 class QueueFIFO(Resource):
-    def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
-        super().__init__(ctx, capacity)
+    def __init__(
+        self,
+        ctx: SimContext,
+        capacity: Optional[int] = None,
+        name: Optional[ResourceName] = None,
+    ):
+        super().__init__(ctx, capacity, name)
         self._queue: Deque[Any] = deque()
         self.stat = QueueStat(ctx)
 
@@ -544,8 +592,8 @@ class Event:
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        proc_id = self._process.proc_id if self._process else None
-        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id})"
+        process_name = self._process.name if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc={process_name})"
 
     @property
     def time(self) -> SimTime:
@@ -658,8 +706,8 @@ class Timeout(Event):
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        proc_id = self._process.proc_id if self._process else None
-        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+        process_name = self._process.name if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc={process_name}, delay={self._delay})"
 
 
 class NoOp(Event):
@@ -673,8 +721,8 @@ class NoOp(Event):
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        proc_id = self._process.proc_id if self._process else None
-        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id})"
+        process_name = self._process.name if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc={process_name})"
 
 
 class StopSim(Timeout):
@@ -691,8 +739,8 @@ class StopSim(Timeout):
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        proc_id = self._process.proc_id if self._process else None
-        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+        process_name = self._process.name if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc={process_name}, delay={self._delay})"
 
 
 class CollectStat(Timeout):
@@ -708,8 +756,8 @@ class CollectStat(Timeout):
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        proc_id = self._process.proc_id if self._process else None
-        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc_id={proc_id}, delay={self._delay})"
+        process_name = self._process.name if self._process else None
+        return f"{type_name}(time={self._time}, event_id={self._event_id}, proc={process_name}, delay={self._delay})"
 
 
 class Put(Event):
@@ -869,8 +917,8 @@ class SimContext:
             self._cur_simtime = new_time
             logger.debug("\nAdvancing time to %s", new_time)
 
-    def create_process(self, coro: Coro) -> Process:
-        proc = Process(ctx=self, coro=coro)
+    def create_process(self, coro: Coro, name: Optional[ProcessName]) -> Process:
+        proc = Process(ctx=self, coro=coro, name=name)
         self._procs[proc.proc_id] = proc
         return proc
 
@@ -954,7 +1002,9 @@ SimTime = Union[int, float]
 EventPriority = int
 EventID = int
 ProcessID = int
+ProcessName = str
 ResourceID = int
+ResourceName = str
 ResourceCapacity = Union[int, float]
 StatCallback = Callable[[None], None]
 TimeInterval = Tuple[SimTime]

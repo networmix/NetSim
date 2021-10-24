@@ -83,6 +83,8 @@ class PacketStat(Stat):  # pylint: disable=too-many-instance-attributes
         self.dropped_size_hist[self.cur_timestamp] += packet.size
 
     def _update_avg(self):
+        if not self.cur_timestamp:
+            return
         self.avg_send_rate_pps = self.total_sent_pkts / self.cur_timestamp
         self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.cur_timestamp
         self.avg_receive_rate_pps = self.total_received_pkts / self.cur_timestamp
@@ -201,37 +203,44 @@ class NetSimStat(Stat):
 
     def todict(self) -> Dict[str, Any]:
         ret = defaultdict(dict)
-        for proc_id, statsamples in self.stat_samples.items():
-            for interval, statsample in statsamples.items():
-                ret["stat_samples"].setdefault(proc_id, {})[
-                    interval
-                ] = statsample.todict()
+
+        for item_dict_name in ["stat_samples"]:
+            for name, stat in getattr(self, item_dict_name).items():
+                for interval, statsample in stat.items():
+                    ret[item_dict_name].setdefault(name, {})[
+                        interval
+                    ] = statsample.todict()
         return dict(ret)
 
 
 class NetSimObject(ABC):
     _next_netsim_id: NetSimObjectID = 0
 
-    def __init__(self, ctx: SimContext):
+    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
         self._ctx: SimContext = ctx
-        self._name: NetSimObjectName = ""
         self._id, NetSimObject._next_netsim_id = (
             NetSimObject._next_netsim_id,
             NetSimObject._next_netsim_id + 1,
         )
-        self._process: Process = ctx.create_process(self.run())
+        self._name: NetSimObjectName = (
+            name if name else f"{type(self).__name__}_{self._id}"
+        )
+        self._process: Process = ctx.create_process(self.run(), self._name)
+        self._process.extend_name("_proc")
         self.stat: Stat = Stat(self._ctx)
 
-    @property
-    def name(self) -> str:
-        if self._name:
-            return self._name
-        return f"{type(self).__name__}_{self._id}"
+    def __repr__(self) -> str:
+        return f"{self._name}(process={self._process.name})"
 
-    @name.setter
-    def name(self, name: str) -> None:
-        if not self._name:
-            self._name = name
+    @property
+    def name(self) -> NetSimObjectName:
+        return self._name
+
+    def extend_name(self, extension: str, prepend: bool = False) -> None:
+        if prepend:
+            self._name = extension + self._name
+        else:
+            self._name = self._name + extension
 
     @abstractmethod
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
@@ -266,11 +275,8 @@ class Packet:
 
 
 class Sender(NetSimObject):
-    def __init__(
-        self,
-        ctx: SimContext,
-    ):
-        super().__init__(ctx)
+    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+        super().__init__(ctx, name=name)
         self._subscribers: List[Receiver] = []
         self.stat: PacketStat = PacketStat(ctx)
         self._process.add_stat_callback(self.stat.update_stat)
@@ -293,11 +299,8 @@ class Sender(NetSimObject):
 
 
 class Receiver(NetSimObject):
-    def __init__(
-        self,
-        ctx: SimContext,
-    ):
-        super().__init__(ctx)
+    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+        super().__init__(ctx, name=name)
         self.stat: PacketStat = PacketStat(ctx)
         self._process.add_stat_callback(self.stat.update_stat)
         self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
@@ -326,11 +329,8 @@ class Receiver(NetSimObject):
 
 
 class SenderReceiver(NetSimObject):
-    def __init__(
-        self,
-        ctx: SimContext,
-    ):
-        super().__init__(ctx)
+    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+        super().__init__(ctx, name=name)
         self._subscribers: List[Receiver] = []
         self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
         self.stat: PacketStat = PacketStat(ctx)
@@ -377,8 +377,9 @@ class PacketSource(Sender):
         size_func: Generator,
         flow_func: Optional[Generator] = None,
         initial_delay: SimTime = 0,
+        name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx)
+        super().__init__(ctx, name=name)
         self._arrival_func: Generator = arrival_func
         self._size_func: Generator = size_func
         self._flow_func: Optional[Generator] = flow_func
@@ -400,9 +401,8 @@ class PacketSource(Sender):
             packet = Packet(self._ctx, size, flow_id=flow)
             self._packet_sent(packet)
             logger.debug(
-                "Packet created by %s_%s at %s",
-                type(self).__name__,
-                self._process.proc_id,
+                "Packet created by %s at %s",
+                self,
                 self._ctx.now,
             )
             for subscriber in self._subscribers:
@@ -419,20 +419,25 @@ class PacketSink(Receiver):
     ) -> None:
         self._packet_received(item)
         logger.debug(
-            "Packet received by %s_%s at %s",
-            type(self).__name__,
-            self._process.proc_id,
+            "Packet received by %s at %s",
+            self,
             self._ctx.now,
         )
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
-        yield self._process.noop()
+        yield
 
 
 class PacketQueue(SenderReceiver):
-    def __init__(self, ctx: SimContext, capacity: Optional[int] = None):
-        super().__init__(ctx)
-        self._queue = QueueFIFO(ctx, capacity)
+    def __init__(
+        self,
+        ctx: SimContext,
+        capacity: Optional[int] = None,
+        name: Optional[NetSimObjectName] = None,
+    ):
+        super().__init__(ctx, name=name)
+        self._queue = QueueFIFO(ctx, capacity, name=self._name)
+        self._queue.extend_name("_QueueFIFO")
         self.queue_stat: PacketQueueStat = PacketQueueStat(ctx, self._queue)
         self._process.add_stat_callback(self.queue_stat.update_stat)
 
@@ -445,9 +450,8 @@ class PacketQueue(SenderReceiver):
                     subscriber.put(packet, self)
                 self._packet_sent(packet)
                 logger.debug(
-                    "Packet sent by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet sent by %s at %s",
+                    self,
                     self._ctx.now,
                 )
             else:
@@ -464,9 +468,8 @@ class PacketQueue(SenderReceiver):
         self._packet_received(item)
         self._packet_put(item)
         logger.debug(
-            "Packet received by %s_%s at %s",
-            type(self).__name__,
-            self._process.proc_id,
+            "Packet received by %s at %s",
+            self,
             self._ctx.now,
         )
 
@@ -487,8 +490,9 @@ class PacketInterfaceRx(PacketQueue):
         ctx: SimContext,
         propagation_delay: Optional[SimTime] = None,
         transmission_len_limit: Optional[int] = None,
+        name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx)
+        super().__init__(ctx, name=name)
         self._propagation_delay: Optional[SimTime] = propagation_delay
         self._transmission_len_limit: Optional[int] = transmission_len_limit
 
@@ -503,14 +507,13 @@ class PacketInterfaceRx(PacketQueue):
                     subscriber.put(packet, self)
                 self._packet_sent(packet)
                 logger.debug(
-                    "Packet sent by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet sent by %s at %s",
+                    self,
                     self._ctx.now,
                 )
             else:
                 raise RuntimeError(
-                    f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self._ctx.now}",
                 )
 
     def put(
@@ -527,17 +530,15 @@ class PacketInterfaceRx(PacketQueue):
             self._packet_put(item)
             self._packet_received(item)
             logger.debug(
-                "Packet received by %s_%s at %s",
-                type(self).__name__,
-                self._process.proc_id,
+                "Packet received by %s at %s",
+                self,
                 self._ctx.now,
             )
         else:
             self._packet_dropped(item)
             logger.debug(
-                "Packet dropped by %s_%s at %s",
-                type(self).__name__,
-                self._process.proc_id,
+                "Packet dropped by %s at %s",
+                self,
                 self._ctx.now,
             )
 
@@ -553,9 +554,13 @@ class PacketInterfaceRx(PacketQueue):
 
 class PacketInterfaceTx(PacketQueue):
     def __init__(
-        self, ctx: SimContext, bw: InterfaceBW, queue_len_limit: Optional[int] = None
+        self,
+        ctx: SimContext,
+        bw: InterfaceBW,
+        queue_len_limit: Optional[int] = None,
+        name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx)
+        super().__init__(ctx, name=name)
         self._bw: InterfaceBW = bw
         self._queue_len_limit: Optional[int] = queue_len_limit
         self._busy: bool = False
@@ -567,33 +572,29 @@ class PacketInterfaceTx(PacketQueue):
                 self._busy = True
                 self._packet_get(packet)
                 logger.debug(
-                    "Packet serialization started by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet serialization started by %s at %s",
+                    self,
                     self._ctx.now,
                 )
                 yield self._process.timeout(packet.size * 8 / self._bw)
                 for subscriber in self._subscribers:
                     subscriber.put(packet, self)
                     logger.debug(
-                        "Packet put into %s_%s by %s_%s at %s",
-                        type(self).__name__,
-                        self._process.proc_id,
-                        type(subscriber).__name__,
-                        subscriber._process.proc_id,
+                        "Packet put into %s by %s at %s",
+                        self,
+                        subscriber,
                         self._ctx.now,
                     )
                 self._packet_sent(packet)
                 self._busy = False
                 logger.debug(
-                    "Packet serialization finished by %s_%s at %s",
-                    type(self).__name__,
-                    self._process.proc_id,
+                    "Packet serialization finished by %s at %s",
+                    self,
                     self._ctx.now,
                 )
             else:
                 raise RuntimeError(
-                    f"Resumed {type(self).__name__}_{self._process.proc_id} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self._ctx.now}",
                 )
 
     def put(
@@ -608,17 +609,15 @@ class PacketInterfaceTx(PacketQueue):
             self._queue.put(item)
             self._packet_put(item)
             logger.debug(
-                "Packet received by %s_%s at %s",
-                type(self).__name__,
-                self._process.proc_id,
+                "Packet received by %s at %s",
+                self,
                 self._ctx.now,
             )
         else:
             self._packet_dropped(item)
             logger.debug(
-                "Packet dropped by %s_%s at %s",
-                type(self).__name__,
-                self._process.proc_id,
+                "Packet dropped by %s at %s",
+                self,
                 self._ctx.now,
             )
 
