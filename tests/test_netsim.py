@@ -2,48 +2,83 @@
 from netsim.netsim_switch import PacketSwitch
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
+    PacketSink,
     PacketSize,
 )
-from netsim.netsim import NetSim
+from netsim.netsim_simulator import NetSim
 from netsim.netgraph.graph import MultiDiGraph
+from .test_data.netsim_data import (
+    SCENARIO_1_STAT,
+    SCENARIO_2_3_STAT,
+    SCENARIO_6_STAT,
+)
 
 
 def test_netsim_load_1():
     sim = NetSim()
 
-    def arrival_gen() -> SimTime:
-        while True:
-            yield 1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1
-
     graph = MultiDiGraph()
     graph.add_node(
         "S",
         ns_type="PacketSource",
-        ns_attr={"arrival_func": arrival_gen(), "size_func": size_gen()},
+        ns_attr={
+            "flow_distr": "Constant",
+            "size_distr": "Constant",
+            "arrival_time_distr": "Constant",
+            "flow_distr_params": {"constant": 1},
+            "size_distr_params": {"constant": 1000},
+            "arrival_distr_params": {"constant": 1, "first": 0, "count": 3},
+        },
     )
+
     graph.add_node("D", ns_type="PacketSink", ns_attr={})
     graph.add_edge("S", "D", ns_attr={})
 
     sim.load_graph(graph)
 
+    assert sim.get_ns_obj("S")
+    assert sim.get_ns_obj("D")
+
 
 def test_netsim_scenario_1():
     sim = NetSim()
 
-    def arrival_gen() -> SimTime:
-        yield 0
-        while True:
-            yield 1
+    s_attr = {
+        "flow_distr": "Constant",
+        "size_distr": "Constant",
+        "arrival_time_distr": "Constant",
+        "flow_distr_params": {"constant": 1},
+        "size_distr_params": {"constant": 1000},
+        "arrival_distr_params": {"constant": 1, "first": 0, "count": 10},
+    }
+    d_attr = {}
 
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1
+    graph = MultiDiGraph()
+    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
+    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
+    graph.add_edge("S", "D", ns_attr={})
 
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
+    sim.load_graph(graph)
+    sim.run()
+
+    import pprint
+
+    pprint.pprint(sim.nstat.todict())
+
+    assert sim.nstat.todict() == SCENARIO_1_STAT
+
+
+def test_netsim_scenario_2():
+    sim = NetSim()
+
+    s_attr = {
+        "flow_distr": "Constant",
+        "size_distr": "Constant",
+        "arrival_time_distr": "Constant",
+        "flow_distr_params": {"constant": 1},
+        "size_distr_params": {"constant": 1000},
+        "arrival_distr_params": {"constant": 1, "first": 0},
+    }
     d_attr = {}
 
     graph = MultiDiGraph()
@@ -54,132 +89,44 @@ def test_netsim_scenario_1():
     sim.load_graph(graph)
     sim.run(until_time=10)
 
-
-def test_netsim_scenario_2():
-    sim = NetSim()
-
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(2):
-            yield 1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
-    d_attr = {}
-    r1_tx_attr = {"bw": 8000, "queue_len_limit": 10}
-    r2_rx_attr = {"propagation_delay": 0.0}
-
-    graph = MultiDiGraph()
-    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
-    graph.add_node("R1_TX", ns_type="PacketInterfaceTx", ns_attr=r1_tx_attr)
-    graph.add_node("R2_RX", ns_type="PacketInterfaceRx", ns_attr=r2_rx_attr)
-    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
-
-    graph.add_edge("S", "R1_TX", ns_attr={})
-    graph.add_edge("R1_TX", "R2_RX", ns_attr={})
-    graph.add_edge("R2_RX", "D", ns_attr={})
-
-    sim.load_graph(graph)
-    sim.run()
-
-    r1_tx = sim.get_ns_obj("R1_TX")
-    r2_rx = sim.get_ns_obj("R2_RX")
-
-    print(r1_tx.stat)
-    print(r2_rx.stat)
-    assert r1_tx.stat.total_sent_pkts == 3
-    assert r1_tx.stat.total_received_pkts == 3
-    assert r1_tx.stat.total_dropped_pkts == 0
-    assert r1_tx.stat.total_sent_bytes == 3000
-    assert r1_tx.stat.total_received_bytes == 3000
-    assert r1_tx.stat.total_dropped_bytes == 0
-    assert r1_tx.stat.avg_send_rate_pps == 1
-    assert r1_tx.stat.avg_receive_rate_pps == 1
-    assert r1_tx.stat.avg_drop_rate_pps == 0
-
-    assert r2_rx.stat.total_sent_pkts == 3
-    assert r2_rx.stat.total_received_pkts == 3
-    assert r2_rx.stat.total_dropped_pkts == 0
-    assert r2_rx.stat.total_sent_bytes == 3000
-    assert r2_rx.stat.total_received_bytes == 3000
-    assert r2_rx.stat.total_dropped_bytes == 0
-    assert r2_rx.stat.avg_send_rate_pps == 1
-    assert r2_rx.stat.avg_receive_rate_pps == 1
-    assert r2_rx.stat.avg_drop_rate_pps == 0
+    assert sim.nstat.todict() == SCENARIO_2_3_STAT
 
 
 def test_netsim_scenario_3():
-    sim = NetSim()
+    sim = NetSim(stat_interval=10)
 
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(9):
-            yield 1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
+    s_attr = {
+        "flow_distr": "Constant",
+        "size_distr": "Constant",
+        "arrival_time_distr": "Constant",
+        "flow_distr_params": {"constant": 1},
+        "size_distr_params": {"constant": 1000},
+        "arrival_distr_params": {"constant": 1, "first": 0},
+    }
     d_attr = {}
-    r1_tx_attr = {"bw": 16000, "queue_len_limit": 10}
-    r2_rx_attr = {"propagation_delay": 0.5}
 
     graph = MultiDiGraph()
     graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
-    graph.add_node("R1_TX", ns_type="PacketInterfaceTx", ns_attr=r1_tx_attr)
-    graph.add_node("R2_RX", ns_type="PacketInterfaceRx", ns_attr=r2_rx_attr)
     graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
-
-    graph.add_edge("S", "R1_TX", ns_attr={})
-    graph.add_edge("R1_TX", "R2_RX", ns_attr={})
-    graph.add_edge("R2_RX", "D", ns_attr={})
+    graph.add_edge("S", "D", ns_attr={})
 
     sim.load_graph(graph)
-    sim.run()
+    sim.run(until_time=10)
 
-    r1_tx = sim.get_ns_obj("R1_TX")
-    r2_rx = sim.get_ns_obj("R2_RX")
-
-    print(r1_tx.stat)
-    print(r2_rx.stat)
-    assert r1_tx.stat.total_sent_pkts == 10
-    assert r1_tx.stat.total_received_pkts == 10
-    assert r1_tx.stat.total_dropped_pkts == 0
-    assert r1_tx.stat.total_sent_bytes == 10000
-    assert r1_tx.stat.total_received_bytes == 10000
-    assert r1_tx.stat.total_dropped_bytes == 0
-    assert r1_tx.stat.avg_send_rate_pps == 1
-    assert r1_tx.stat.avg_receive_rate_pps == 1
-    assert r1_tx.stat.avg_drop_rate_pps == 0
-
-    assert r2_rx.stat.total_sent_pkts == 10
-    assert r2_rx.stat.total_received_pkts == 10
-    assert r2_rx.stat.total_dropped_pkts == 0
-    assert r2_rx.stat.total_sent_bytes == 10000
-    assert r2_rx.stat.total_received_bytes == 10000
-    assert r2_rx.stat.total_dropped_bytes == 0
-    assert r2_rx.stat.avg_send_rate_pps == 1
-    assert r2_rx.stat.avg_receive_rate_pps == 1
-    assert r2_rx.stat.avg_drop_rate_pps == 0
+    assert sim.nstat.todict() == SCENARIO_2_3_STAT
 
 
 def test_netsim_scenario_4():
     sim = NetSim()
 
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(9):
-            yield 0.1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
+    s_attr = {
+        "flow_distr": "Constant",
+        "size_distr": "Constant",
+        "arrival_time_distr": "Constant",
+        "flow_distr_params": {"constant": 1},
+        "size_distr_params": {"constant": 1000},
+        "arrival_distr_params": {"constant": 0.1, "first": 0, "count": 10},
+    }
     d_attr = {}
     r1_tx_attr = {"bw": 16000, "queue_len_limit": 2}
     r2_rx_attr = {"propagation_delay": 0.5}
@@ -200,144 +147,102 @@ def test_netsim_scenario_4():
     r1_tx = sim.get_ns_obj("R1_TX")
     r2_rx = sim.get_ns_obj("R2_RX")
 
-    print(r1_tx.stat)
-    print(r2_rx.stat)
-    assert r1_tx.stat.total_sent_pkts == 4
-    assert r1_tx.stat.total_received_pkts == 10
-    assert r1_tx.stat.total_dropped_pkts == 6
-    assert r1_tx.stat.total_sent_bytes == 4000
-    assert r1_tx.stat.total_received_bytes == 10000
-    assert r1_tx.stat.total_dropped_bytes == 6000
-    assert r1_tx.stat.avg_send_rate_pps == 1.6
-    assert r1_tx.stat.avg_receive_rate_pps == 4
-    assert r1_tx.stat.avg_drop_rate_pps == 2.4
+    assert r1_tx.stat.cur_stat_frame.todict() == {
+        "timestamp": 2.5,
+        "duration": 2.5,
+        "last_state_change_timestamp": 2.0,
+        "total_sent_pkts": 4,
+        "total_received_pkts": 10,
+        "total_dropped_pkts": 6,
+        "total_sent_bytes": 4000,
+        "total_received_bytes": 10000,
+        "total_dropped_bytes": 6000,
+        "received_pkts_hist": {
+            0: 1,
+            0.1: 1,
+            0.2: 1,
+            0.30000000000000004: 1,
+            0.4: 1,
+            0.5: 1,
+            0.6: 1,
+            0.7: 1,
+            0.7999999999999999: 1,
+            0.8999999999999999: 1,
+        },
+        "sent_pkts_hist": {0.5: 1, 1.0: 1, 1.5: 1, 2.0: 1},
+        "dropped_pkts_hist": {
+            0.30000000000000004: 1,
+            0.4: 1,
+            0.6: 1,
+            0.7: 1,
+            0.7999999999999999: 1,
+            0.8999999999999999: 1,
+        },
+        "received_size_hist": {
+            0: 1000,
+            0.1: 1000,
+            0.2: 1000,
+            0.30000000000000004: 1000,
+            0.4: 1000,
+            0.5: 1000,
+            0.6: 1000,
+            0.7: 1000,
+            0.7999999999999999: 1000,
+            0.8999999999999999: 1000,
+        },
+        "sent_size_hist": {0.5: 1000, 1.0: 1000, 1.5: 1000, 2.0: 1000},
+        "dropped_size_hist": {
+            0.30000000000000004: 1000,
+            0.4: 1000,
+            0.6: 1000,
+            0.7: 1000,
+            0.7999999999999999: 1000,
+            0.8999999999999999: 1000,
+        },
+        "avg_send_rate_pps": 1.6,
+        "avg_receive_rate_pps": 4.0,
+        "avg_drop_rate_pps": 2.4,
+        "avg_send_rate_bps": 12800.0,
+        "avg_receive_rate_bps": 32000.0,
+        "avg_drop_rate_bps": 19200.0,
+    }
 
-    assert r2_rx.stat.total_sent_pkts == 4
-    assert r2_rx.stat.total_received_pkts == 4
-    assert r2_rx.stat.total_dropped_pkts == 0
-    assert r2_rx.stat.total_sent_bytes == 4000
-    assert r2_rx.stat.total_received_bytes == 4000
-    assert r2_rx.stat.total_dropped_bytes == 0
-    assert r2_rx.stat.avg_send_rate_pps == 1.6
-    assert r2_rx.stat.avg_receive_rate_pps == 1.6
-    assert r2_rx.stat.avg_drop_rate_pps == 0
-
-
-def test_netsim_scenario_5():
-    sim = NetSim()
-
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(99):
-            yield 0.1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
-    d_attr = {}
-    r1_tx_attr = {"bw": 16000, "queue_len_limit": 1}
-    r2_rx_attr = {"propagation_delay": 0.0}
-
-    graph = MultiDiGraph()
-    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
-    graph.add_node("R1_TX", ns_type="PacketInterfaceTx", ns_attr=r1_tx_attr)
-    graph.add_node("R2_RX", ns_type="PacketInterfaceRx", ns_attr=r2_rx_attr)
-    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
-
-    graph.add_edge("S", "R1_TX", ns_attr={})
-    graph.add_edge("R1_TX", "R2_RX", ns_attr={})
-    graph.add_edge("R2_RX", "D", ns_attr={})
-
-    sim.load_graph(graph)
-    sim.run(until_time=10)
-
-    r1_tx = sim.get_ns_obj("R1_TX")
-    r2_rx = sim.get_ns_obj("R2_RX")
-
-    print(r1_tx.stat)
-    print(r2_rx.stat)
-    assert r1_tx.stat.total_sent_pkts == 19
-    assert r1_tx.stat.total_received_pkts == 100
-    assert r1_tx.stat.total_dropped_pkts == 79
-    assert r1_tx.stat.total_sent_bytes == 19000
-    assert r1_tx.stat.total_received_bytes == 100000
-    assert r1_tx.stat.total_dropped_bytes == 79000
-    assert r1_tx.stat.avg_send_rate_pps == 1.9
-    assert r1_tx.stat.avg_receive_rate_pps == 10
-    assert r1_tx.stat.avg_drop_rate_pps == 7.9
-
-    assert r2_rx.stat.total_sent_pkts == 19
-    assert r2_rx.stat.total_received_pkts == 19
-    assert r2_rx.stat.total_dropped_pkts == 0
-    assert r2_rx.stat.total_sent_bytes == 19000
-    assert r2_rx.stat.total_received_bytes == 19000
-    assert r2_rx.stat.total_dropped_bytes == 0
-    assert r2_rx.stat.avg_send_rate_pps == 1.9
-    assert r2_rx.stat.avg_receive_rate_pps == 1.9
-    assert r2_rx.stat.avg_drop_rate_pps == 0
+    assert r2_rx.stat.cur_stat_frame.todict() == {
+        "timestamp": 2.5,
+        "duration": 2.5,
+        "last_state_change_timestamp": 2.5,
+        "total_sent_pkts": 4,
+        "total_received_pkts": 4,
+        "total_dropped_pkts": 0,
+        "total_sent_bytes": 4000,
+        "total_received_bytes": 4000,
+        "total_dropped_bytes": 0,
+        "received_pkts_hist": {0.5: 1, 1.0: 1, 1.5: 1, 2.0: 1},
+        "sent_pkts_hist": {1.0: 1, 1.5: 1, 2.0: 1, 2.5: 1},
+        "dropped_pkts_hist": {},
+        "received_size_hist": {0.5: 1000, 1.0: 1000, 1.5: 1000, 2.0: 1000},
+        "sent_size_hist": {1.0: 1000, 1.5: 1000, 2.0: 1000, 2.5: 1000},
+        "dropped_size_hist": {},
+        "avg_send_rate_pps": 1.6,
+        "avg_receive_rate_pps": 1.6,
+        "avg_drop_rate_pps": 0.0,
+        "avg_send_rate_bps": 12800.0,
+        "avg_receive_rate_bps": 12800.0,
+        "avg_drop_rate_bps": 0.0,
+    }
 
 
 def test_netsim_scenario_6():
-    sim = NetSim()
+    sim = NetSim(stat_interval=2)
 
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(99):
-            yield 0.1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
-    d_attr = {}
-    sw1_attr = {}
-    sw1_tx_attr = {"tx": {"bw": 16000, "queue_len_limit": 1}}
-    sw1_rx_attr = {"rx": {"propagation_delay": 0.0}}
-
-    graph = MultiDiGraph()
-    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
-    graph.add_node("SW1", ns_type="PacketSwitch", ns_attr=sw1_attr)
-    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
-
-    graph.add_edge("S", "SW1", ns_attr=sw1_rx_attr)
-    graph.add_edge("SW1", "D", ns_attr=sw1_tx_attr)
-
-    sim.load_graph(graph)
-    sim.run()
-
-    sw1: PacketSwitch = sim.get_ns_obj("SW1")
-
-    print(sw1.stat)
-    assert sw1.stat.total_sent_pkts == 21
-    assert sw1.stat.total_received_pkts == 100
-    assert sw1.stat.total_dropped_pkts == 79
-    assert sw1.stat.total_sent_bytes == 21000
-    assert sw1.stat.total_received_bytes == 100000
-    assert sw1.stat.total_dropped_bytes == 79000
-    assert sw1.stat.avg_send_rate_pps == 2.0
-    assert sw1.stat.avg_receive_rate_pps == 9.523809523809524
-    assert sw1.stat.avg_drop_rate_pps == 7.523809523809524
-    assert sw1.stat.avg_send_rate_bps == 16000.0
-    assert sw1.stat.avg_receive_rate_bps == 76190.47619047618
-    assert sw1.stat.avg_drop_rate_bps == 60190.47619047619
-
-
-def test_netsim_scenario_7():
-    sim = NetSim()
-
-    def arrival_gen() -> SimTime:
-        yield 0
-        for _ in range(99):
-            yield 0.1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
+    s_attr = {
+        "flow_distr": "Constant",
+        "size_distr": "Constant",
+        "arrival_time_distr": "Constant",
+        "flow_distr_params": {"constant": 1},
+        "size_distr_params": {"constant": 1000},
+        "arrival_distr_params": {"constant": 0.1},
+    }
     d_attr = {}
     sw_attr = {}
     link_attr = {
@@ -356,54 +261,9 @@ def test_netsim_scenario_7():
     graph.add_edge("SW2", "D", ns_attr=link_attr)
 
     sim.load_graph(graph)
-    sim.run()
+    # sim.enable_stat_trace()
+    sim.run(until_time=4)
 
-    sw1: PacketSwitch = sim.get_ns_obj("SW1")
-
-    print(sw1.stat)
-    assert sw1.stat.total_sent_pkts == 21
-    assert sw1.stat.total_received_pkts == 100
-    assert sw1.stat.total_dropped_pkts == 79
-
-    sw2: PacketSwitch = sim.get_ns_obj("SW2")
-
-    print(sw2.stat)
-    assert sw2.stat.total_sent_pkts == 21
-    assert sw2.stat.total_received_pkts == 21
-    assert sw2.stat.total_dropped_pkts == 0
-
-
-def test_netsim_scenario_8():
-    sim = NetSim(stat_interval=10)
-
-    def arrival_gen() -> SimTime:
-        while True:
-            yield 0.1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1000
-
-    s_attr = {"arrival_func": arrival_gen(), "size_func": size_gen()}
-    d_attr = {}
-    sw_attr = {}
-    link_attr = {
-        "tx": {"bw": 16000, "queue_len_limit": 1},
-        "rx": {"propagation_delay": 0.0},
-    }
-
-    graph = MultiDiGraph()
-    graph.add_node("S", ns_type="PacketSource", ns_attr=s_attr)
-    graph.add_node("SW1", ns_type="PacketSwitch", ns_attr=sw_attr)
-    graph.add_node("SW2", ns_type="PacketSwitch", ns_attr=sw_attr)
-    graph.add_node("D", ns_type="PacketSink", ns_attr=d_attr)
-
-    graph.add_edge("S", "SW1", ns_attr=link_attr)
-    graph.add_edge("SW1", "SW2", ns_attr=link_attr)
-    graph.add_edge("SW2", "D", ns_attr=link_attr)
-
-    sim.load_graph(graph)
-    sim.run(until_time=100)
-
-    assert len(sim.nstat.stat_samples["SW1"]) == 10
-    assert len(sim.nstat.stat_samples["SW2"]) == 10
+    # sw1.stat.get_stat_tracer().seek(0)
+    # print(sw1.stat.get_stat_tracer().read())
+    assert sim.nstat.todict() == SCENARIO_6_STAT

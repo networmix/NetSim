@@ -15,7 +15,7 @@ from netsim.instructions import ExecutionContext, Instruction
 
 
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -49,9 +49,12 @@ class CreateNodes(BuilderInstruction):
     def __init__(self, path: Path, attr=None):
         super().__init__(path, attr)
 
-        self._name_template = self._attr.get("name_template", "{path[1]}-{node_num}")
-        self._node_count = self._attr["node_count"]
-        self._node_num_start = self._attr.get("node_num_start", 1)
+        self._name: Optional[str] = self._attr.get("name", None)
+        self._name_template: str = self._attr.get(
+            "name_template", "{path[1]}-{node_num}"
+        )
+        self._node_count: int = self._attr.get("node_count", 1)
+        self._node_num_start: int = self._attr.get("node_num_start", 1)
 
     def _node_id_generator(self) -> str:
         for node_num in range(
@@ -62,12 +65,16 @@ class CreateNodes(BuilderInstruction):
     def run(self, ctx: ExecutionContext) -> ExecutionContext:
         graphs = ctx.get_graphs_by_path(self._path).values()
 
-        node_ids = set()
-        for node_id in self._node_id_generator():
+        if self._name:
             for graph in graphs:
-                graph.add_node(node_id, **self._attr.get("node_attr", {}))
-            node_ids.add(node_id)
-        ctx.add_node_group(self._path, node_ids)
+                graph.add_node(self._name, **self._attr.get("node_attr", {}))
+        else:
+            node_ids = set()
+            for node_id in self._node_id_generator():
+                for graph in graphs:
+                    graph.add_node(node_id, **self._attr.get("node_attr", {}))
+                node_ids.add(node_id)
+            ctx.add_node_group(self._path, node_ids)
         return ctx
 
 

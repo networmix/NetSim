@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
 from collections import deque
-from typing import Dict, Set, Any, List
+from typing import Dict, Optional, Set, Any, List
 
 from netsim.netgraph.graph import MultiDiGraph
 
@@ -17,7 +17,7 @@ from netsim.dict_path import (
 
 @dataclass
 class DataContainer:
-    pass
+    ...
 
 
 class ExecutionContext:
@@ -30,7 +30,7 @@ class ExecutionContext:
     def set_data(self, key: str, container: DataContainer) -> None:
         self._data[key] = container
 
-    def get_data(self, key: str = "") -> DataContainer:
+    def get_data(self, key: Optional[str] = None) -> DataContainer:
         if key:
             return self._data[key]
         return self._data

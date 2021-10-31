@@ -1,12 +1,16 @@
 # pylint: disable=c-extension-no-member
 from __future__ import annotations
 
+import cProfile
+import pstats
 from collections import deque
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 import logging
 import json
 import jq
+import pprint
 
 from netsim.netgraph.io import graph_to_node_link
 
@@ -15,14 +19,27 @@ from netsim.dict_path import (
     dict_to_paths,
     process_dict,
 )
-from netsim.instructions import Instruction, ExecutionContext
+from netsim.instructions import DataContainer, Instruction, ExecutionContext
 from netsim.netbuilder.builder_instructions import BUILDER_INSTRUCTIONS
+from netsim.netsim_common import NetSimObjectName
+from netsim.netsim_simulator import NetSim
+from netsim.sim_common import SimTime
+from netsim.simstat import Stat
 
 
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NetSimData(DataContainer):
+    until_time: SimTime
+    stat_interval: SimTime
+    stat_data: Dict[NetSimObjectName, Stat]
+    sim_stat_data: Stat
+    nsim_stat_data: Stat
 
 
 class WorkflowInstruction(Instruction):
@@ -125,7 +142,7 @@ class ValidateGraphJQ(WorkflowInstruction):
 
                 for graph in graphs:
                     res = jq_expr.input(graph_to_node_link(graph)).first()
-                    logger.debug("JQ Result: %s", res)
+                    logger.debug("JQ Result: %s. Expected: %s", res, exp_res)
                     if isinstance(res, int):
                         exp_res = int(exp_res)
                     assert res == exp_res
@@ -171,4 +188,62 @@ class LogContextData(WorkflowInstruction):
     def run(self, ctx: ExecutionContext) -> ExecutionContext:
 
         logger.debug(ctx.get_data())
+        return ctx
+
+
+class RunNetSim(WorkflowInstruction):
+    def __init__(self, attr: Dict[str, Any]):
+        super().__init__(attr)
+        self._graph = attr["graph"]
+        self._until_time = attr.get("until_time")
+        self._stat_interval = attr.get("stat_interval")
+        self._profile = attr.get("profile", False)
+        self._profile_sort = attr.get("profile_sort", "tottime")
+
+    def run(self, ctx: ExecutionContext) -> ExecutionContext:
+
+        graph = list(ctx.get_graphs_by_path(Path(["/", self._graph])).values())[0]
+
+        sim = NetSim(stat_interval=self._stat_interval)
+        sim.load_graph(graph)
+
+        if self._profile:
+            with cProfile.Profile() as profiler:
+                sim.run(until_time=self._until_time)
+                stats = pstats.Stats(profiler).sort_stats(self._profile_sort)
+                stats.print_stats()
+        else:
+            sim.run(until_time=self._until_time)
+        stat_dict: Dict[NetSimObjectName, Stat] = {}
+        for ns_obj in sim.get_ns_obj_iter():
+            stat_dict[ns_obj.name] = ns_obj.stat
+
+        key = "NetSim_" + self._graph
+        ctx.set_data(
+            key,
+            NetSimData(
+                self._until_time, self._stat_interval, stat_dict, sim.stat, sim.nstat
+            ),
+        )
+        return ctx
+
+
+class PrintSimData(WorkflowInstruction):
+    def __init__(self, attr: Dict[str, Any]):
+        super().__init__(attr)
+        self._graph = attr["graph"]
+
+    def run(self, ctx: ExecutionContext) -> ExecutionContext:
+        key = "NetSim_" + self._graph
+        simdata: NetSimData = ctx.get_data(key)
+
+        for obj_name, obj_stat_samples in simdata.nsim_stat_data.stat_samples.items():
+            for interval, stat_sample in obj_stat_samples.items():
+                print(f"{obj_name} {interval}")
+                sample_dict = stat_sample.todict()
+                for key in sorted(sample_dict):
+                    for k_pref in ["total", "avg"]:
+                        if k_pref in key:
+                            print(f"\t{key}: {sample_dict[key]}")
+
         return ctx

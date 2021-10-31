@@ -6,7 +6,7 @@ from netsim.netsim_base import (
     PacketSize,
 )
 from netsim.netsim_switch import PacketProcessor, PacketSwitch
-from netsim.netsim import NetSim
+from netsim.netsim_simulator import NetSim
 
 
 def test_packet_processor_1():
@@ -30,10 +30,119 @@ def test_packet_processor_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 32
 
-    assert source.stat.total_sent_pkts == 10
-    assert packet_processor.stat.total_received_pkts == 10
-    assert packet_processor.stat.total_sent_pkts == 0
-    assert packet_processor.stat.total_dropped_pkts == 10
+    assert source.stat.cur_stat_frame.todict() == {
+        "avg_drop_rate_bps": 0.0,
+        "avg_drop_rate_pps": 0.0,
+        "avg_receive_rate_bps": 0.0,
+        "avg_receive_rate_pps": 0.0,
+        "avg_send_rate_bps": 12000.0,
+        "avg_send_rate_pps": 1.0,
+        "dropped_pkts_hist": {},
+        "dropped_size_hist": {},
+        "duration": 10,
+        "last_state_change_timestamp": 9,
+        "received_pkts_hist": {},
+        "received_size_hist": {},
+        "sent_pkts_hist": {
+            0: 1,
+            1: 1,
+            2: 1,
+            3: 1,
+            4: 1,
+            5: 1,
+            6: 1,
+            7: 1,
+            8: 1,
+            9: 1,
+        },
+        "sent_size_hist": {
+            0: 1500,
+            1: 1500,
+            2: 1500,
+            3: 1500,
+            4: 1500,
+            5: 1500,
+            6: 1500,
+            7: 1500,
+            8: 1500,
+            9: 1500,
+        },
+        "timestamp": 10,
+        "total_dropped_bytes": 0,
+        "total_dropped_pkts": 0,
+        "total_received_bytes": 0,
+        "total_received_pkts": 0,
+        "total_sent_bytes": 15000,
+        "total_sent_pkts": 10,
+    }
+
+    assert packet_processor.stat.cur_stat_frame.todict() == {
+        "avg_drop_rate_bps": 12000.0,
+        "avg_drop_rate_pps": 1.0,
+        "avg_receive_rate_bps": 12000.0,
+        "avg_receive_rate_pps": 1.0,
+        "avg_send_rate_bps": 0.0,
+        "avg_send_rate_pps": 0.0,
+        "dropped_pkts_hist": {
+            0: 1,
+            1: 1,
+            2: 1,
+            3: 1,
+            4: 1,
+            5: 1,
+            6: 1,
+            7: 1,
+            8: 1,
+            9: 1,
+        },
+        "dropped_size_hist": {
+            0: 1500,
+            1: 1500,
+            2: 1500,
+            3: 1500,
+            4: 1500,
+            5: 1500,
+            6: 1500,
+            7: 1500,
+            8: 1500,
+            9: 1500,
+        },
+        "duration": 10,
+        "last_state_change_timestamp": 9,
+        "received_pkts_hist": {
+            0: 1,
+            1: 1,
+            2: 1,
+            3: 1,
+            4: 1,
+            5: 1,
+            6: 1,
+            7: 1,
+            8: 1,
+            9: 1,
+        },
+        "received_size_hist": {
+            0: 1500,
+            1: 1500,
+            2: 1500,
+            3: 1500,
+            4: 1500,
+            5: 1500,
+            6: 1500,
+            7: 1500,
+            8: 1500,
+            9: 1500,
+        },
+        "sent_pkts_hist": {},
+        "sent_size_hist": {},
+        "timestamp": 10,
+        "total_dropped_bytes": 15000,
+        "total_dropped_pkts": 10,
+        "total_received_bytes": 15000,
+        "total_received_pkts": 10,
+        "total_sent_bytes": 0,
+        "total_sent_pkts": 0,
+    }
 
 
 def test_packet_processor_2():
@@ -59,10 +168,62 @@ def test_packet_processor_2():
     assert sim.ctx.now == 10
     assert sim.event_counter == 32
 
-    assert source.stat.total_sent_pkts == 10
-    assert packet_processor.stat.total_received_pkts == 10
-    assert packet_processor.stat.total_sent_pkts == 10
-    assert packet_processor.stat.total_dropped_pkts == 0
+    assert packet_processor.stat.cur_stat_frame.todict() == {
+        "avg_drop_rate_bps": 0.0,
+        "avg_drop_rate_pps": 0.0,
+        "avg_receive_rate_bps": 12000.0,
+        "avg_receive_rate_pps": 1.0,
+        "avg_send_rate_bps": 12000.0,
+        "avg_send_rate_pps": 1.0,
+        "dropped_pkts_hist": {},
+        "dropped_size_hist": {},
+        "duration": 10,
+        "last_state_change_timestamp": 9,
+        "received_pkts_hist": {
+            0: 1,
+            1: 1,
+            2: 1,
+            3: 1,
+            4: 1,
+            5: 1,
+            6: 1,
+            7: 1,
+            8: 1,
+            9: 1,
+        },
+        "received_size_hist": {
+            0: 1500,
+            1: 1500,
+            2: 1500,
+            3: 1500,
+            4: 1500,
+            5: 1500,
+            6: 1500,
+            7: 1500,
+            8: 1500,
+            9: 1500,
+        },
+        "sent_pkts_hist": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1},
+        "sent_size_hist": {
+            0: 1500,
+            1: 1500,
+            2: 1500,
+            3: 1500,
+            4: 1500,
+            5: 1500,
+            6: 1500,
+            7: 1500,
+            8: 1500,
+            9: 1500,
+        },
+        "timestamp": 10,
+        "total_dropped_bytes": 0,
+        "total_dropped_pkts": 0,
+        "total_received_bytes": 15000,
+        "total_received_pkts": 10,
+        "total_sent_bytes": 15000,
+        "total_sent_pkts": 10,
+    }
 
 
 def test_packet_switch_1():
@@ -85,24 +246,272 @@ def test_packet_switch_1():
     source.subscribe(rx)
     tx = packet_switch.create_interface_tx(1, 2 ** 20)
     tx.subscribe(sink)
-    packet_processor = packet_switch.create_packet_processor()
+    packet_switch.create_packet_processor()
 
     sim.run(until_time=10)
 
     assert sim.ctx.now == 10
     assert sim.event_counter == 82
 
-    assert source.stat.total_sent_pkts == 10
-
-    assert rx.stat.total_received_pkts == 10
-    assert rx.stat.total_sent_pkts == 10
-    assert rx.stat.total_dropped_pkts == 0
-
-    assert packet_processor.stat.total_received_pkts == 10
-    assert packet_processor.stat.total_sent_pkts == 10
-    assert packet_processor.stat.total_dropped_pkts == 0
-
-    assert tx.stat.total_received_pkts == 10
-    assert tx.stat.total_sent_pkts == 10
-    assert tx.stat.total_dropped_pkts == 0
-    assert sink.stat.total_received_pkts == 10
+    assert packet_switch.stat.cur_stat_frame.todict() == {
+        "avg_drop_rate_bps": 0.0,
+        "avg_drop_rate_pps": 0.0,
+        "avg_receive_rate_bps": 12000.0,
+        "avg_receive_rate_pps": 1.0,
+        "avg_send_rate_bps": 12000.0,
+        "avg_send_rate_pps": 1.0,
+        "duration": 10.0,
+        "last_state_change_timestamp": 9.011444091796875,
+        "packet_processors": {
+            "PacketProcessor": {
+                "avg_drop_rate_bps": 0.0,
+                "avg_drop_rate_pps": 0.0,
+                "avg_receive_rate_bps": 12000.0,
+                "avg_receive_rate_pps": 1.0,
+                "avg_send_rate_bps": 12000.0,
+                "avg_send_rate_pps": 1.0,
+                "dropped_pkts_hist": {},
+                "dropped_size_hist": {},
+                "duration": 10.0,
+                "last_state_change_timestamp": 9,
+                "received_pkts_hist": {
+                    0: 1,
+                    1: 1,
+                    2: 1,
+                    3: 1,
+                    4: 1,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                    8: 1,
+                    9: 1,
+                },
+                "received_size_hist": {
+                    0: 1500,
+                    1: 1500,
+                    2: 1500,
+                    3: 1500,
+                    4: 1500,
+                    5: 1500,
+                    6: 1500,
+                    7: 1500,
+                    8: 1500,
+                    9: 1500,
+                },
+                "sent_pkts_hist": {
+                    0: 1,
+                    1: 1,
+                    2: 1,
+                    3: 1,
+                    4: 1,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                    8: 1,
+                    9: 1,
+                },
+                "sent_size_hist": {
+                    0: 1500,
+                    1: 1500,
+                    2: 1500,
+                    3: 1500,
+                    4: 1500,
+                    5: 1500,
+                    6: 1500,
+                    7: 1500,
+                    8: 1500,
+                    9: 1500,
+                },
+                "timestamp": 10,
+                "total_dropped_bytes": 0,
+                "total_dropped_pkts": 0,
+                "total_received_bytes": 15000,
+                "total_received_pkts": 10,
+                "total_sent_bytes": 15000,
+                "total_sent_pkts": 10,
+            }
+        },
+        "rx_interface_queues": {
+            0: {
+                "avg_get_processed_rate": 0,
+                "avg_get_requested_rate": 0,
+                "avg_put_processed_rate": 0,
+                "avg_put_requested_rate": 0,
+                "avg_queue_len": 0,
+                "cur_queue_len": 0,
+                "duration": 0,
+                "integral_queue_sum": 0,
+                "last_state_change_timestamp": 0,
+                "max_queue_len": 0,
+                "timestamp": 0,
+                "total_get_processed_count": 10,
+                "total_get_requested_count": 11,
+                "total_put_processed_count": 10,
+                "total_put_requested_count": 10,
+            }
+        },
+        "rx_interfaces": {
+            0: {
+                "avg_drop_rate_bps": 0.0,
+                "avg_drop_rate_pps": 0.0,
+                "avg_receive_rate_bps": 12000.0,
+                "avg_receive_rate_pps": 1.0,
+                "avg_send_rate_bps": 12000.0,
+                "avg_send_rate_pps": 1.0,
+                "dropped_pkts_hist": {},
+                "dropped_size_hist": {},
+                "duration": 10.0,
+                "last_state_change_timestamp": 9,
+                "received_pkts_hist": {
+                    0: 1,
+                    1: 1,
+                    2: 1,
+                    3: 1,
+                    4: 1,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                    8: 1,
+                    9: 1,
+                },
+                "received_size_hist": {
+                    0: 1500,
+                    1: 1500,
+                    2: 1500,
+                    3: 1500,
+                    4: 1500,
+                    5: 1500,
+                    6: 1500,
+                    7: 1500,
+                    8: 1500,
+                    9: 1500,
+                },
+                "sent_pkts_hist": {
+                    0: 1,
+                    1: 1,
+                    2: 1,
+                    3: 1,
+                    4: 1,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                    8: 1,
+                    9: 1,
+                },
+                "sent_size_hist": {
+                    0: 1500,
+                    1: 1500,
+                    2: 1500,
+                    3: 1500,
+                    4: 1500,
+                    5: 1500,
+                    6: 1500,
+                    7: 1500,
+                    8: 1500,
+                    9: 1500,
+                },
+                "timestamp": 10,
+                "total_dropped_bytes": 0,
+                "total_dropped_pkts": 0,
+                "total_received_bytes": 15000,
+                "total_received_pkts": 10,
+                "total_sent_bytes": 15000,
+                "total_sent_pkts": 10,
+            }
+        },
+        "timestamp": 10,
+        "total_dropped_bytes": 0,
+        "total_dropped_pkts": 0,
+        "total_received_bytes": 15000,
+        "total_received_pkts": 10,
+        "total_sent_bytes": 15000,
+        "total_sent_pkts": 10,
+        "tx_interface_queues": {
+            1: {
+                "avg_get_processed_rate": 0,
+                "avg_get_requested_rate": 0,
+                "avg_put_processed_rate": 0,
+                "avg_put_requested_rate": 0,
+                "avg_queue_len": 0,
+                "cur_queue_len": 0,
+                "duration": 0,
+                "integral_queue_sum": 0,
+                "last_state_change_timestamp": 0,
+                "max_queue_len": 0,
+                "timestamp": 0,
+                "total_get_processed_count": 10,
+                "total_get_requested_count": 11,
+                "total_put_processed_count": 10,
+                "total_put_requested_count": 10,
+            }
+        },
+        "tx_interfaces": {
+            1: {
+                "avg_drop_rate_bps": 0.0,
+                "avg_drop_rate_pps": 0.0,
+                "avg_receive_rate_bps": 12000.0,
+                "avg_receive_rate_pps": 1.0,
+                "avg_send_rate_bps": 12000.0,
+                "avg_send_rate_pps": 1.0,
+                "dropped_pkts_hist": {},
+                "dropped_size_hist": {},
+                "duration": 10.0,
+                "last_state_change_timestamp": 9.011444091796875,
+                "received_pkts_hist": {
+                    0: 1,
+                    1: 1,
+                    2: 1,
+                    3: 1,
+                    4: 1,
+                    5: 1,
+                    6: 1,
+                    7: 1,
+                    8: 1,
+                    9: 1,
+                },
+                "received_size_hist": {
+                    0: 1500,
+                    1: 1500,
+                    2: 1500,
+                    3: 1500,
+                    4: 1500,
+                    5: 1500,
+                    6: 1500,
+                    7: 1500,
+                    8: 1500,
+                    9: 1500,
+                },
+                "sent_pkts_hist": {
+                    0.011444091796875: 1,
+                    1.011444091796875: 1,
+                    2.011444091796875: 1,
+                    3.011444091796875: 1,
+                    4.011444091796875: 1,
+                    5.011444091796875: 1,
+                    6.011444091796875: 1,
+                    7.011444091796875: 1,
+                    8.011444091796875: 1,
+                    9.011444091796875: 1,
+                },
+                "sent_size_hist": {
+                    0.011444091796875: 1500,
+                    1.011444091796875: 1500,
+                    2.011444091796875: 1500,
+                    3.011444091796875: 1500,
+                    4.011444091796875: 1500,
+                    5.011444091796875: 1500,
+                    6.011444091796875: 1500,
+                    7.011444091796875: 1500,
+                    8.011444091796875: 1500,
+                    9.011444091796875: 1500,
+                },
+                "timestamp": 10,
+                "total_dropped_bytes": 0,
+                "total_dropped_pkts": 0,
+                "total_received_bytes": 15000,
+                "total_received_pkts": 10,
+                "total_sent_bytes": 15000,
+                "total_sent_pkts": 10,
+            }
+        },
+    }

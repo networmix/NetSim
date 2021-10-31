@@ -28,7 +28,7 @@ class MultiDiGraph:
         self._adj_out = {}  # dictionary for outgoing adjacencies (successors)
         self._adj_in = {}  # dictionary for incoming adjacencies (predecessors)
 
-        self.__next_edge_id = 1  # the index for the next added edge
+        self._next_edge_id = 1  # the index for the next added edge
 
     def __contains__(self, node_id):
         """
@@ -52,10 +52,9 @@ class MultiDiGraph:
         """
         return len(self._nodes)
 
-    @property
-    def _next_edge_id(self) -> int:
-        next_edge_id = self.__next_edge_id
-        self.__next_edge_id += 1
+    def get_next_edge_id(self) -> int:
+        next_edge_id = self._next_edge_id
+        self._next_edge_id += 1
         return next_edge_id
 
     def add_node(self, node_to_add: Hashable, **attr: Dict) -> None:
@@ -86,7 +85,7 @@ class MultiDiGraph:
             attr: optional node attributes in a form of keyword arguments (k=v pairs).
         """
         if edge_id == 0:
-            edge_id = self._next_edge_id
+            edge_id = self.get_next_edge_id()
 
         if edge_id not in self._edges:
             self._edges[edge_id] = (src_node, dst_node, edge_id, attr)

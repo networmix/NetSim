@@ -1,8 +1,10 @@
 # pylint: disable=invalid-name
+from enum import IntEnum
 import random
 import statistics
 import math
 import functools
+import itertools
 from typing import (
     Callable,
     Generator,
@@ -20,6 +22,16 @@ import numpy as np
 
 
 Sample = Iterable[Union[int, float]]
+SEED = 0
+random.seed(SEED)
+
+
+class DistrFunc(IntEnum):
+
+    Constant = 0
+    Normal = 1
+    Uniform = 2
+    Exponential = 3
 
 
 def make_generator(func: Callable) -> Generator[Any, None, None]:
@@ -46,6 +58,55 @@ def normal(mu: float, sigma: float) -> float:
 @make_generator
 def exponential(lambd: float) -> float:
     return random.expovariate(lambd)
+
+
+class DistrBuilder:
+    @classmethod
+    def create(
+        cls, distr_func: DistrFunc, params: Dict[str, Union[int, float]]
+    ) -> Generator[Any, None, None]:
+
+        if distr_func == DistrFunc.Constant:
+            constant = params["constant"]
+            first = params.get("first", constant)
+            count = params.get("count")
+
+            def gen():
+                if first is not None:
+                    yield first
+                while True:
+                    yield constant
+
+            return gen() if not count else itertools.islice(gen(), count)
+
+        if distr_func == DistrFunc.Normal:
+            mu = params["mu"]
+            sigma = params["sigma"]
+            count = params.get("count")
+            return (
+                normal(mu, sigma)
+                if not count
+                else itertools.islice(normal(mu, sigma), count)
+            )
+
+        if distr_func == DistrFunc.Uniform:
+            a = params["a"]
+            b = params["b"]
+            count = params.get("count")
+            return (
+                uniform(a, b) if not count else itertools.islice(uniform(a, b), count)
+            )
+
+        if distr_func == DistrFunc.Exponential:
+            lambd = params["lambda"]
+            count = params.get("count")
+            return (
+                exponential(lambd)
+                if not count
+                else itertools.islice(exponential(lambd), count)
+            )
+
+        raise RuntimeError(f"Unknown distribution function: {distr_func}")
 
 
 def sample_df(sample: Sample, r: int) -> int:

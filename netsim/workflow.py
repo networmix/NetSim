@@ -7,6 +7,8 @@ from netsim.wf_instructions import (
     Instruction,
     ExecutionContext,
     BuildGraph,
+    PrintSimData,
+    RunNetSim,
     ValidateGraphJQ,
     LogGraphNodeLink,
     LogGraphLinks,
@@ -16,7 +18,7 @@ from netsim.analysers import ShortestPath
 
 
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
+    level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s:%(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,8 @@ INSTRUCTIONS = {
     "LogGraphLinks": LogGraphLinks,
     "ShortestPath": ShortestPath,
     "LogContextData": LogContextData,
+    "RunNetSim": RunNetSim,
+    "PrintSimData": PrintSimData,
 }
 
 
