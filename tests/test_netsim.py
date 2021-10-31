@@ -61,10 +61,6 @@ def test_netsim_scenario_1():
     sim.load_graph(graph)
     sim.run()
 
-    import pprint
-
-    pprint.pprint(sim.nstat.todict())
-
     assert sim.nstat.todict() == SCENARIO_1_STAT
 
 
@@ -157,48 +153,6 @@ def test_netsim_scenario_4():
         "total_sent_bytes": 4000,
         "total_received_bytes": 10000,
         "total_dropped_bytes": 6000,
-        "received_pkts_hist": {
-            0: 1,
-            0.1: 1,
-            0.2: 1,
-            0.30000000000000004: 1,
-            0.4: 1,
-            0.5: 1,
-            0.6: 1,
-            0.7: 1,
-            0.7999999999999999: 1,
-            0.8999999999999999: 1,
-        },
-        "sent_pkts_hist": {0.5: 1, 1.0: 1, 1.5: 1, 2.0: 1},
-        "dropped_pkts_hist": {
-            0.30000000000000004: 1,
-            0.4: 1,
-            0.6: 1,
-            0.7: 1,
-            0.7999999999999999: 1,
-            0.8999999999999999: 1,
-        },
-        "received_size_hist": {
-            0: 1000,
-            0.1: 1000,
-            0.2: 1000,
-            0.30000000000000004: 1000,
-            0.4: 1000,
-            0.5: 1000,
-            0.6: 1000,
-            0.7: 1000,
-            0.7999999999999999: 1000,
-            0.8999999999999999: 1000,
-        },
-        "sent_size_hist": {0.5: 1000, 1.0: 1000, 1.5: 1000, 2.0: 1000},
-        "dropped_size_hist": {
-            0.30000000000000004: 1000,
-            0.4: 1000,
-            0.6: 1000,
-            0.7: 1000,
-            0.7999999999999999: 1000,
-            0.8999999999999999: 1000,
-        },
         "avg_send_rate_pps": 1.6,
         "avg_receive_rate_pps": 4.0,
         "avg_drop_rate_pps": 2.4,
@@ -217,12 +171,6 @@ def test_netsim_scenario_4():
         "total_sent_bytes": 4000,
         "total_received_bytes": 4000,
         "total_dropped_bytes": 0,
-        "received_pkts_hist": {0.5: 1, 1.0: 1, 1.5: 1, 2.0: 1},
-        "sent_pkts_hist": {1.0: 1, 1.5: 1, 2.0: 1, 2.5: 1},
-        "dropped_pkts_hist": {},
-        "received_size_hist": {0.5: 1000, 1.0: 1000, 1.5: 1000, 2.0: 1000},
-        "sent_size_hist": {1.0: 1000, 1.5: 1000, 2.0: 1000, 2.5: 1000},
-        "dropped_size_hist": {},
         "avg_send_rate_pps": 1.6,
         "avg_receive_rate_pps": 1.6,
         "avg_drop_rate_pps": 0.0,
