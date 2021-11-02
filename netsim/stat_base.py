@@ -47,16 +47,35 @@ def make_generator(func: Callable) -> Generator[Any, None, None]:
 
 @make_generator
 def uniform(a: float, b: float) -> float:
+    """
+    Uniform distribution in [a, b) range.
+
+    Simple "shift and scale" of the Uniform distribution [0.0, 1.0).
+    """
     return a + (b - a) * random.random()
 
 
 @make_generator
 def normal(mu: float, sigma: float) -> float:
+    """
+    Normal distribution.
+    mu - mean
+    sigma - standard deviation
+
+    Uses the Kinderman and Monahan method.
+    """
     return random.normalvariate(mu, sigma)
 
 
 @make_generator
 def exponential(lambd: float) -> float:
+    """
+    Exponential distribution.
+    lambda = 1/mean
+
+    Wrapper around the following formula:
+    -ln(1.0 - random.random()) / lambda
+    """
     return random.expovariate(lambd)
 
 

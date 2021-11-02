@@ -9,6 +9,7 @@ from netsim.wf_instructions import (
     BuildGraph,
     PrintSimData,
     RunNetSim,
+    SaveSimData,
     ValidateGraphJQ,
     LogGraphNodeLink,
     LogGraphLinks,
@@ -32,6 +33,7 @@ INSTRUCTIONS = {
     "LogContextData": LogContextData,
     "RunNetSim": RunNetSim,
     "PrintSimData": PrintSimData,
+    "SaveSimData": SaveSimData,
 }
 
 

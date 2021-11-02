@@ -3,11 +3,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Set, Union, Generator, Any
+from typing import Dict, List, Optional, Set, Type, Union, Generator, Any
 from netsim.netsim_common import (
     InterfaceBW,
     NetSimObjectID,
     NetSimObjectName,
+    PacketAction,
     PacketFlowID,
     PacketID,
     PacketSize,
@@ -33,7 +34,12 @@ logger = logging.getLogger(__name__)
 class NetSimObject(ABC):
     _next_netsim_id: NetSimObjectID = 0
 
-    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+    def __init__(
+        self,
+        ctx: SimContext,
+        name: Optional[NetSimObjectName] = None,
+        stat_type: Optional[Type[Stat]] = None,
+    ):
         self._ctx: SimContext = ctx
         self.ns_id, NetSimObject._next_netsim_id = (
             NetSimObject._next_netsim_id,
@@ -44,7 +50,7 @@ class NetSimObject(ABC):
         )
         self.process: Process = ctx.create_process(self.run(), self.name)
         self.process.extend_name("_proc")
-        self.stat: Stat = Stat(self._ctx)
+        self.stat: Stat = Stat(self._ctx) if not stat_type else stat_type(self._ctx)
 
     def __repr__(self) -> str:
         return f"{self.name}(process={self.process.name})"
@@ -69,29 +75,49 @@ class Packet:
         size: PacketSize,
         flow_id: PacketFlowID = 0,
     ):
-        self.ctx = ctx
+        self._ctx = ctx
         self.packet_id, Packet._next_packet_id = (
             Packet._next_packet_id,
             Packet._next_packet_id + 1,
         )
         self.flow_id = flow_id
         self.size = size
-        self.timestamp = ctx.now
+        self.generated_timestamp = ctx.now
+        self.touched_timestamp: Optional[SimTime] = None
+        self.touched_by: Optional[NetSimObjectName] = None
+        self.last_action: Optional[PacketAction] = None
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
-        return f"{type_name}(packet_id={self.packet_id}, flow_id={self.flow_id}, size={self.size}, timestamp={self.timestamp})"
+        return f"{type_name}(packet_id={self.packet_id}, flow_id={self.flow_id}, size={self.size}, timestamp={self.generated_timestamp})"
 
     @classmethod
     def reset_packet_id(cls):
         cls.next_packet_id: PacketID = 0
 
+    def touched(self, ns_obj: NetSimObject, action: PacketAction) -> None:
+        self.touched_timestamp = self._ctx.now
+        self.touched_by = ns_obj.name
+        self.last_action = action
+
+    def todict(self) -> Dict[str, Any]:
+        return {
+            field: getattr(self, field)
+            for field in vars(self)
+            if not field.startswith("_")
+        }
+
 
 class Sender(NetSimObject):
-    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
-        super().__init__(ctx, name=name)
+    def __init__(
+        self,
+        ctx: SimContext,
+        name: Optional[NetSimObjectName] = None,
+        stat_type: Optional[Type[Stat]] = None,
+    ):
+        super().__init__(ctx, name=name, stat_type=stat_type or PacketStat)
+        self.stat: PacketStat = self.stat
         self._subscribers: List[Receiver] = []
-        self.stat: PacketStat = PacketStat(ctx)
         self.process.add_stat_callback(self.stat.advance_time)
 
     def subscribe(
@@ -102,19 +128,27 @@ class Sender(NetSimObject):
         receiver.add_subscription(self)
 
     def _packet_sent(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.SENT)
         self.stat.packet_sent(packet)
 
     def _packet_received(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.RECEIVED)
         self.stat.packet_received(packet)
 
     def _packet_dropped(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.DROPPED)
         self.stat.packet_dropped(packet)
 
 
 class Receiver(NetSimObject):
-    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
-        super().__init__(ctx, name=name)
-        self.stat: PacketStat = PacketStat(ctx)
+    def __init__(
+        self,
+        ctx: SimContext,
+        name: Optional[NetSimObjectName] = None,
+        stat_type: Optional[Type[Stat]] = None,
+    ):
+        super().__init__(ctx, name=name, stat_type=stat_type or PacketStat)
+        self.stat: PacketStat = self.stat
         self.process.add_stat_callback(self.stat.advance_time)
         self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
 
@@ -135,18 +169,25 @@ class Receiver(NetSimObject):
         return self._subscriptions
 
     def _packet_received(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.RECEIVED)
         self.stat.packet_received(packet)
 
     def _packet_dropped(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.DROPPED)
         self.stat.packet_dropped(packet)
 
 
 class SenderReceiver(NetSimObject):
-    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
-        super().__init__(ctx, name=name)
+    def __init__(
+        self,
+        ctx: SimContext,
+        name: Optional[NetSimObjectName] = None,
+        stat_type: Optional[Type[Stat]] = None,
+    ):
+        super().__init__(ctx, name=name, stat_type=stat_type or PacketStat)
+        self.stat: PacketStat = self.stat
         self._subscribers: List[Receiver] = []
         self._subscriptions: Set[Union[Sender, SenderReceiver]] = set()
-        self.stat: PacketStat = PacketStat(ctx)
         self.process.add_stat_callback(self.stat.advance_time)
 
     @abstractmethod
@@ -173,12 +214,15 @@ class SenderReceiver(NetSimObject):
         return self._subscriptions
 
     def _packet_sent(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.SENT)
         self.stat.packet_sent(packet)
 
     def _packet_received(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.RECEIVED)
         self.stat.packet_received(packet)
 
     def _packet_dropped(self, packet: Packet) -> None:
+        packet.touched(self, action=PacketAction.DROPPED)
         self.stat.packet_dropped(packet)
 
 
@@ -283,11 +327,10 @@ class PacketQueue(SenderReceiver):
         capacity: Optional[int] = None,
         name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx, name=name)
+        super().__init__(ctx, name=name, stat_type=PacketQueueStat)
+        self.stat: PacketQueueStat = self.stat
         self._queue = QueueFIFO(ctx, capacity, name=self.name)
         self._queue.extend_name("_QueueFIFO")
-        self.queue_stat: PacketQueueStat = PacketQueueStat(ctx)
-        self.process.add_stat_callback(self.queue_stat.advance_time)
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
         while True:
@@ -312,14 +355,14 @@ class PacketQueue(SenderReceiver):
         self._packet_put(item)
 
     def _packet_put(self, packet: Packet) -> None:
-        self.queue_stat.packet_put(packet)
+        self.stat.packet_put(packet)
 
     def _packet_get(self, packet: Packet) -> None:
-        self.queue_stat.packet_get(packet)
+        self.stat.packet_get(packet)
 
     def _packet_dropped(self, packet: Packet) -> None:
         self.stat.packet_dropped(packet)
-        self.queue_stat.packet_dropped(packet)
+        self.stat.packet_dropped(packet)
 
 
 class PacketInterfaceRx(PacketQueue):

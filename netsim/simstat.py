@@ -1,11 +1,10 @@
 from __future__ import annotations
 from collections import defaultdict
 from copy import deepcopy, copy
-from tempfile import SpooledTemporaryFile
+from tempfile import NamedTemporaryFile
 from json import dumps
 from dataclasses import MISSING, dataclass, fields, field
-import functools
-from typing import Any, Callable, Dict, TYPE_CHECKING, Optional
+from typing import Any, Dict, TYPE_CHECKING, Optional
 
 from netsim.sim_common import ProcessName, ResourceName, SimTime, TimeInterval
 
@@ -70,7 +69,7 @@ class Stat:
     """
 
     _ctx: SimContext = field(repr=False)
-    _stat_tracer: Optional[SpooledTemporaryFile] = None
+    _stat_tracer: Optional[NamedTemporaryFile] = None
     cur_stat_frame: StatFrame = field(default_factory=StatFrame)
     prev_stat_frame: StatFrame = field(default_factory=StatFrame)
 
@@ -86,6 +85,11 @@ class Stat:
         """
         Handle to advance time of the stat container.
         """
+
+        if self.cur_stat_frame.duration:
+            # update avg in the frame
+            self.cur_stat_frame.update_stat()
+
         if self._stat_tracer:
             # dump stat frame to a temp file
             self.dump_stat_trace()
@@ -96,10 +100,6 @@ class Stat:
 
         # clone cur frame to prev
         self.prev_stat_frame = copy(self.cur_stat_frame)
-
-        if self.prev_stat_frame.duration:
-            # update avg in the prev frame
-            self.prev_stat_frame.update_stat()
 
         # update timestamps in the cur frame
         self.cur_stat_frame.set_time(self.cur_timestamp, self.cur_interval_duration)
@@ -136,11 +136,11 @@ class Stat:
         self._stat_tracer.write(dumps(self.cur_stat_frame.todict()) + "\n")
 
     def enable_stat_trace(self, prefix: Optional[None]) -> None:
-        self._stat_tracer = SpooledTemporaryFile(
-            mode="w", encoding="utf8", prefix=prefix
+        self._stat_tracer = NamedTemporaryFile(
+            mode="r+", encoding="utf8", prefix=prefix
         )
 
-    def get_stat_tracer(self) -> Optional[SpooledTemporaryFile]:
+    def get_stat_tracer(self) -> Optional[NamedTemporaryFile]:
         return self._stat_tracer
 
 

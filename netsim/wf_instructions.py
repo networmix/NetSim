@@ -4,13 +4,15 @@ from __future__ import annotations
 import cProfile
 import pstats
 from collections import deque
+import os
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 import logging
 import json
-import jq
 import pprint
+
+import jq
 
 from netsim.netgraph.io import graph_to_node_link
 
@@ -197,6 +199,8 @@ class RunNetSim(WorkflowInstruction):
         self._graph = attr["graph"]
         self._until_time = attr.get("until_time")
         self._stat_interval = attr.get("stat_interval")
+        self._enable_stat_trace = attr.get("enable_stat_trace")
+        self._enable_packet_trace = attr.get("enable_packet_trace")
         self._profile = attr.get("profile", False)
         self._profile_sort = attr.get("profile_sort", "tottime")
 
@@ -209,11 +213,20 @@ class RunNetSim(WorkflowInstruction):
 
         if self._profile:
             with cProfile.Profile() as profiler:
-                sim.run(until_time=self._until_time)
+                sim.run(
+                    until_time=self._until_time,
+                    enable_stat_trace=self._enable_stat_trace,
+                    enable_packet_trace=self._enable_packet_trace,
+                )
                 stats = pstats.Stats(profiler).sort_stats(self._profile_sort)
                 stats.print_stats()
         else:
-            sim.run(until_time=self._until_time)
+            sim.run(
+                until_time=self._until_time,
+                enable_stat_trace=self._enable_stat_trace,
+                enable_packet_trace=self._enable_packet_trace,
+            )
+
         stat_dict: Dict[NetSimObjectName, Stat] = {}
         for ns_obj in sim.get_ns_obj_iter():
             stat_dict[ns_obj.name] = ns_obj.stat
@@ -242,8 +255,52 @@ class PrintSimData(WorkflowInstruction):
                 print(f"{obj_name} {interval}")
                 sample_dict = stat_sample.todict()
                 for key in sorted(sample_dict):
-                    for k_pref in ["total", "avg"]:
+                    for k_pref in ["total", "avg", "max"]:
                         if k_pref in key:
                             print(f"\t{key}: {sample_dict[key]}")
 
+        return ctx
+
+
+class SaveSimData(WorkflowInstruction):
+    def __init__(self, attr: Dict[str, Any]):
+        super().__init__(attr)
+        self._graph = attr["graph"]
+        self._dir_path = attr["dir_path"]
+        self._file_prefix = attr.get("file_prefix", self._graph)
+        self._trace_scope = attr.get("trace_scope", ["nsim"])
+
+    def run(self, ctx: ExecutionContext) -> ExecutionContext:
+        key = "NetSim_" + self._graph
+        simdata: NetSimData = ctx.get_data(key)
+
+        if "ns_obj" in self._trace_scope:
+            for obj_name, obj_stat in simdata.stat_data.items():
+                self._dir_path = os.path.expanduser(self._dir_path)
+                filename = f"{self._file_prefix}_{obj_name}_stat.jsonl"
+                path = os.path.join(self._dir_path, filename)
+
+                if tracer := obj_stat.get_stat_tracer():
+                    with open(path, "w", encoding="utf8") as fd:
+                        tracer.seek(0)
+                        for line in tracer:
+                            fd.write(line)
+
+                filename = f"{self._file_prefix}_{obj_name}_packets.jsonl"
+                path = os.path.join(self._dir_path, filename)
+                if tracer := obj_stat.get_packet_tracer():
+                    with open(path, "w", encoding="utf8") as fd:
+                        tracer.seek(0)
+                        for line in tracer:
+                            fd.write(line)
+
+        if "nsim" in self._trace_scope:
+            filename = f"{self._file_prefix}_nstat.jsonl"
+            self._dir_path = os.path.expanduser(self._dir_path)
+            path = os.path.join(self._dir_path, filename)
+            if tracer := simdata.nsim_stat_data.get_stat_tracer():
+                with open(path, "w", encoding="utf8") as fd:
+                    tracer.seek(0)
+                    for line in tracer:
+                        fd.write(line)
         return ctx

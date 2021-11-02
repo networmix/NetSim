@@ -31,3 +31,4 @@ pyvenv.cfg
 .pytest_cache
 .coverage
 buildenv*
+*.jsonl

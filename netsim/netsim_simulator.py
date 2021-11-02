@@ -102,6 +102,12 @@ class NetSim(Simulator):
     def enable_stat_trace(self) -> None:
         for ns_obj in self._ns.values():
             ns_obj.stat.enable_stat_trace(prefix=ns_obj.name)
+        self.nstat.enable_stat_trace(prefix="NetSim")
+
+    def enable_packet_trace(self) -> None:
+        for ns_obj in self._ns.values():
+            if getattr(ns_obj.stat, "enable_packet_trace", None):
+                ns_obj.stat.enable_packet_trace(prefix=ns_obj.name)
 
     def _parse_graph_nodes(self, graph: MultiDiGraph) -> None:
         for node, node_attr in graph.get_nodes().items():
@@ -147,3 +153,15 @@ class NetSim(Simulator):
         self._parse_graph_nodes(graph)
         self._parse_graph_edges(graph)
         self._postprocess_ns_obj()
+
+    def run(
+        self,
+        until_time: Optional[SimTime] = None,
+        enable_stat_trace: bool = False,
+        enable_packet_trace: bool = False,
+    ) -> None:
+        if enable_stat_trace:
+            self.enable_stat_trace()
+        if enable_packet_trace:
+            self.enable_packet_trace()
+        super().run(until_time=until_time)

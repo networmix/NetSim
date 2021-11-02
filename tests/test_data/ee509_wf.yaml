@@ -25,10 +25,11 @@ instructions:
                     constant: 1
 
           - Create:
-              name: Switch
+              name: InterfaceTx
               node_attr:
-                ns_type: PacketSwitch
-                ns_attr: {}
+                ns_type: PacketInterfaceTx
+                ns_attr:
+                  bw: 10000000
           - Create:
               name: Sink
               node_attr:
@@ -39,22 +40,15 @@ instructions:
         EE509_1:
         - P2P:
             node_lhs: Source
-            node_rhs: Switch
+            node_rhs: InterfaceTx
             edge_attr:
-              ns_attr:
-                rx:
-                  propagation_delay: 0.0
+              ns_attr: {}
 
         - P2P:
-            node_lhs: Switch
+            node_lhs: InterfaceTx
             node_rhs: Sink
             edge_attr:
-              ns_attr:
-                tx:
-                  bw: 10000000
-                  queue_len_limit: 0
-                rx:
-                  propagation_delay: 0.0
+              ns_attr: {}
 
   - ValidateGraphJQ:
       EE509_1:
@@ -66,8 +60,16 @@ instructions:
 
   - RunNetSim:
       graph: EE509_1
-      until_time: 1000
-      stat_interval: 1000
+      until_time: 10
+      stat_interval: 10
+      enable_stat_trace: True
+      enable_packet_trace: True
+
 
   - PrintSimData:
       graph: EE509_1
+
+  - SaveSimData:
+      graph: EE509_1
+      dir_path: ""
+      trace_scope: [nsim, ns_obj]

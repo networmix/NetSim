@@ -143,40 +143,70 @@ def test_netsim_scenario_4():
     r1_tx = sim.get_ns_obj("R1_TX")
     r2_rx = sim.get_ns_obj("R2_RX")
 
+    import pprint
+
+    pprint.pprint(r2_rx.stat.cur_stat_frame.todict())
+
     assert r1_tx.stat.cur_stat_frame.todict() == {
-        "timestamp": 2.5,
-        "duration": 2.5,
-        "last_state_change_timestamp": 2.0,
-        "total_sent_pkts": 4,
-        "total_received_pkts": 10,
-        "total_dropped_pkts": 6,
-        "total_sent_bytes": 4000,
-        "total_received_bytes": 10000,
-        "total_dropped_bytes": 6000,
-        "avg_send_rate_pps": 1.6,
-        "avg_receive_rate_pps": 4.0,
-        "avg_drop_rate_pps": 2.4,
-        "avg_send_rate_bps": 12800.0,
+        "avg_drop_rate_bps": 38400.0,
+        "avg_drop_rate_pps": 4.8,
+        "avg_get_rate_pps": 1.6,
+        "avg_put_rate_pps": 1.6,
+        "avg_queue_len": 0.8800000000000001,
         "avg_receive_rate_bps": 32000.0,
-        "avg_drop_rate_bps": 19200.0,
+        "avg_receive_rate_pps": 4.0,
+        "avg_send_rate_bps": 12800.0,
+        "avg_send_rate_pps": 1.6,
+        "avg_wait_time": 0.55,
+        "cur_queue_len": 0,
+        "duration": 2.5,
+        "integral_queue_sum": 2.2,
+        "integral_wait_time_sum": 2.2,
+        "last_state_change_timestamp": 2.0,
+        "max_queue_len": 2,
+        "max_wait_time": 1.0,
+        "timestamp": 2.5,
+        "total_dropped_bytes": 12000,
+        "total_dropped_pkts": 12,
+        "total_get_bytes": 4000,
+        "total_get_pkts": 4,
+        "total_put_bytes": 4000,
+        "total_put_pkts": 4,
+        "total_received_bytes": 10000,
+        "total_received_pkts": 10,
+        "total_sent_bytes": 4000,
+        "total_sent_pkts": 4,
     }
 
     assert r2_rx.stat.cur_stat_frame.todict() == {
-        "timestamp": 2.5,
-        "duration": 2.5,
-        "last_state_change_timestamp": 2.5,
-        "total_sent_pkts": 4,
-        "total_received_pkts": 4,
-        "total_dropped_pkts": 0,
-        "total_sent_bytes": 4000,
-        "total_received_bytes": 4000,
-        "total_dropped_bytes": 0,
-        "avg_send_rate_pps": 1.6,
-        "avg_receive_rate_pps": 1.6,
-        "avg_drop_rate_pps": 0.0,
-        "avg_send_rate_bps": 12800.0,
-        "avg_receive_rate_bps": 12800.0,
         "avg_drop_rate_bps": 0.0,
+        "avg_drop_rate_pps": 0.0,
+        "avg_get_rate_pps": 1.6,
+        "avg_put_rate_pps": 1.6,
+        "avg_queue_len": 0.8,
+        "avg_receive_rate_bps": 12800.0,
+        "avg_receive_rate_pps": 1.6,
+        "avg_send_rate_bps": 12800.0,
+        "avg_send_rate_pps": 1.6,
+        "avg_wait_time": 0.5,
+        "cur_queue_len": 0,
+        "duration": 2.5,
+        "integral_queue_sum": 2.0,
+        "integral_wait_time_sum": 2.0,
+        "last_state_change_timestamp": 2.5,
+        "max_queue_len": 1,
+        "max_wait_time": 0.5,
+        "timestamp": 2.5,
+        "total_dropped_bytes": 0,
+        "total_dropped_pkts": 0,
+        "total_get_bytes": 4000,
+        "total_get_pkts": 4,
+        "total_put_bytes": 4000,
+        "total_put_pkts": 4,
+        "total_received_bytes": 4000,
+        "total_received_pkts": 4,
+        "total_sent_bytes": 4000,
+        "total_sent_pkts": 4,
     }
 
 
@@ -211,6 +241,10 @@ def test_netsim_scenario_6():
     sim.load_graph(graph)
     # sim.enable_stat_trace()
     sim.run(until_time=4)
+
+    import pprint
+
+    pprint.pprint(sim.nstat.todict())
 
     # sw1.stat.get_stat_tracer().seek(0)
     # print(sw1.stat.get_stat_tracer().read())

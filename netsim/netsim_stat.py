@@ -1,10 +1,12 @@
 from __future__ import annotations
+from json import dumps
+from tempfile import NamedTemporaryFile
 
 from typing import (
-    DefaultDict,
     Dict,
     Any,
     TYPE_CHECKING,
+    Optional,
 )
 from collections import defaultdict
 from copy import deepcopy
@@ -77,34 +79,50 @@ class PacketStatFrame(StatFrame):  # pylint: disable=too-many-instance-attribute
 class PacketStat(Stat):
     cur_stat_frame: PacketStatFrame = field(default_factory=PacketStatFrame)
     prev_stat_frame: PacketStatFrame = field(default_factory=PacketStatFrame)
+    _packet_tracer: Optional[NamedTemporaryFile] = None
 
     def packet_sent(self, packet: Packet):
         self.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.packet_sent(packet)
+        self._dump_packet(packet)
 
     def packet_received(self, packet: Packet):
         self.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.packet_received(packet)
+        self._dump_packet(packet)
 
     def packet_dropped(self, packet: Packet):
         self.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.packet_dropped(packet)
+        self._dump_packet(packet)
+
+    def _dump_packet(self, packet: Packet) -> None:
+        if self._packet_tracer:
+            self._packet_tracer.write(dumps(packet.todict()) + "\n")
+
+    def enable_packet_trace(self, prefix: Optional[None]) -> None:
+        self._packet_tracer = NamedTemporaryFile(
+            mode="r+", encoding="utf8", prefix=prefix
+        )
+
+    def get_packet_tracer(self) -> Optional[NamedTemporaryFile]:
+        return self._packet_tracer
 
 
 @dataclass
-class PacketQueueStatFrame(StatFrame):  # pylint: disable=too-many-instance-attributes
+class PacketQueueStatFrame(
+    PacketStatFrame
+):  # pylint: disable=too-many-instance-attributes
     _wait_tracker: Dict[PacketID, SimTime] = field(default_factory=dict)
 
     total_get_pkts: int = 0
     total_put_pkts: int = 0
-    total_dropped_pkts: int = 0
 
     total_get_bytes: PacketSize = 0
     total_put_bytes: PacketSize = 0
-    total_dropped_bytes: PacketSize = 0
 
     avg_put_rate_pps: RatePPS = 0
     avg_get_rate_pps: RatePPS = 0
@@ -125,6 +143,7 @@ class PacketQueueStatFrame(StatFrame):  # pylint: disable=too-many-instance-attr
         self.total_get_pkts += 1
         self.total_get_bytes += packet.size
         wait_time = self.timestamp - self._wait_tracker[packet.packet_id]
+        del self._wait_tracker[packet.packet_id]
         self.max_wait_time = max(self.max_wait_time, wait_time)
         self.integral_wait_time_sum += wait_time
 
@@ -134,18 +153,24 @@ class PacketQueueStatFrame(StatFrame):  # pylint: disable=too-many-instance-attr
         self.cur_queue_len += 1
         self._wait_tracker[packet.packet_id] = self.timestamp
 
-    def packet_dropped(self, packet: Packet):
-        self.total_dropped_pkts += 1
-        self.total_dropped_bytes += packet.size
-
     def _calc_avg(self) -> None:
+        self.avg_send_rate_pps = self.total_sent_pkts / self.duration
+        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
+
+        self.avg_receive_rate_pps = self.total_received_pkts / self.duration
+        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
+
+        self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
+        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
+
         self.avg_put_rate_pps = self.total_put_pkts / self.duration
         self.avg_get_rate_pps = self.total_get_pkts / self.duration
 
     def _update_queue_stat(self) -> None:
         self.max_queue_len = max(self.max_queue_len, self.cur_queue_len)
         self.avg_queue_len = self.integral_queue_sum / self.duration
-        self.avg_wait_time = self.integral_wait_time_sum / self.duration
+        if self.total_get_pkts:
+            self.avg_wait_time = self.integral_wait_time_sum / self.total_get_pkts
 
     def _update_queue_integral(self, prev_frame: PacketQueueStatFrame) -> None:
         self.integral_queue_sum += prev_frame.cur_queue_len * (
@@ -162,7 +187,7 @@ class PacketQueueStatFrame(StatFrame):  # pylint: disable=too-many-instance-attr
 
 
 @dataclass
-class PacketQueueStat(Stat):
+class PacketQueueStat(PacketStat):
     cur_stat_frame: PacketQueueStatFrame = field(default_factory=PacketQueueStatFrame)
     prev_stat_frame: PacketQueueStatFrame = field(default_factory=PacketQueueStatFrame)
 
@@ -175,11 +200,6 @@ class PacketQueueStat(Stat):
         self.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.last_state_change_timestamp = self.cur_timestamp
         self.cur_stat_frame.packet_put(packet)
-
-    def packet_dropped(self, packet: Packet):
-        self.last_state_change_timestamp = self.cur_timestamp
-        self.cur_stat_frame.last_state_change_timestamp = self.cur_timestamp
-        self.cur_stat_frame.packet_dropped(packet)
 
 
 @dataclass
