@@ -1,4 +1,6 @@
 # pylint: disable=protected-access,invalid-name
+import pprint
+
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
     PacketSink,
@@ -30,9 +32,14 @@ def test_packet_processor_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 32
 
+    pprint.pprint(packet_processor.stat.cur_stat_frame.todict())
+
     assert source.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
+        "avg_latency_at_arrival": 0,
+        "avg_latency_at_departure": 0.0,
+        "avg_latency_at_drop": 0,
         "avg_receive_rate_bps": 0.0,
         "avg_receive_rate_pps": 0.0,
         "avg_send_rate_bps": 12000.0,
@@ -52,6 +59,9 @@ def test_packet_processor_1():
         "avg_drop_rate_bps": 24000.0,
         "avg_drop_rate_pps": 2.0,
         "avg_get_rate_pps": 1.0,
+        "avg_latency_at_arrival": 0.0,
+        "avg_latency_at_departure": 0,
+        "avg_latency_at_drop": 0.0,
         "avg_put_rate_pps": 1.0,
         "avg_queue_len": 0.0,
         "avg_receive_rate_bps": 12000.0,
@@ -103,10 +113,15 @@ def test_packet_processor_2():
     assert sim.ctx.now == 10
     assert sim.event_counter == 32
 
+    pprint.pprint(packet_processor.stat.cur_stat_frame.todict())
+
     assert packet_processor.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
         "avg_get_rate_pps": 1.0,
+        "avg_latency_at_arrival": 0.0,
+        "avg_latency_at_departure": 0.0,
+        "avg_latency_at_drop": 0,
         "avg_put_rate_pps": 1.0,
         "avg_queue_len": 0.0,
         "avg_receive_rate_bps": 12000.0,
@@ -162,8 +177,6 @@ def test_packet_switch_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 82
 
-    import pprint
-
     pprint.pprint(packet_switch.stat.cur_stat_frame.todict())
 
     assert packet_switch.stat.cur_stat_frame.todict() == {
@@ -180,6 +193,9 @@ def test_packet_switch_1():
                 "avg_drop_rate_bps": 0.0,
                 "avg_drop_rate_pps": 0.0,
                 "avg_get_rate_pps": 1.0,
+                "avg_latency_at_arrival": 0.0,
+                "avg_latency_at_departure": 0.0,
+                "avg_latency_at_drop": 0,
                 "avg_put_rate_pps": 1.0,
                 "avg_queue_len": 0.0,
                 "avg_receive_rate_bps": 12000.0,
@@ -231,6 +247,9 @@ def test_packet_switch_1():
                 "avg_drop_rate_bps": 0.0,
                 "avg_drop_rate_pps": 0.0,
                 "avg_get_rate_pps": 1.0,
+                "avg_latency_at_arrival": 0.0,
+                "avg_latency_at_departure": 0.0,
+                "avg_latency_at_drop": 0,
                 "avg_put_rate_pps": 1.0,
                 "avg_queue_len": 0.0,
                 "avg_receive_rate_bps": 12000.0,
@@ -289,6 +308,9 @@ def test_packet_switch_1():
                 "avg_drop_rate_bps": 0.0,
                 "avg_drop_rate_pps": 0.0,
                 "avg_get_rate_pps": 1.0,
+                "avg_latency_at_arrival": 0.0,
+                "avg_latency_at_departure": 0.011444091796875,
+                "avg_latency_at_drop": 0,
                 "avg_put_rate_pps": 1.0,
                 "avg_queue_len": 0.0,
                 "avg_receive_rate_bps": 12000.0,

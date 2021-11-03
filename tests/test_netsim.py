@@ -1,4 +1,6 @@
 # pylint: disable=protected-access,invalid-name
+import pprint
+
 from netsim.netsim_switch import PacketSwitch
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
@@ -61,6 +63,7 @@ def test_netsim_scenario_1():
     sim.load_graph(graph)
     sim.run()
 
+    pprint.pprint(sim.nstat.todict())
     assert sim.nstat.todict() == SCENARIO_1_STAT
 
 
@@ -109,6 +112,8 @@ def test_netsim_scenario_3():
     sim.load_graph(graph)
     sim.run(until_time=10)
 
+    pprint.pprint(sim.nstat.todict())
+
     assert sim.nstat.todict() == SCENARIO_2_3_STAT
 
 
@@ -143,14 +148,15 @@ def test_netsim_scenario_4():
     r1_tx = sim.get_ns_obj("R1_TX")
     r2_rx = sim.get_ns_obj("R2_RX")
 
-    import pprint
-
     pprint.pprint(r2_rx.stat.cur_stat_frame.todict())
 
     assert r1_tx.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 38400.0,
         "avg_drop_rate_pps": 4.8,
         "avg_get_rate_pps": 1.6,
+        "avg_latency_at_arrival": 0.0,
+        "avg_latency_at_departure": 1.0499999999999998,
+        "avg_latency_at_drop": 0.0,
         "avg_put_rate_pps": 1.6,
         "avg_queue_len": 0.8800000000000001,
         "avg_receive_rate_bps": 32000.0,
@@ -182,6 +188,9 @@ def test_netsim_scenario_4():
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
         "avg_get_rate_pps": 1.6,
+        "avg_latency_at_arrival": 1.0499999999999998,
+        "avg_latency_at_departure": 1.55,
+        "avg_latency_at_drop": 0,
         "avg_put_rate_pps": 1.6,
         "avg_queue_len": 0.8,
         "avg_receive_rate_bps": 12800.0,
@@ -241,8 +250,6 @@ def test_netsim_scenario_6():
     sim.load_graph(graph)
     # sim.enable_stat_trace()
     sim.run(until_time=4)
-
-    import pprint
 
     pprint.pprint(sim.nstat.todict())
 

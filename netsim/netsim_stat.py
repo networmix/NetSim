@@ -49,17 +49,36 @@ class PacketStatFrame(StatFrame):  # pylint: disable=too-many-instance-attribute
     avg_receive_rate_bps: RateBPS = 0
     avg_drop_rate_bps: RateBPS = 0
 
+    avg_latency_at_arrival: SimTime = 0
+    avg_latency_at_departure: SimTime = 0
+    avg_latency_at_drop: SimTime = 0
+
     def packet_sent(self, packet: Packet):
         self.total_sent_pkts += 1
         self.total_sent_bytes += packet.size
+        self.avg_latency_at_departure = (
+            self.avg_latency_at_departure * (self.total_sent_pkts - 1)
+            + self.timestamp
+            - packet.generated_timestamp
+        ) / self.total_sent_pkts
 
     def packet_received(self, packet: Packet):
         self.total_received_pkts += 1
         self.total_received_bytes += packet.size
+        self.avg_latency_at_arrival = (
+            self.avg_latency_at_arrival * (self.total_received_pkts - 1)
+            + self.timestamp
+            - packet.generated_timestamp
+        ) / self.total_received_pkts
 
     def packet_dropped(self, packet: Packet):
         self.total_dropped_pkts += 1
         self.total_dropped_bytes += packet.size
+        self.avg_latency_at_drop = (
+            self.avg_latency_at_drop * (self.total_dropped_pkts - 1)
+            + self.timestamp
+            - packet.generated_timestamp
+        ) / self.total_dropped_pkts
 
     def _calc_avg(self):
         self.avg_send_rate_pps = self.total_sent_pkts / self.duration

@@ -1,4 +1,6 @@
 # pylint: disable=protected-access,invalid-name
+import pprint
+
 from netsim.simcore import SimTime
 from netsim.netsim_base import (
     PacketInterfaceTx,
@@ -26,10 +28,14 @@ def test_packet_source_1():
     sim.run(until_time=1)
     assert sim.ctx.now == 1
     assert sim.event_counter == 3  # initial_delay, arrival, stop_sim
+    pprint.pprint(source.stat.cur_stat_frame.todict())
 
     assert source.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
+        "avg_latency_at_arrival": 0,
+        "avg_latency_at_departure": 0.0,
+        "avg_latency_at_drop": 0,
         "avg_receive_rate_bps": 0.0,
         "avg_receive_rate_pps": 0.0,
         "avg_send_rate_bps": 8000.0,
@@ -62,12 +68,16 @@ def test_packet_source_2():
     sim.run(until_time=3)
     assert sim.ctx.now == 3
     assert sim.event_counter == 5  # initial_delay, arrival, arrival, arrival, stop_sim
+    pprint.pprint(source.stat.todict())
 
     assert source.stat.todict() == {
         "cur_interval_duration": 3,
         "cur_stat_frame": {
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
+            "avg_latency_at_arrival": 0,
+            "avg_latency_at_departure": 0.0,
+            "avg_latency_at_drop": 0,
             "avg_receive_rate_bps": 0.0,
             "avg_receive_rate_pps": 0.0,
             "avg_send_rate_bps": 8000.0,
@@ -87,6 +97,9 @@ def test_packet_source_2():
         "prev_stat_frame": {
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
+            "avg_latency_at_arrival": 0,
+            "avg_latency_at_departure": 0.0,
+            "avg_latency_at_drop": 0,
             "avg_receive_rate_bps": 0.0,
             "avg_receive_rate_pps": 0.0,
             "avg_send_rate_bps": 12000.0,
@@ -126,9 +139,14 @@ def test_packet_sink_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 12
 
+    pprint.pprint(sink.stat.cur_stat_frame.todict())
+
     assert source.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
+        "avg_latency_at_arrival": 0,
+        "avg_latency_at_departure": 0.0,
+        "avg_latency_at_drop": 0,
         "avg_receive_rate_bps": 0.0,
         "avg_receive_rate_pps": 0.0,
         "avg_send_rate_bps": 8.0,
@@ -146,6 +164,9 @@ def test_packet_sink_1():
     assert sink.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,
+        "avg_latency_at_arrival": 0.0,
+        "avg_latency_at_departure": 0,
+        "avg_latency_at_drop": 0,
         "avg_receive_rate_bps": 8.0,
         "avg_receive_rate_pps": 1.0,
         "avg_send_rate_bps": 0.0,
@@ -182,8 +203,6 @@ def test_packet_queue_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 32
 
-    import pprint
-
     pprint.pprint(queue.stat.todict())
 
     assert queue.stat.todict() == {
@@ -192,6 +211,9 @@ def test_packet_queue_1():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 1.0,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.0,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 1.0,
             "avg_queue_len": 0.0,
             "avg_receive_rate_bps": 8000.0,
@@ -224,6 +246,9 @@ def test_packet_queue_1():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 1.1111111111111112,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.0,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 1.1111111111111112,
             "avg_queue_len": 0.0,
             "avg_receive_rate_bps": 8888.888888888889,
@@ -273,8 +298,6 @@ def test_packet_interface_tx_1():
     assert sim.ctx.now == 10
     assert sim.event_counter == 38
 
-    import pprint
-
     pprint.pprint(interface_tx.stat.todict())
     assert interface_tx.stat.todict() == {
         "cur_interval_duration": 10.0,
@@ -282,6 +305,9 @@ def test_packet_interface_tx_1():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 0.9,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.1875,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 0.9,
             "avg_queue_len": 0.0,
             "avg_receive_rate_bps": 10800.0,
@@ -314,6 +340,9 @@ def test_packet_interface_tx_1():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 0.9795918367346939,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.1875,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 0.9795918367346939,
             "avg_queue_len": 0.0,
             "avg_receive_rate_bps": 11755.102040816326,
@@ -363,8 +392,6 @@ def test_packet_interface_tx_2():
     assert sim.ctx.now == 10
     assert sim.event_counter == 35
 
-    import pprint
-
     pprint.pprint(interface_tx.stat.todict())
 
     assert interface_tx.stat.todict() == {
@@ -373,6 +400,9 @@ def test_packet_interface_tx_2():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 0.8,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 2.0,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 0.9,
             "avg_queue_len": 0.8,
             "avg_receive_rate_bps": 10800.0,
@@ -405,6 +435,9 @@ def test_packet_interface_tx_2():
             "avg_drop_rate_bps": 0.0,
             "avg_drop_rate_pps": 0.0,
             "avg_get_rate_pps": 0.8205128205128205,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 2.0,
+            "avg_latency_at_drop": 0,
             "avg_put_rate_pps": 0.9230769230769231,
             "avg_queue_len": 0.7948717948717948,
             "avg_receive_rate_bps": 11076.923076923076,
