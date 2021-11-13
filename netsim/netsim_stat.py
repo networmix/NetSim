@@ -378,6 +378,12 @@ class PacketSwitchStat(Stat):
 class NetSimStat(Stat):
     stat_samples: Dict[NetSimObjectName, StatSamples] = field(default_factory=dict)
 
+    def dump_stat_trace(self) -> None:
+        ...
+
+    def dump_stat_samples(self, data_dict: Dict[str, Any]) -> None:
+        self._stat_tracer.write(dumps(data_dict) + "\n")
+
     def todict(self) -> Dict[str, Any]:
         ret = defaultdict(dict)
 

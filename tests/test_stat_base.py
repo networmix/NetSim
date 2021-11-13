@@ -130,6 +130,14 @@ def test_uniform_1():
     assert len(sample) == n
 
 
+def test_sample_stddev_1():
+    sample = [1, 2, 2, 3]
+    mean = sum(sample) / len(sample)
+    sigma = (1 / (len(sample) - 1) * sum((a - mean) ** 2 for a in sample)) ** 0.5
+    assert sigma == (1 / 3 * 2) ** 0.5
+    assert sigma == stat_base.sample_stdev(sample)
+
+
 def test_df_1():
     assert stat_base.sample_df(SAMPLE_UNIFORM, r=0) == 99
 

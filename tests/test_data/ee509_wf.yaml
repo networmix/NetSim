@@ -14,7 +14,7 @@ instructions:
                 ns_attr:
                   arrival_time_distr: Exponential
                   arrival_distr_params:
-                    lambda: 1000
+                    lambda: 2750
 
                   size_distr: Exponential
                   size_distr_params:
@@ -30,6 +30,8 @@ instructions:
                 ns_type: PacketInterfaceTx
                 ns_attr:
                   bw: 10000000
+                  queue_len_limit: 30
+
           - Create:
               name: Sink
               node_attr:
@@ -60,16 +62,15 @@ instructions:
 
   - RunNetSim:
       graph: EE509_1
-      until_time: 10
-      stat_interval: 10
+      until_time: 250
+      stat_interval: 5
       enable_stat_trace: True
-      enable_packet_trace: True
+      enable_packet_trace: False
 
+  # - PrintSimData:
+  #     graph: EE509_1
 
-  - PrintSimData:
-      graph: EE509_1
-
-  - SaveSimData:
+  - ExportSimData:
       graph: EE509_1
       dir_path: ""
-      trace_scope: [nsim, ns_obj]
+      trace_scope: [nsim]

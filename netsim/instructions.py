@@ -30,6 +30,9 @@ class ExecutionContext:
     def set_data(self, key: str, container: DataContainer) -> None:
         self._data[key] = container
 
+    def del_data(self, key: str) -> None:
+        del self._data[key]
+
     def get_data(self, key: Optional[str] = None) -> DataContainer:
         if key:
             return self._data[key]

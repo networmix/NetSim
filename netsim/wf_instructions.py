@@ -5,12 +5,12 @@ import cProfile
 import pstats
 from collections import deque
 import os
+import shutil
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 import logging
 import json
-import pprint
 
 import jq
 
@@ -23,6 +23,10 @@ from netsim.dict_path import (
 )
 from netsim.instructions import DataContainer, Instruction, ExecutionContext
 from netsim.netbuilder.builder_instructions import BUILDER_INSTRUCTIONS
+from netsim.netsim_analysis import (
+    ANALYSER_TYPE_MAP,
+    NetSimIntQueueAnalyser,
+)
 from netsim.netsim_common import NetSimObjectName
 from netsim.netsim_simulator import NetSim
 from netsim.sim_common import SimTime
@@ -200,6 +204,7 @@ class RunNetSim(WorkflowInstruction):
         self._until_time = attr.get("until_time")
         self._stat_interval = attr.get("stat_interval")
         self._enable_stat_trace = attr.get("enable_stat_trace")
+        self._enable_obj_trace = attr.get("enable_obj_trace")
         self._enable_packet_trace = attr.get("enable_packet_trace")
         self._profile = attr.get("profile", False)
         self._profile_sort = attr.get("profile_sort", "tottime")
@@ -216,6 +221,7 @@ class RunNetSim(WorkflowInstruction):
                 sim.run(
                     until_time=self._until_time,
                     enable_stat_trace=self._enable_stat_trace,
+                    enable_obj_trace=self._enable_obj_trace,
                     enable_packet_trace=self._enable_packet_trace,
                 )
                 stats = pstats.Stats(profiler).sort_stats(self._profile_sort)
@@ -262,11 +268,11 @@ class PrintSimData(WorkflowInstruction):
         return ctx
 
 
-class SaveSimData(WorkflowInstruction):
+class ExportSimData(WorkflowInstruction):
     def __init__(self, attr: Dict[str, Any]):
         super().__init__(attr)
         self._graph = attr["graph"]
-        self._dir_path = attr["dir_path"]
+        self._dir_path = os.path.expanduser(attr["dir_path"])
         self._file_prefix = attr.get("file_prefix", self._graph)
         self._trace_scope = attr.get("trace_scope", ["nsim"])
 
@@ -276,31 +282,82 @@ class SaveSimData(WorkflowInstruction):
 
         if "ns_obj" in self._trace_scope:
             for obj_name, obj_stat in simdata.stat_data.items():
-                self._dir_path = os.path.expanduser(self._dir_path)
-                filename = f"{self._file_prefix}_{obj_name}_stat.jsonl"
+                filename = f"{self._file_prefix}_{obj_stat.__class__.__name__}_{obj_name}_stat.jsonl"
                 path = os.path.join(self._dir_path, filename)
-
                 if tracer := obj_stat.get_stat_tracer():
-                    with open(path, "w", encoding="utf8") as fd:
-                        tracer.seek(0)
-                        for line in tracer:
-                            fd.write(line)
+                    tracer.flush()
+                    shutil.copyfile(tracer.name, path)
+                    tracer.close()
 
-                filename = f"{self._file_prefix}_{obj_name}_packets.jsonl"
+                filename = f"{self._file_prefix}_{obj_stat.__class__.__name__}_{obj_name}_packets.jsonl"
                 path = os.path.join(self._dir_path, filename)
                 if tracer := obj_stat.get_packet_tracer():
-                    with open(path, "w", encoding="utf8") as fd:
-                        tracer.seek(0)
-                        for line in tracer:
-                            fd.write(line)
+                    tracer.flush()
+                    shutil.copyfile(tracer.name, path)
+                    tracer.close()
 
         if "nsim" in self._trace_scope:
-            filename = f"{self._file_prefix}_nstat.jsonl"
-            self._dir_path = os.path.expanduser(self._dir_path)
+            filename = f"{self._file_prefix}_{simdata.nsim_stat_data.__class__.__name__}_nstat_stat.jsonl"
             path = os.path.join(self._dir_path, filename)
             if tracer := simdata.nsim_stat_data.get_stat_tracer():
-                with open(path, "w", encoding="utf8") as fd:
-                    tracer.seek(0)
-                    for line in tracer:
-                        fd.write(line)
+                tracer.flush()
+                shutil.copyfile(tracer.name, path)
+                tracer.close()
+
+        for obj_name in self._trace_scope:
+            if obj_name not in ("ns_obj", "nsim"):
+                obj_stat = simdata.stat_data[obj_name]
+
+                filename = f"{self._file_prefix}_{obj_stat.__class__.__name__}_{obj_name}_stat.jsonl"
+                path = os.path.join(self._dir_path, filename)
+                if tracer := obj_stat.get_stat_tracer():
+                    tracer.flush()
+                    shutil.copyfile(tracer.name, path)
+                    tracer.close()
+
+                filename = f"{self._file_prefix}_{obj_stat.__class__.__name__}_{obj_name}_packets.jsonl"
+                path = os.path.join(self._dir_path, filename)
+                if tracer := obj_stat.get_packet_tracer():
+                    tracer.flush()
+                    shutil.copyfile(tracer.name, path)
+                    tracer.close()
+        ctx.del_data(key)
+        return ctx
+
+
+class ProcessSimData(WorkflowInstruction):
+    def __init__(self, attr: Dict[str, Any]):
+        super().__init__(attr)
+        self._graph = attr["graph"]
+        self._dir_path = os.path.expanduser(attr["dir_path"])
+        self._file_prefix = attr.get("file_prefix", self._graph)
+        self._obj_name = attr.get("ns_obj")
+        self._stat_type = attr.get("stat_type")
+        self._analyser_type = attr.get("analyser_type")
+
+    def run(self, ctx: ExecutionContext) -> ExecutionContext:
+
+        if self._stat_type != "NetSimStat":
+            path = os.path.join(
+                self._dir_path,
+                f"{self._file_prefix}_{self._stat_type}_{self._obj_name}_stat.jsonl",
+            )
+        else:
+            path = os.path.join(
+                self._dir_path,
+                f"{self._file_prefix}_NetSimStat_nstat_stat.jsonl",
+            )
+
+        if self._analyser_type == "NetSimIntQueueAnalyser":
+            analyser_class: NetSimIntQueueAnalyser = ANALYSER_TYPE_MAP[
+                self._analyser_type
+            ]
+            if os.path.exists(path):
+                with open(path, encoding="utf8") as fd:
+                    analyser: NetSimIntQueueAnalyser = (
+                        analyser_class.init_with_nsim_stat(fd)
+                    )
+                    analyser.analyse_queue(self._obj_name)
+            else:
+                raise RuntimeError(f"File {path} does not exist!")
         return ctx

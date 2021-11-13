@@ -8,8 +8,9 @@ from netsim.wf_instructions import (
     ExecutionContext,
     BuildGraph,
     PrintSimData,
+    ProcessSimData,
     RunNetSim,
-    SaveSimData,
+    ExportSimData,
     ValidateGraphJQ,
     LogGraphNodeLink,
     LogGraphLinks,
@@ -33,7 +34,8 @@ INSTRUCTIONS = {
     "LogContextData": LogContextData,
     "RunNetSim": RunNetSim,
     "PrintSimData": PrintSimData,
-    "SaveSimData": SaveSimData,
+    "ExportSimData": ExportSimData,
+    "ProcessSimData": ProcessSimData
 }
 
 

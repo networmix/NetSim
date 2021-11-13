@@ -137,7 +137,7 @@ class Stat:
 
     def enable_stat_trace(self, prefix: Optional[None]) -> None:
         self._stat_tracer = NamedTemporaryFile(
-            mode="r+", encoding="utf8", prefix=prefix
+            mode="w", encoding="utf8", prefix=prefix
         )
 
     def get_stat_tracer(self) -> Optional[NamedTemporaryFile]:

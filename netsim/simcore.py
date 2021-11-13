@@ -730,8 +730,9 @@ class Simulator:
         while (event := self._ctx.get_event()) and not self._ctx.is_stopped():
             if self._ctx.advance_simtime(event.time):
                 self._ctx.exec_all_stat_callbacks()
-            event.run()
-            self.event_counter += 1
+            if event.is_triggered():
+                event.run()
+                self.event_counter += 1
         if not self._stat_interval:
             for stat_collector in self.stat_collectors:
                 stat_collector.collect_now()

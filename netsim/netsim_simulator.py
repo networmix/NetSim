@@ -60,18 +60,22 @@ class NetStatCollector(StatCollector):
 
     def _collect(self, reset: bool) -> Event:
         self._stat_container.advance_time()
+        stat_samples: Dict[NetSimObjectName, Dict[str, Union[int, float]]] = {}
         for ns_obj in self._nsim.get_ns_obj_iter():
             ns_obj.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
                 self._stat_container.cur_timestamp,
             )
-
+            cur_stat_frame_copy = deepcopy(ns_obj.stat.cur_stat_frame)
             self._stat_container.stat_samples.setdefault(ns_obj.name, {})[
                 interval
-            ] = deepcopy(ns_obj.stat.cur_stat_frame)
+            ] = cur_stat_frame_copy
+            stat_samples[ns_obj.name] = cur_stat_frame_copy.todict()
             if reset:
                 ns_obj.stat.reset_stat()
+        if self._stat_container.get_stat_tracer() and stat_samples:
+            self._stat_container.dump_stat_samples({str(interval): stat_samples})
 
 
 class NetSim(Simulator):
@@ -100,9 +104,11 @@ class NetSim(Simulator):
         return iter(self._ns.values())
 
     def enable_stat_trace(self) -> None:
+        self.nstat.enable_stat_trace(prefix="NetSim")
+
+    def enable_obj_trace(self) -> None:
         for ns_obj in self._ns.values():
             ns_obj.stat.enable_stat_trace(prefix=ns_obj.name)
-        self.nstat.enable_stat_trace(prefix="NetSim")
 
     def enable_packet_trace(self) -> None:
         for ns_obj in self._ns.values():
@@ -158,10 +164,13 @@ class NetSim(Simulator):
         self,
         until_time: Optional[SimTime] = None,
         enable_stat_trace: bool = False,
+        enable_obj_trace: bool = False,
         enable_packet_trace: bool = False,
     ) -> None:
         if enable_stat_trace:
             self.enable_stat_trace()
+        if enable_obj_trace:
+            self.enable_obj_trace()
         if enable_packet_trace:
             self.enable_packet_trace()
         super().run(until_time=until_time)
