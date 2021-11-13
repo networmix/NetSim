@@ -2,7 +2,7 @@
 
 set -e
 
-IMAGE_TAG=ubuildenv
+IMAGE_TAG=pybuildenv
 IMAGE_ID=$(docker images --format "{{.ID}}" $IMAGE_TAG)
 
 USAGE="Usage: $0 COMMAND IMAGE_TAG\n"
