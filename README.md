@@ -2,6 +2,8 @@
 
 🚧 Work in progress! 🚧
 
+![Python-test](https://github.com/networmix/NetSim/workflows/Python-test/badge.svg?branch=main) 
+
 ## Introduction
 NetSim is planned to become a toolkit that could help network engineers (my friends and myself included) to better reason about the network designs.
 
