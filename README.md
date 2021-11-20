@@ -16,3 +16,11 @@ From a high level standpoint the system consists of few components:
 * Simple graph library
 * Tool to build network graphs from their definitions
 * Discrete event simulator
+
+## How to use
+```
+$ docker build -t netsim .
+$ docker run -it --rm --hostname netsim --name netsim-running netsim
+
+root@netsim:/usr/src/NetSim# python3 ./netsim/cli.py examples/wf_ee509_1_1.yaml
+```

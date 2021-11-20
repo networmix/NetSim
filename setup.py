@@ -14,4 +14,5 @@ setup(
     long_description=readme,
     license=lic,
     packages=find_packages(exclude=("tests", "docs")),
+    tests_require=['pytest'],
 )
