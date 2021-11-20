@@ -8,7 +8,7 @@ WORKDIR /usr/src/NetSim
 
 COPY netsim netsim
 COPY examples examples
-COPY LICENSE README.md requirements.txt setup.cfg setup.py .
+COPY LICENSE README.md requirements.txt setup.cfg setup.py /usr/src/NetSim/
 RUN pip install -r requirements.txt
 RUN pip install -e .
 
