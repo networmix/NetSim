@@ -1,0 +1,12 @@
+pyyaml
+schema
+jq
+pandas
+seaborn
+matplotlib
+faker
+pytest
+pytest-cov
+pytest-benchmark
+pylint
+black

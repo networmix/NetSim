@@ -1,4 +1,5 @@
 pyyaml
+schema
 jq
 pandas
 seaborn

@@ -280,6 +280,235 @@ def test_packet_queue_1():
     }
 
 
+def test_packet_queue_admission_taildrop_2():
+    sim = NetSim()
+
+    ADMISSION_PARAMS = {
+        "admission_policy": "taildrop",
+    }
+    MAX_QUEUE_LEN = 10
+
+    def arrival_gen() -> SimTime:
+        yield 0
+        while True:
+            for idx in range(0, 10):
+                yield 1 / 2 ** idx
+
+    def size_gen() -> PacketSize:
+        while True:
+            yield 1000
+
+    def service_gen() -> SimTime:
+        while True:
+            yield 0.25
+
+    source = PacketSource(sim.ctx, arrival_gen(), size_gen())
+    queue = PacketQueue(
+        sim.ctx,
+        queue_len_limit=MAX_QUEUE_LEN,
+        admission_params=ADMISSION_PARAMS,
+        service_func=service_gen(),
+    )
+    source.subscribe(queue)
+    sim.run(until_time=10)
+
+    assert sim.ctx.now == 10
+
+    pprint.pprint(queue.stat.todict())
+
+    assert queue.stat.todict() == {
+        "cur_interval_duration": 10.0,
+        "cur_stat_frame": {
+            "avg_drop_rate_bps": 8000.0,
+            "avg_drop_rate_pps": 1.0,
+            "avg_get_rate_pps": 3.6,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 1.2932477678571428,
+            "avg_latency_at_drop": 0.0,
+            "avg_put_rate_pps": 4.6,
+            "avg_queue_len": 4.4390625,
+            "avg_receive_rate_bps": 40800.0,
+            "avg_receive_rate_pps": 5.1,
+            "avg_send_rate_bps": 28000.0,
+            "avg_send_rate_pps": 3.5,
+            "avg_wait_time": 1.0639105902777777,
+            "cur_queue_len": 10,
+            "duration": 10.0,
+            "integral_queue_sum": 44.390625,
+            "integral_wait_time_sum": 38.30078125,
+            "last_state_change_timestamp": 9.990234375,
+            "max_queue_len": 10,
+            "max_wait_time": 2.2578125,
+            "timestamp": 10,
+            "total_dropped_bytes": 10000,
+            "total_dropped_pkts": 10,
+            "total_get_bytes": 36000,
+            "total_get_pkts": 36,
+            "total_put_bytes": 46000,
+            "total_put_pkts": 46,
+            "total_received_bytes": 51000,
+            "total_received_pkts": 51,
+            "total_sent_bytes": 35000,
+            "total_sent_pkts": 35,
+        },
+        "cur_timestamp": 10,
+        "last_state_change_timestamp": 9.990234375,
+        "prev_stat_frame": {
+            "avg_drop_rate_bps": 8007.820136852395,
+            "avg_drop_rate_pps": 1.0009775171065494,
+            "avg_get_rate_pps": 3.6035190615835777,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 1.2932477678571428,
+            "avg_latency_at_drop": 0.0,
+            "avg_put_rate_pps": 4.604496578690127,
+            "avg_queue_len": 4.433626588465298,
+            "avg_receive_rate_bps": 40839.882697947214,
+            "avg_receive_rate_pps": 5.104985337243402,
+            "avg_send_rate_bps": 28027.370478983383,
+            "avg_send_rate_pps": 3.5034213098729228,
+            "avg_wait_time": 1.0639105902777777,
+            "cur_queue_len": 10,
+            "duration": 9.990234375,
+            "integral_queue_sum": 44.29296875,
+            "integral_wait_time_sum": 38.30078125,
+            "last_state_change_timestamp": 9.990234375,
+            "max_queue_len": 10,
+            "max_wait_time": 2.2578125,
+            "timestamp": 9.990234375,
+            "total_dropped_bytes": 10000,
+            "total_dropped_pkts": 10,
+            "total_get_bytes": 36000,
+            "total_get_pkts": 36,
+            "total_put_bytes": 46000,
+            "total_put_pkts": 46,
+            "total_received_bytes": 51000,
+            "total_received_pkts": 51,
+            "total_sent_bytes": 35000,
+            "total_sent_pkts": 35,
+        },
+        "prev_timestamp": 9.990234375,
+        "start_interval_timestamp": 0,
+    }
+
+
+def test_packet_queue_admission_red_1():
+    sim = NetSim()
+
+    ADMISSION_PARAMS = {
+        "admission_policy": "red",
+        "wq": 0.5,
+        "minth": 3,
+        "maxth": 10,
+        "maxp": 0.99,
+        "s": 0.1,
+    }
+
+    MAX_QUEUE_LEN = 10
+
+    def arrival_gen() -> SimTime:
+        yield 0
+        while True:
+            for idx in range(0, 10):
+                yield 1 / 2 ** idx
+
+    def size_gen() -> PacketSize:
+        while True:
+            yield 1000
+
+    def service_gen() -> SimTime:
+        while True:
+            yield 0.25
+
+    source = PacketSource(sim.ctx, arrival_gen(), size_gen())
+    queue = PacketQueue(
+        sim.ctx,
+        queue_len_limit=MAX_QUEUE_LEN,
+        admission_params=ADMISSION_PARAMS,
+        service_func=service_gen(),
+    )
+    source.subscribe(queue)
+    sim.run(until_time=10)
+
+    assert sim.ctx.now == 10
+
+    pprint.pprint(queue.stat.todict())
+    print(queue._queue._queue)
+
+    assert queue.stat.todict() == {
+        "cur_interval_duration": 10.0,
+        "cur_stat_frame": {
+            "avg_drop_rate_bps": 14400.0,
+            "avg_drop_rate_pps": 1.8,
+            "avg_get_rate_pps": 3.6,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.9234933035714286,
+            "avg_latency_at_drop": 0.0,
+            "avg_put_rate_pps": 4.2,
+            "avg_queue_len": 2.5361328125,
+            "avg_receive_rate_bps": 40800.0,
+            "avg_receive_rate_pps": 5.1,
+            "avg_send_rate_bps": 28000.0,
+            "avg_send_rate_pps": 3.5,
+            "avg_wait_time": 0.6758355034722222,
+            "cur_queue_len": 6,
+            "duration": 10.0,
+            "integral_queue_sum": 25.361328125,
+            "integral_wait_time_sum": 24.330078125,
+            "last_state_change_timestamp": 9.990234375,
+            "max_queue_len": 7,
+            "max_wait_time": 1.509765625,
+            "timestamp": 10,
+            "total_dropped_bytes": 18000,
+            "total_dropped_pkts": 18,
+            "total_get_bytes": 36000,
+            "total_get_pkts": 36,
+            "total_put_bytes": 42000,
+            "total_put_pkts": 42,
+            "total_received_bytes": 51000,
+            "total_received_pkts": 51,
+            "total_sent_bytes": 35000,
+            "total_sent_pkts": 35,
+        },
+        "cur_timestamp": 10,
+        "last_state_change_timestamp": 9.990234375,
+        "prev_stat_frame": {
+            "avg_drop_rate_bps": 14414.07624633431,
+            "avg_drop_rate_pps": 1.8017595307917889,
+            "avg_get_rate_pps": 3.6035190615835777,
+            "avg_latency_at_arrival": 0.0,
+            "avg_latency_at_departure": 0.9234933035714286,
+            "avg_latency_at_drop": 0.0,
+            "avg_put_rate_pps": 4.204105571847507,
+            "avg_queue_len": 2.5327468230694037,
+            "avg_receive_rate_bps": 40839.882697947214,
+            "avg_receive_rate_pps": 5.104985337243402,
+            "avg_send_rate_bps": 28027.370478983383,
+            "avg_send_rate_pps": 3.5034213098729228,
+            "avg_wait_time": 0.6758355034722222,
+            "cur_queue_len": 6,
+            "duration": 9.990234375,
+            "integral_queue_sum": 25.302734375,
+            "integral_wait_time_sum": 24.330078125,
+            "last_state_change_timestamp": 9.990234375,
+            "max_queue_len": 7,
+            "max_wait_time": 1.509765625,
+            "timestamp": 9.990234375,
+            "total_dropped_bytes": 18000,
+            "total_dropped_pkts": 18,
+            "total_get_bytes": 36000,
+            "total_get_pkts": 36,
+            "total_put_bytes": 42000,
+            "total_put_pkts": 42,
+            "total_received_bytes": 51000,
+            "total_received_pkts": 51,
+            "total_sent_bytes": 35000,
+            "total_sent_pkts": 35,
+        },
+        "prev_timestamp": 9.990234375,
+        "start_interval_timestamp": 0,
+    }
+
+
 def test_packet_interface_tx_1():
     sim = NetSim()
 

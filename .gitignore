@@ -30,4 +30,8 @@ var/
 pyvenv.cfg
 .pytest_cache
 .coverage
+
+# NetSim artifacts
 *.jsonl
+*.png
+*.csv
