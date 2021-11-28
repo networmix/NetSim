@@ -44,9 +44,12 @@ class NetSimIntAnalyser(NetAnalyser):
 class NetSimIntQueueAnalyser(NetSimIntAnalyser):
     def analyse_queue(self, obj_name: str) -> None:
         df = self.data_frames[obj_name]
-        print(df.info())
         int_duration = df.duration[0]
         int_count = len(df)
+        if int_count < 2:
+            raise RuntimeError(
+                "NetSimIntQueueAnalyser requires data from at least two intervals."
+            )
         total_duration = int_duration * int_count
         sns.set_theme()
         sns.set_context("paper")

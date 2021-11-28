@@ -456,7 +456,7 @@ class PacketQueue(SenderReceiver):
         _ = packet
         self._queue_state: QueueStateRED
 
-        if len(self._queue):
+        if len(self._queue) > 0:
             # queue is nonempty
             self._queue_state.avg = (
                 1 - self._queue_state.wq
