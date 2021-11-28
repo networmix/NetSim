@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import random
 from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Set, Type, Union, Generator, Any
+from typing import Callable, Dict, List, Optional, Set, Type, Union, Generator, Any
+
+from schema import Schema
+
 from netsim.netsim_common import (
     InterfaceBW,
     NetSimObjectID,
@@ -22,6 +26,7 @@ from netsim.simcore import (
     QueueFIFO,
     SimContext,
 )
+
 from netsim.simstat import Stat
 from netsim.stat_base import DistrBuilder, DistrFunc
 
@@ -29,6 +34,49 @@ from netsim.stat_base import DistrBuilder, DistrFunc
 LOG_FMT = "%(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FMT)
 logger = logging.getLogger(__name__)
+
+SEED = 0
+random.seed(SEED)
+
+QUEUE_ADMISSION_RED_PARAMS = Schema(
+    [
+        {
+            "admission_policy": lambda s: s == "red",
+            "wq": float,
+            "minth": int,
+            "maxth": int,
+            "maxp": float,
+            "s": float,
+        }
+    ]
+)
+
+
+QUEUE_ADMISSION_TAILDROP_PARAMS = Schema(
+    [
+        {
+            "admission_policy": lambda s: s == "taildrop",
+        }
+    ]
+)
+
+
+@dataclass
+class QueueState:
+    ...
+
+
+@dataclass
+class QueueStateRED(QueueState):
+    admission_policy: str  # name of the policy
+    wq: float  # queue weight
+    minth: float  # min threshold
+    maxth: float  # max threshold
+    maxp: float  # maximum value for pb
+    s: float  #  transmission time for a small packet
+    avg: float = 0  # smoothed average queue size for RED
+    q_time: float = 0  # start of the queue idle time
+    count: int = -1  # packets since last marked packet
 
 
 class NetSimObject(ABC):
@@ -324,19 +372,60 @@ class PacketQueue(SenderReceiver):
     def __init__(
         self,
         ctx: SimContext,
-        capacity: Optional[int] = None,
+        queue_len_limit: Optional[int] = None,
         name: Optional[NetSimObjectName] = None,
+        admission_params: Optional[Dict[str, Any]] = None,
+        service_func: Optional[Generator] = None,
     ):
         super().__init__(ctx, name=name, stat_type=PacketQueueStat)
         self.stat: PacketQueueStat = self.stat
-        self._queue = QueueFIFO(ctx, capacity, name=self.name)
+        self._queue = QueueFIFO(ctx, name=self.name)
+        self._queue_len_limit: Optional[int] = queue_len_limit
         self._queue.extend_name("_QueueFIFO")
+        self._admission_params: Optional[Dict[str, Any]] = admission_params
+        self._queue_state: Optional[QueueState] = None
+        self._admission_func: Optional[Callable[[PacketQueue, Packet], bool]] = None
+        self._service_func: Optional[Generator] = service_func
+        self._packet_get_callbacks: List[Callable[[PacketQueue, Packet], None]] = []
+
+        if not admission_params and queue_len_limit is None:
+            self._admission_func: Callable[
+                [PacketQueue, Packet], bool
+            ] = self._queue_admission_all
+
+        elif not admission_params and queue_len_limit is not None:
+            self._admission_func: Callable[
+                [PacketQueue, Packet], bool
+            ] = self._queue_admission_tail_drop
+
+        elif QUEUE_ADMISSION_TAILDROP_PARAMS.is_valid([admission_params]):
+            self._admission_func: Callable[
+                [PacketQueue, Packet], bool
+            ] = self._queue_admission_tail_drop
+
+        elif QUEUE_ADMISSION_RED_PARAMS.is_valid([admission_params]):
+            self._admission_func: Callable[
+                [PacketQueue, Packet], bool
+            ] = self._queue_admission_red
+            self._queue_state = QueueStateRED(**admission_params)
+
+            def q_time_callback(pq: PacketQueue, p: Packet) -> None:
+                if not len(pq._queue) > 0:
+                    pq._queue_state.q_time = pq._ctx.now
+
+            self._packet_get_callbacks.append(q_time_callback)
+
+        else:
+            raise RuntimeError(f"Unknown admission_params: {admission_params}")
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
         while True:
             packet: Packet = yield self._queue.get()
             if packet:
                 self._packet_get(packet)
+                if self._service_func:
+                    service_delay = next(self._service_func, None)
+                    yield self.process.timeout(service_delay)
                 for subscriber in self._subscribers:
                     subscriber.put(packet, self)
                 self._packet_sent(packet)
@@ -350,14 +439,73 @@ class PacketQueue(SenderReceiver):
         *args: List[Any],
         **kwargs: Dict[str, Any],
     ) -> None:
-        self._queue.put(item)
         self._packet_received(item)
-        self._packet_put(item)
+        if self._admission_func(packet=item):
+            self._queue.put(item)
+            self._packet_put(item)
+        else:
+            self._packet_dropped(item)
+
+    def _queue_admission_tail_drop(self, packet: Packet) -> bool:
+        _ = packet
+        if not self._queue_len_limit or len(self._queue) < self._queue_len_limit:
+            return True
+        return False
+
+    def _queue_admission_red(self, packet: Packet) -> bool:
+        _ = packet
+        self._queue_state: QueueStateRED
+
+        if len(self._queue):
+            # queue is nonempty
+            self._queue_state.avg = (
+                1 - self._queue_state.wq
+            ) * self._queue_state.avg + self._queue_state.wq * len(self._queue)
+        else:
+            # queue is empty
+            m = (self._ctx.now - self._queue_state.q_time) / self._queue_state.s
+            self._queue_state.avg *= (1 - self._queue_state.wq) ** m
+
+        if self._queue_len_limit and not len(self._queue) < self._queue_len_limit:
+            # "hard" drop
+            self._queue_state.count = 0
+            return False
+
+        if self._queue_state.minth <= self._queue_state.avg < self._queue_state.maxth:
+            self._queue_state.count += 1
+            pb = (
+                self._queue_state.maxp
+                * (self._queue_state.avg - self._queue_state.minth)
+                / (self._queue_state.maxth - self._queue_state.minth)
+            )
+
+            if self._queue_state.count * pb < 1:
+                pa = pb / (1 - self._queue_state.count * pb)
+            else:
+                pa = 1.0
+
+            if random.random() < pa:
+                self._queue_state.count = 0
+                return False
+
+        elif self._queue_state.maxth <= self._queue_state.avg:
+            self._queue_state.count = 0
+            return False
+
+        else:
+            self._queue_state.count = -1
+        return True
+
+    def _queue_admission_all(self, packet: Packet) -> bool:
+        _ = packet
+        return True
 
     def _packet_put(self, packet: Packet) -> None:
         self.stat.packet_put(packet)
 
     def _packet_get(self, packet: Packet) -> None:
+        for callback in self._packet_get_callbacks:
+            callback(self, packet)
         self.stat.packet_get(packet)
 
     def _packet_dropped(self, packet: Packet) -> None:
@@ -424,11 +572,16 @@ class PacketInterfaceTx(PacketQueue):
         ctx: SimContext,
         bw: InterfaceBW,
         queue_len_limit: Optional[int] = None,
+        admission_params: Optional[Dict[str, Any]] = None,
         name: Optional[NetSimObjectName] = None,
     ):
-        super().__init__(ctx, name=name)
+        super().__init__(
+            ctx,
+            name=name,
+            queue_len_limit=queue_len_limit,
+            admission_params=admission_params,
+        )
         self._bw: InterfaceBW = bw
-        self._queue_len_limit: Optional[int] = queue_len_limit
         self._busy: bool = False
 
     def run(self, *args: List[Any], **kwargs: Dict[str, Any]) -> Coro:
@@ -446,23 +599,3 @@ class PacketInterfaceTx(PacketQueue):
                 raise RuntimeError(
                     f"Resumed {self} without packet at {self._ctx.now}",
                 )
-
-    def put(
-        self,
-        item: Packet,
-        source: Union[Sender, SenderReceiver],
-        *args: List[Any],
-        **kwargs: Dict[str, Any],
-    ):
-        self._packet_received(item)
-        if self._queue_admission_tail_drop(packet=item):
-            self._queue.put(item)
-            self._packet_put(item)
-        else:
-            self._packet_dropped(item)
-
-    def _queue_admission_tail_drop(self, packet: Packet):
-        _ = packet
-        if not self._queue_len_limit or len(self._queue) < self._queue_len_limit:
-            return True
-        return False
