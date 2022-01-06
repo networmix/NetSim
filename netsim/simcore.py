@@ -80,6 +80,7 @@ class Process:
         self.status: ProcessStatus = ProcessStatus.CREATED
         self.stat: ProcessStat = ProcessStat(ctx)
         self.stat_callbacks: List[StatCallback] = []
+        self.tick_callbacks: List[TickCallback] = []
 
     def __repr__(self) -> str:
         return f"{self.name}(proc_id={self.proc_id}, coro={self._coro})"
@@ -156,6 +157,13 @@ class Process:
     def add_stat_callback(self, callback: StatCallback) -> None:
         self.stat_callbacks.append(callback)
 
+    def exec_tick_callbacks(self) -> None:
+        for tick_callback in self.tick_callbacks:
+            tick_callback()
+
+    def add_tick_callback(self, callback: TickCallback) -> None:
+        self.tick_callbacks.append(callback)
+
 
 class StatCollector(Process):
     def __init__(
@@ -227,6 +235,7 @@ class Resource(ABC):
         self._get_queue: Deque[Get] = deque()
         self.stat = ResourceStat(ctx)
         self.stat_callbacks: List[StatCallback] = []
+        self.tick_callbacks: List[TickCallback] = []
 
     def __repr__(self) -> str:
         return f"{self.name}(res_id={self.res_id}, capacity={self._capacity})"
@@ -303,6 +312,13 @@ class Resource(ABC):
 
     def add_stat_callback(self, callback: StatCallback) -> None:
         self.stat_callbacks.append(callback)
+
+    def exec_tick_callbacks(self) -> None:
+        for tick_callback in self.stat_callbacks:
+            tick_callback()
+
+    def add_tick_callback(self, callback: TickCallback) -> None:
+        self.tick_callbacks.append(callback)
 
 
 class QueueFIFO(Resource):
@@ -687,6 +703,13 @@ class SimContext:
         for resource in self._resources.values():
             resource.exec_stat_callbacks()
 
+    def exec_all_tick_callbacks(self) -> None:
+        for proc in self._procs.values():
+            proc.exec_tick_callbacks()
+
+        for resource in self._resources.values():
+            resource.exec_tick_callbacks()
+
 
 class Simulator:
     def __init__(
@@ -730,6 +753,7 @@ class Simulator:
         while (event := self._ctx.get_event()) and not self._ctx.is_stopped():
             if self._ctx.advance_simtime(event.time):
                 self._ctx.exec_all_stat_callbacks()
+                self._ctx.exec_all_tick_callbacks()
             if event.is_triggered():
                 event.run()
                 self.event_counter += 1
@@ -745,5 +769,6 @@ class Simulator:
 
 
 StatCallback = Callable[[None], None]
+TickCallback = Callable[[None], None]
 EventCallback = Callable[[Event], None]
 Coro = Generator[Optional[Event], Any, Optional[Event]]
