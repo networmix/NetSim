@@ -230,6 +230,7 @@ class RunNetSim(WorkflowInstruction):
             sim.run(
                 until_time=self._until_time,
                 enable_stat_trace=self._enable_stat_trace,
+                enable_obj_trace=self._enable_obj_trace,
                 enable_packet_trace=self._enable_packet_trace,
             )
 

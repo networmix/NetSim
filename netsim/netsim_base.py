@@ -29,6 +29,7 @@ from netsim.simcore import (
 
 from netsim.simstat import Stat
 from netsim.stat_base import DistrBuilder, DistrFunc
+from netsim.simtracer import Tracer
 
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -414,6 +415,9 @@ class PacketQueue(SenderReceiver):
                     pq._queue_state.q_time = pq._ctx.now
 
             self._packet_get_callbacks.append(q_time_callback)
+            # self.process.add_tick_callback(
+            #     Tracer(self).get_trace_dumper(self._queue_state)
+            # )
 
         else:
             raise RuntimeError(f"Unknown admission_params: {admission_params}")

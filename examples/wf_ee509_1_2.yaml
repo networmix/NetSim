@@ -75,7 +75,7 @@ instructions:
                 ns_attr:
                   arrival_time_distr: Exponential
                   arrival_distr_params:
-                    lambda: 3000
+                    lambda: 2750
 
                   size_distr: Exponential
                   size_distr_params:
@@ -133,24 +133,26 @@ instructions:
       until_time: 250
       stat_interval: 5
       enable_stat_trace: True
+      enable_obj_trace: False
       enable_packet_trace: False
 
   - ExportSimData:
       graph: EE509_1
       dir_path: ""
-      trace_scope: [nsim]
+      trace_scope: [nsim, Sink]
 
   - RunNetSim:
       graph: EE509_2
       until_time: 250
       stat_interval: 5
       enable_stat_trace: True
-      enable_packet_trace: False
+      enable_obj_trace: False
+      enable_packet_trace: True
 
   - ExportSimData:
       graph: EE509_2
       dir_path: ""
-      trace_scope: [nsim]
+      trace_scope: [nsim, Sink]
 
   - ProcessSimData:
       graph: EE509_1
