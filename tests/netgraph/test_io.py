@@ -1,4 +1,4 @@
-from netsim.netgraph.io import graph_to_node_link, node_link_to_graph
+from netsim.netgraph.io import graph_to_node_link, node_link_to_graph, edgelist_to_graph
 from netsim.netgraph.graph import MultiDiGraph
 
 
@@ -212,3 +212,32 @@ def test_node_link_1():
         ],
     }
     assert graph_to_node_link(node_link_to_graph(data)) == data
+
+
+def test_edgelist_to_graph_1():
+    columns = ["src", "dst", "test_attr"]
+    lines = [
+        "A B TEST_edge1a",
+        "B A TEST_edge1a",
+        "A B TEST_edge1b",
+        "B A TEST_edge1b",
+        "B C TEST_edge2",
+        "C B TEST_edge2",
+        "C A TEST_edge3",
+        "A C TEST_edge3",
+    ]
+
+    g = edgelist_to_graph(lines, columns)
+
+    assert "A" in g
+    assert "B" in g
+    assert "C" in g
+
+    assert g._edges[1] == ("A", "B", 1, {"test_attr": "TEST_edge1a"})
+    assert g._edges[2] == ("B", "A", 2, {"test_attr": "TEST_edge1a"})
+    assert g._edges[3] == ("A", "B", 3, {"test_attr": "TEST_edge1b"})
+    assert g._edges[4] == ("B", "A", 4, {"test_attr": "TEST_edge1b"})
+    assert g._edges[5] == ("B", "C", 5, {"test_attr": "TEST_edge2"})
+    assert g._edges[6] == ("C", "B", 6, {"test_attr": "TEST_edge2"})
+    assert g._edges[7] == ("C", "A", 7, {"test_attr": "TEST_edge3"})
+    assert g._edges[8] == ("A", "C", 8, {"test_attr": "TEST_edge3"})
