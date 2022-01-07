@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Iterable, List, Optional
 
 from .graph import MultiDiGraph
 
@@ -49,4 +49,37 @@ def node_link_to_graph(data: Dict) -> MultiDiGraph:
             edge["key"],
             **edge["attr"]
         )
+    return graph
+
+
+def edgelist_to_graph(
+    lines: Iterable[str],
+    columns: List[str],
+    separator: str = " ",
+    graph: Optional[MultiDiGraph] = None,
+    source: str = "src",
+    target: str = "dst",
+    key: str = "key",
+) -> MultiDiGraph:
+    """
+    Take strings and return a MultiDiGraph
+    """
+    graph = MultiDiGraph() if graph is None else graph
+
+    for line in lines:
+        tokens = line.split(sep=separator)
+        if len(tokens) != len(columns):
+            raise RuntimeError("")
+
+        line_dict = dict(zip(columns, tokens))
+        attr_dict = {
+            k: v for k, v in line_dict.items() if k not in [source, target, key]
+        }
+        graph.add_edge(
+            src_node=line_dict[source],
+            dst_node=line_dict[target],
+            edge_id=line_dict.get(key, 0),
+            **attr_dict
+        )
+
     return graph
