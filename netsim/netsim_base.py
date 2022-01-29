@@ -514,7 +514,6 @@ class PacketQueue(SenderReceiver):
 
     def _packet_dropped(self, packet: Packet) -> None:
         self.stat.packet_dropped(packet)
-        self.stat.packet_dropped(packet)
 
 
 class PacketInterfaceRx(PacketQueue):

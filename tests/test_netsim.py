@@ -148,11 +148,10 @@ def test_netsim_scenario_4():
     r1_tx = sim.get_ns_obj("R1_TX")
     r2_rx = sim.get_ns_obj("R2_RX")
 
-    pprint.pprint(r2_rx.stat.cur_stat_frame.todict())
-
+    pprint.pprint(r1_tx.stat.cur_stat_frame.todict())
     assert r1_tx.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 38400.0,
-        "avg_drop_rate_pps": 4.8,
+        "avg_drop_rate_bps": 19200.0,
+        "avg_drop_rate_pps": 2.4,
         "avg_get_rate_pps": 1.6,
         "avg_latency_at_arrival": 0.0,
         "avg_latency_at_departure": 1.0499999999999998,
@@ -172,8 +171,8 @@ def test_netsim_scenario_4():
         "max_queue_len": 2,
         "max_wait_time": 1.0,
         "timestamp": 2.5,
-        "total_dropped_bytes": 12000,
-        "total_dropped_pkts": 12,
+        "total_dropped_bytes": 6000,
+        "total_dropped_pkts": 6,
         "total_get_bytes": 4000,
         "total_get_pkts": 4,
         "total_put_bytes": 4000,
@@ -184,6 +183,7 @@ def test_netsim_scenario_4():
         "total_sent_pkts": 4,
     }
 
+    pprint.pprint(r2_rx.stat.cur_stat_frame.todict())
     assert r2_rx.stat.cur_stat_frame.todict() == {
         "avg_drop_rate_bps": 0.0,
         "avg_drop_rate_pps": 0.0,

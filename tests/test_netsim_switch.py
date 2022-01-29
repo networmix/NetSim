@@ -56,8 +56,8 @@ def test_packet_processor_1():
     }
 
     assert packet_processor.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 24000.0,
-        "avg_drop_rate_pps": 2.0,
+        "avg_drop_rate_bps": 12000.0,
+        "avg_drop_rate_pps": 1.0,
         "avg_get_rate_pps": 1.0,
         "avg_latency_at_arrival": 0.0,
         "avg_latency_at_departure": 0,
@@ -77,8 +77,8 @@ def test_packet_processor_1():
         "max_queue_len": 0,
         "max_wait_time": 0,
         "timestamp": 10,
-        "total_dropped_bytes": 30000,
-        "total_dropped_pkts": 20,
+        "total_dropped_bytes": 15000,
+        "total_dropped_pkts": 10,
         "total_get_bytes": 15000,
         "total_get_pkts": 10,
         "total_put_bytes": 15000,

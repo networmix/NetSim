@@ -184,8 +184,8 @@ SCENARIO_6_STAT = {
         },
         "SW1": {
             (0, 2): {
-                "avg_drop_rate_bps": 112000.0,
-                "avg_drop_rate_pps": 14.0,
+                "avg_drop_rate_bps": 56000.0,
+                "avg_drop_rate_pps": 7.0,
                 "avg_receive_rate_bps": 76000.0,
                 "avg_receive_rate_pps": 9.5,
                 "avg_send_rate_bps": 12000.0,
@@ -282,8 +282,8 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "timestamp": 2,
-                "total_dropped_bytes": 28000,
-                "total_dropped_pkts": 28,
+                "total_dropped_bytes": 14000,
+                "total_dropped_pkts": 14,
                 "total_received_bytes": 19000,
                 "total_received_pkts": 19,
                 "total_sent_bytes": 3000,
@@ -309,8 +309,8 @@ SCENARIO_6_STAT = {
                 },
                 "tx_interfaces": {
                     "to_SW2": {
-                        "avg_drop_rate_bps": 112000.0,
-                        "avg_drop_rate_pps": 14.0,
+                        "avg_drop_rate_bps": 56000.0,
+                        "avg_drop_rate_pps": 7.0,
                         "avg_get_rate_pps": 2.0,
                         "avg_latency_at_arrival": 0.0,
                         "avg_latency_at_departure": 0.7999999999999999,
@@ -330,8 +330,8 @@ SCENARIO_6_STAT = {
                         "max_queue_len": 1,
                         "max_wait_time": 0.5000000000000001,
                         "timestamp": 2,
-                        "total_dropped_bytes": 28000,
-                        "total_dropped_pkts": 28,
+                        "total_dropped_bytes": 14000,
+                        "total_dropped_pkts": 14,
                         "total_get_bytes": 4000,
                         "total_get_pkts": 4,
                         "total_put_bytes": 5000,
@@ -344,8 +344,8 @@ SCENARIO_6_STAT = {
                 },
             },
             (2, 4): {
-                "avg_drop_rate_bps": 240000.0,
-                "avg_drop_rate_pps": 30.0,
+                "avg_drop_rate_bps": 120000.0,
+                "avg_drop_rate_pps": 15.0,
                 "avg_receive_rate_bps": 156000.0,
                 "avg_receive_rate_pps": 19.5,
                 "avg_send_rate_bps": 28000.0,
@@ -442,8 +442,8 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "timestamp": 4,
-                "total_dropped_bytes": 60000,
-                "total_dropped_pkts": 60,
+                "total_dropped_bytes": 30000,
+                "total_dropped_pkts": 30,
                 "total_received_bytes": 39000,
                 "total_received_pkts": 39,
                 "total_sent_bytes": 7000,
@@ -469,8 +469,8 @@ SCENARIO_6_STAT = {
                 },
                 "tx_interfaces": {
                     "to_SW2": {
-                        "avg_drop_rate_bps": 120000.0,
-                        "avg_drop_rate_pps": 15.0,
+                        "avg_drop_rate_bps": 60000.0,
+                        "avg_drop_rate_pps": 7.5,
                         "avg_get_rate_pps": 2.0,
                         "avg_latency_at_arrival": 0.0,
                         "avg_latency_at_departure": 0.8999999999999998,
@@ -490,8 +490,8 @@ SCENARIO_6_STAT = {
                         "max_queue_len": 1,
                         "max_wait_time": 0.5000000000000001,
                         "timestamp": 4,
-                        "total_dropped_bytes": 60000,
-                        "total_dropped_pkts": 60,
+                        "total_dropped_bytes": 30000,
+                        "total_dropped_pkts": 30,
                         "total_get_bytes": 8000,
                         "total_get_pkts": 8,
                         "total_put_bytes": 9000,
