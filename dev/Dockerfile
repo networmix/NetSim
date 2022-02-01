@@ -16,6 +16,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+RUN pip install jupyter
+
 # The VOLUME instruction creates a mount point with the specified name
 # and marks it as holding externally mounted volumes from native host or other containers.
 VOLUME /root/env
