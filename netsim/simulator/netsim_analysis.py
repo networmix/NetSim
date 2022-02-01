@@ -7,7 +7,7 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from netsim.netsim_common import NetSimObjectName
+from netsim.simulator.netsim_common import NetSimObjectName
 from netsim.stat_base import sample_stdev
 
 

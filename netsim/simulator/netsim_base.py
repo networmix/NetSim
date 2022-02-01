@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Set, Type, Union, Generator, 
 
 from schema import Schema
 
-from netsim.netsim_common import (
+from netsim.simulator.netsim_common import (
     InterfaceBW,
     NetSimObjectID,
     NetSimObjectName,
@@ -17,19 +17,19 @@ from netsim.netsim_common import (
     PacketID,
     PacketSize,
 )
-from netsim.netsim_stat import PacketQueueStat, PacketStat
-from netsim.sim_common import SimTime
+from netsim.simulator.netsim_stat import PacketQueueStat, PacketStat
+from netsim.simulator.sim_common import SimTime
 
-from netsim.simcore import (
+from netsim.simulator.simcore import (
     Coro,
     Process,
     QueueFIFO,
     SimContext,
 )
 
-from netsim.simstat import Stat
+from netsim.simulator.simstat import Stat
 from netsim.stat_base import DistrBuilder, DistrFunc
-from netsim.simtracer import Tracer
+from netsim.simulator.simtracer import Tracer
 
 
 LOG_FMT = "%(levelname)s - %(message)s"

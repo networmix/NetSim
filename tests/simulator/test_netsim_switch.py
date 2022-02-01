@@ -1,14 +1,14 @@
 # pylint: disable=protected-access,invalid-name
 import pprint
 
-from netsim.simcore import SimTime
-from netsim.netsim_base import (
+from netsim.simulator.simcore import SimTime
+from netsim.simulator.netsim_base import (
     PacketSink,
     PacketSource,
     PacketSize,
 )
-from netsim.netsim_switch import PacketProcessor, PacketSwitch
-from netsim.netsim_simulator import NetSim
+from netsim.simulator.netsim_switch import PacketProcessor, PacketSwitch
+from netsim.simulator.netsim_simulator import NetSim
 
 
 def test_packet_processor_1():
@@ -168,7 +168,7 @@ def test_packet_switch_1():
 
     rx = packet_switch.create_interface_rx(0, 0.0)
     source.subscribe(rx)
-    tx = packet_switch.create_interface_tx(1, 2 ** 20)
+    tx = packet_switch.create_interface_tx(1, 2**20)
     tx.subscribe(sink)
     packet_switch.create_packet_processor()
 

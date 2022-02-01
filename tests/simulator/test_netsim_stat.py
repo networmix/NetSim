@@ -1,6 +1,6 @@
-from netsim.netsim_base import Packet
-from netsim.netsim_stat import PacketStatFrame
-from netsim.simcore import SimContext
+from netsim.simulator.netsim_base import Packet
+from netsim.simulator.netsim_stat import PacketStatFrame
+from netsim.simulator.simcore import SimContext
 
 
 def test_statframe_process_1():

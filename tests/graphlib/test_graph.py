@@ -1,4 +1,5 @@
-from netsim.netgraph.graph import MultiDiGraph
+# pylint: disable=protected-access,invalid-name
+from netsim.graphlib.graph import MultiDiGraph
 
 
 def test_graph_init_1():

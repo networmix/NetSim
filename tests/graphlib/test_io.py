@@ -1,5 +1,6 @@
-from netsim.netgraph.io import graph_to_node_link, node_link_to_graph, edgelist_to_graph
-from netsim.netgraph.graph import MultiDiGraph
+# pylint: disable=protected-access,invalid-name
+from netsim.graphlib.io import graph_to_node_link, node_link_to_graph, edgelist_to_graph
+from netsim.graphlib.graph import MultiDiGraph
 
 
 def test_graph_to_node_link_1():

@@ -6,11 +6,11 @@ from json import dumps
 from dataclasses import MISSING, dataclass, fields, field
 from typing import Any, Dict, TYPE_CHECKING, Optional
 
-from netsim.sim_common import ProcessName, ResourceName, SimTime, TimeInterval
+from netsim.simulator.sim_common import ProcessName, ResourceName, SimTime, TimeInterval
 
 
 if TYPE_CHECKING:
-    from netsim.simcore import (
+    from netsim.simulator.simcore import (
         Event,
         Get,
         Put,
@@ -136,9 +136,7 @@ class Stat:
         self._stat_tracer.write(dumps(self.cur_stat_frame.todict()) + "\n")
 
     def enable_stat_trace(self, prefix: Optional[None]) -> None:
-        self._stat_tracer = NamedTemporaryFile(
-            mode="w", encoding="utf8", prefix=prefix
-        )
+        self._stat_tracer = NamedTemporaryFile(mode="w", encoding="utf8", prefix=prefix)
 
     def get_stat_tracer(self) -> Optional[NamedTemporaryFile]:
         return self._stat_tracer

@@ -1,6 +1,6 @@
 # pylint: disable=protected-access,invalid-name
 from tests import test_data
-from netsim.wf_instructions import BuildGraph
+from netsim.workflow.wf_instructions import BuildGraph
 from netsim.utils import load_resource, yaml_to_dict
 from netsim.netbuilder.builder_instructions import (
     CreateGraph,
@@ -8,7 +8,7 @@ from netsim.netbuilder.builder_instructions import (
     CreateAdjacencyMesh,
     ExecutionContext,
 )
-from netsim.dict_path import Path
+from netsim.workflow.dict_path import Path
 
 
 def test_buildgraph_create_instr_1():

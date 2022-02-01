@@ -3,8 +3,8 @@ from unittest import mock
 
 import pytest
 
-from netsim.simtracer import Tracer
-from netsim.simstat import StatFrame
+from netsim.simulator.simtracer import Tracer
+from netsim.simulator.simstat import StatFrame
 
 
 def test_tracer_create_1(mocker):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Any, Optional
 import logging
 
-from netsim.wf_instructions import (
+from netsim.workflow.wf_instructions import (
     Instruction,
     ExecutionContext,
     BuildGraph,
@@ -16,7 +16,7 @@ from netsim.wf_instructions import (
     LogGraphLinks,
     LogContextData,
 )
-from netsim.analysers import ShortestPath
+from netsim.workflow.analysers import ShortestPath
 
 
 logging.basicConfig(
@@ -35,7 +35,7 @@ INSTRUCTIONS = {
     "RunNetSim": RunNetSim,
     "PrintSimData": PrintSimData,
     "ExportSimData": ExportSimData,
-    "ProcessSimData": ProcessSimData
+    "ProcessSimData": ProcessSimData,
 }
 
 

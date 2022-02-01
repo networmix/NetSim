@@ -1,15 +1,15 @@
 # pylint: disable=protected-access,invalid-name
 import pprint
 
-from netsim.simcore import SimTime
-from netsim.netsim_base import (
+from netsim.simulator.simcore import SimTime
+from netsim.simulator.netsim_base import (
     PacketInterfaceTx,
     PacketQueue,
     PacketSink,
     PacketSource,
     PacketSize,
 )
-from netsim.netsim_simulator import NetSim
+from netsim.simulator.netsim_simulator import NetSim
 
 
 def test_packet_source_1():
@@ -292,7 +292,7 @@ def test_packet_queue_admission_taildrop_2():
         yield 0
         while True:
             for idx in range(0, 10):
-                yield 1 / 2 ** idx
+                yield 1 / 2**idx
 
     def size_gen() -> PacketSize:
         while True:
@@ -409,7 +409,7 @@ def test_packet_queue_admission_red_1():
         yield 0
         while True:
             for idx in range(0, 10):
-                yield 1 / 2 ** idx
+                yield 1 / 2**idx
 
     def size_gen() -> PacketSize:
         while True:
@@ -441,22 +441,22 @@ def test_packet_queue_admission_red_1():
             "avg_drop_rate_pps": 0.9,
             "avg_get_rate_pps": 3.6,
             "avg_latency_at_arrival": 0.0,
-            "avg_latency_at_departure": 0.9234933035714286,
+            "avg_latency_at_departure": 0.9225446428571429,
             "avg_latency_at_drop": 0.0,
             "avg_put_rate_pps": 4.2,
-            "avg_queue_len": 2.5361328125,
+            "avg_queue_len": 2.4330078125,
             "avg_receive_rate_bps": 40800.0,
             "avg_receive_rate_pps": 5.1,
             "avg_send_rate_bps": 28000.0,
             "avg_send_rate_pps": 3.5,
-            "avg_wait_time": 0.6758355034722222,
+            "avg_wait_time": 0.6610243055555556,
             "cur_queue_len": 6,
             "duration": 10.0,
-            "integral_queue_sum": 25.361328125,
-            "integral_wait_time_sum": 24.330078125,
+            "integral_queue_sum": 24.330078125,
+            "integral_wait_time_sum": 23.796875,
             "last_state_change_timestamp": 9.990234375,
             "max_queue_len": 7,
-            "max_wait_time": 1.509765625,
+            "max_wait_time": 1.5078125,
             "timestamp": 10,
             "total_dropped_bytes": 9000,
             "total_dropped_pkts": 9,
@@ -476,22 +476,22 @@ def test_packet_queue_admission_red_1():
             "avg_drop_rate_pps": 0.9008797653958944,
             "avg_get_rate_pps": 3.6035190615835777,
             "avg_latency_at_arrival": 0.0,
-            "avg_latency_at_departure": 0.9234933035714286,
+            "avg_latency_at_departure": 0.9225446428571429,
             "avg_latency_at_drop": 0.0,
             "avg_put_rate_pps": 4.204105571847507,
-            "avg_queue_len": 2.5327468230694037,
+            "avg_queue_len": 2.429521016617791,
             "avg_receive_rate_bps": 40839.882697947214,
             "avg_receive_rate_pps": 5.104985337243402,
             "avg_send_rate_bps": 28027.370478983383,
             "avg_send_rate_pps": 3.5034213098729228,
-            "avg_wait_time": 0.6758355034722222,
+            "avg_wait_time": 0.6610243055555556,
             "cur_queue_len": 6,
             "duration": 9.990234375,
-            "integral_queue_sum": 25.302734375,
-            "integral_wait_time_sum": 24.330078125,
+            "integral_queue_sum": 24.271484375,
+            "integral_wait_time_sum": 23.796875,
             "last_state_change_timestamp": 9.990234375,
             "max_queue_len": 7,
-            "max_wait_time": 1.509765625,
+            "max_wait_time": 1.5078125,
             "timestamp": 9.990234375,
             "total_dropped_bytes": 9000,
             "total_dropped_pkts": 9,

@@ -11,24 +11,24 @@ from typing import (
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
-from netsim.netsim_common import (
+from netsim.simulator.netsim_common import (
     RateBPS,
     RatePPS,
     NetSimObjectName,
     PacketID,
     PacketSize,
 )
-from netsim.sim_common import SimTime
+from netsim.simulator.sim_common import SimTime
 
-from netsim.simstat import (
+from netsim.simulator.simstat import (
     Stat,
     StatFrame,
     StatSamples,
 )
 
 if TYPE_CHECKING:
-    from netsim.netsim_base import Packet
-    from netsim.netsim_switch import InterfaceName, PacketProcessorName
+    from netsim.simulator.netsim_base import Packet
+    from netsim.simulator.netsim_switch import InterfaceName, PacketProcessorName
 
 
 @dataclass

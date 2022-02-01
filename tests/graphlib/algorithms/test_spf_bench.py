@@ -1,6 +1,6 @@
-from netsim.netgraph.graph import MultiDiGraph
-
-from netsim.netalgo.spf import spf
+# pylint: disable=protected-access,invalid-name
+from netsim.graphlib.graph import MultiDiGraph
+from netsim.graphlib.algorithms.spf import spf
 
 
 def test_spf_bench_1(benchmark):
