@@ -11,11 +11,11 @@ from typing import (
     Optional,
     Union,
 )
-from netsim.netsim_stat import PacketSwitchStat
-from netsim.sim_common import SimTime
+from netsim.simulator.netsim_stat import PacketSwitchStat
+from netsim.simulator.sim_common import SimTime
 
-from netsim.simcore import Coro, SimContext
-from netsim.netsim_base import (
+from netsim.simulator.simcore import Coro, SimContext
+from netsim.simulator.netsim_base import (
     InterfaceBW,
     NetSimObjectName,
     Packet,
@@ -79,7 +79,9 @@ class PacketProcessor(PacketQueue):
     ) -> Iterable[PacketProcessingOutput]:
         packet, _ = packet_processing_item
         if self.tx_interfaces:
-            tx_interface = self.tx_interfaces[int(packet.flow_id % len(self.tx_interfaces))]
+            tx_interface = self.tx_interfaces[
+                int(packet.flow_id % len(self.tx_interfaces))
+            ]
             return [PacketProcessingOutput(packet, tx_interface)]
         return []
 

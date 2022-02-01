@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from collections import deque
 from typing import Dict, Optional, Set, Any, List
 
-from netsim.netgraph.graph import MultiDiGraph
+from netsim.graphlib.graph import MultiDiGraph
 
-from netsim.dict_path import (
+from netsim.workflow.dict_path import (
     Path,
     PathExpr,
     check_scope_level,

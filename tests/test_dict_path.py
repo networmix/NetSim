@@ -1,5 +1,5 @@
 # pylint: disable=protected-access,invalid-name
-from netsim import dict_path as path
+from netsim.workflow import dict_path as path
 
 
 def test_path_1():

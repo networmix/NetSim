@@ -3,18 +3,18 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from typing import Any, Dict, Iterator, Optional, Type, Union
-from netsim.netsim_common import NetSimObjectName
-from netsim.netsim_stat import NetSimStat
-from netsim.netsim_switch import PacketSwitch
-from netsim.sim_common import SimTime, TimeInterval
+from netsim.simulator.netsim_common import NetSimObjectName
+from netsim.simulator.netsim_stat import NetSimStat
+from netsim.simulator.netsim_switch import PacketSwitch
+from netsim.simulator.sim_common import SimTime, TimeInterval
 
-from netsim.simcore import (
+from netsim.simulator.simcore import (
     Event,
     SimContext,
     Simulator,
     StatCollector,
 )
-from netsim.netsim_base import (
+from netsim.simulator.netsim_base import (
     Packet,
     PacketInterfaceRx,
     PacketInterfaceTx,
@@ -27,7 +27,7 @@ from netsim.netsim_base import (
     Sender,
     SenderReceiver,
 )
-from netsim.netgraph.graph import MultiDiGraph
+from netsim.graphlib.graph import MultiDiGraph
 
 
 LOG_FMT = "%(levelname)s - %(message)s"

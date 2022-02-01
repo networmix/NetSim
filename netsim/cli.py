@@ -3,7 +3,7 @@ import argparse
 from typing import Dict, Union
 
 from netsim.utils import yaml_to_dict
-from netsim.workflow import Workflow
+from netsim.workflow.workflow import Workflow
 
 
 def parse_args() -> Dict[str, Union[str, int, float, bool]]:

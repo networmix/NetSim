@@ -7,11 +7,11 @@ from operator import and_
 import re
 import logging
 
-from netsim.netgraph.graph import MultiDiGraph
+from netsim.graphlib.graph import MultiDiGraph
 
-from netsim.dict_path import Path, PathExpr, check_scope_level
+from netsim.workflow.dict_path import Path, PathExpr, check_scope_level
 from netsim.netbuilder.filter import bool_filter
-from netsim.instructions import ExecutionContext, Instruction
+from netsim.workflow.instructions import ExecutionContext, Instruction
 
 
 logging.basicConfig(

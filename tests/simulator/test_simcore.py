@@ -1,7 +1,14 @@
 # pylint: disable=protected-access,invalid-name
 import pytest
 
-from netsim.simcore import EventStatus, QueueFIFO, SimContext, Event, Simulator, Process
+from netsim.simulator.simcore import (
+    EventStatus,
+    QueueFIFO,
+    SimContext,
+    Event,
+    Simulator,
+    Process,
+)
 
 
 def test_simcontext_1():

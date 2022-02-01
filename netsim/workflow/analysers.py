@@ -1,11 +1,11 @@
 from typing import Dict, Any
 from dataclasses import dataclass, field
 
-from netsim.netalgo.spf import spf
+from netsim.graphlib.algorithms.spf import spf
 
-from netsim.dict_path import Path
-from netsim.wf_instructions import WorkflowInstruction
-from netsim.instructions import ExecutionContext, DataContainer
+from netsim.workflow.dict_path import Path
+from netsim.workflow.wf_instructions import WorkflowInstruction
+from netsim.workflow.instructions import ExecutionContext, DataContainer
 
 
 ALGORITHMS = {"spf": spf}

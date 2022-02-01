@@ -14,23 +14,23 @@ import json
 
 import jq
 
-from netsim.netgraph.io import graph_to_node_link
+from netsim.graphlib.io import graph_to_node_link
 
-from netsim.dict_path import (
+from netsim.workflow.dict_path import (
     Path,
     dict_to_paths,
     process_dict,
 )
-from netsim.instructions import DataContainer, Instruction, ExecutionContext
+from netsim.workflow.instructions import DataContainer, Instruction, ExecutionContext
 from netsim.netbuilder.builder_instructions import BUILDER_INSTRUCTIONS
-from netsim.netsim_analysis import (
+from netsim.simulator.netsim_analysis import (
     ANALYSER_TYPE_MAP,
     NetSimIntQueueAnalyser,
 )
-from netsim.netsim_common import NetSimObjectName
-from netsim.netsim_simulator import NetSim
-from netsim.sim_common import SimTime
-from netsim.simstat import Stat
+from netsim.simulator.netsim_common import NetSimObjectName
+from netsim.simulator.netsim_simulator import NetSim
+from netsim.simulator.sim_common import SimTime
+from netsim.simulator.simstat import Stat
 
 
 logging.basicConfig(

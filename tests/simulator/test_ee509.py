@@ -1,12 +1,12 @@
 # pylint: disable=protected-access,invalid-name
-from netsim.netsim_switch import PacketSwitch
-from netsim.simcore import SimTime
-from netsim.netsim_base import (
+from netsim.simulator.netsim_switch import PacketSwitch
+from netsim.simulator.simcore import SimTime
+from netsim.simulator.netsim_base import (
     PacketSize,
 )
-from netsim.netsim_simulator import NetSim
-from netsim.netgraph.graph import MultiDiGraph
-from .test_data.ee509_data import SCENARIO_1_STAT
+from netsim.simulator.netsim_simulator import NetSim
+from netsim.graphlib.graph import MultiDiGraph
+from ..test_data.ee509_data import SCENARIO_1_STAT
 
 
 def test_ee509_scenario_1():

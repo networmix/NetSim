@@ -1,7 +1,7 @@
 from heapq import heappop, heappush
 from typing import Tuple, List, Dict, Callable
 
-from netsim.netgraph.graph import MultiDiGraph
+from netsim.graphlib.graph import MultiDiGraph
 
 
 DEFAULT_COST_ATTRIBUTE = "metric"

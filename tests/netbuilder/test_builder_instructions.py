@@ -1,6 +1,6 @@
 # pylint: disable=protected-access,invalid-name
-from netsim.netgraph.graph import MultiDiGraph
-from netsim.netgraph.io import graph_to_node_link
+from netsim.graphlib.graph import MultiDiGraph
+from netsim.graphlib.io import graph_to_node_link
 
 from netsim.netbuilder.builder_instructions import (
     ExecutionContext,
@@ -8,7 +8,7 @@ from netsim.netbuilder.builder_instructions import (
     CreateNodes,
     CreateAdjacencyMesh,
 )
-from netsim.dict_path import Path, ROOT
+from netsim.workflow.dict_path import Path, ROOT
 
 
 def test_CreateGraph1():
