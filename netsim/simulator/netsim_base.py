@@ -30,6 +30,7 @@ from netsim.simulator.core.simcore import (
 from netsim.simulator.core.simstat import Stat
 from netsim.stat_base import DistrBuilder, DistrFunc
 from netsim.simulator.core.simtracer import Tracer
+from netsim.graphlib.graph import MultiDiGraph
 
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -80,16 +81,26 @@ class QueueStateRED(QueueState):
     count: int = -1  # packets since last marked packet
 
 
+class NetSimContext(SimContext):
+    def __init__(self, starttime: SimTime = 0):
+        super().__init__(starttime=starttime)
+        self.topology: Dict[str, MultiDiGraph] = {}
+        self.state_db: Dict[NetSimObjectName, Any] = {}
+
+    def add_topology(self, name: str, graph: MultiDiGraph) -> None:
+        self.topology[name] = graph
+
+
 class NetSimObject(ABC):
     _next_netsim_id: NetSimObjectID = 0
 
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         name: Optional[NetSimObjectName] = None,
         stat_type: Optional[Type[Stat]] = None,
     ):
-        self._ctx: SimContext = ctx
+        self.ctx: NetSimContext = ctx
         self.ns_id, NetSimObject._next_netsim_id = (
             NetSimObject._next_netsim_id,
             NetSimObject._next_netsim_id + 1,
@@ -99,7 +110,7 @@ class NetSimObject(ABC):
         )
         self.process: Process = ctx.create_process(self.run(), self.name)
         self.process.extend_name("_proc")
-        self.stat: Stat = Stat(self._ctx) if not stat_type else stat_type(self._ctx)
+        self.stat: Stat = Stat(self.ctx) if not stat_type else stat_type(self.ctx)
 
     def __repr__(self) -> str:
         return f"{self.name}(process={self.process.name})"
@@ -120,11 +131,11 @@ class Packet:
 
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         size: PacketSize,
         flow_id: PacketFlowID = 0,
     ):
-        self._ctx = ctx
+        self.ctx = ctx
         self.packet_id, Packet._next_packet_id = (
             Packet._next_packet_id,
             Packet._next_packet_id + 1,
@@ -145,7 +156,7 @@ class Packet:
         cls.next_packet_id: PacketID = 0
 
     def touched(self, ns_obj: NetSimObject, action: PacketAction) -> None:
-        self.touched_timestamp = self._ctx.now
+        self.touched_timestamp = self.ctx.now
         self.touched_by = ns_obj.name
         self.last_action = action
 
@@ -160,7 +171,7 @@ class Packet:
 class Sender(NetSimObject):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         name: Optional[NetSimObjectName] = None,
         stat_type: Optional[Type[Stat]] = None,
     ):
@@ -192,7 +203,7 @@ class Sender(NetSimObject):
 class Receiver(NetSimObject):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         name: Optional[NetSimObjectName] = None,
         stat_type: Optional[Type[Stat]] = None,
     ):
@@ -229,7 +240,7 @@ class Receiver(NetSimObject):
 class SenderReceiver(NetSimObject):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         name: Optional[NetSimObjectName] = None,
         stat_type: Optional[Type[Stat]] = None,
     ):
@@ -312,7 +323,7 @@ class PacketSourceProfile:
 class PacketSource(Sender):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         arrival_func: Generator,
         size_func: Generator,
         flow_func: Optional[Generator] = None,
@@ -327,7 +338,7 @@ class PacketSource(Sender):
 
     @classmethod
     def create(
-        cls, ctx: SimContext, name: NetSimObjectName, profile: PacketSourceProfile
+        cls, ctx: NetSimContext, name: NetSimObjectName, profile: PacketSourceProfile
     ) -> PacketSource:
         arrival_func = DistrBuilder.create(
             profile.arrival_time_distr, profile.arrival_distr_params
@@ -349,7 +360,7 @@ class PacketSource(Sender):
 
             if size is None:
                 return
-            packet = Packet(self._ctx, size, flow_id=flow)
+            packet = Packet(self.ctx, size, flow_id=flow)
             self._packet_sent(packet)
             for subscriber in self._subscribers:
                 subscriber.put(packet, self)
@@ -372,7 +383,7 @@ class PacketSink(Receiver):
 class PacketQueue(SenderReceiver):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         queue_len_limit: Optional[int] = None,
         name: Optional[NetSimObjectName] = None,
         admission_params: Optional[Dict[str, Any]] = None,
@@ -412,7 +423,7 @@ class PacketQueue(SenderReceiver):
 
             def q_time_callback(pq: PacketQueue, p: Packet) -> None:
                 if not len(pq._queue) > 0:
-                    pq._queue_state.q_time = pq._ctx.now
+                    pq._queue_state.q_time = pq.ctx.now
 
             self._packet_get_callbacks.append(q_time_callback)
             # self.process.add_tick_callback(
@@ -467,7 +478,7 @@ class PacketQueue(SenderReceiver):
             ) * self._queue_state.avg + self._queue_state.wq * len(self._queue)
         else:
             # queue is empty
-            m = (self._ctx.now - self._queue_state.q_time) / self._queue_state.s
+            m = (self.ctx.now - self._queue_state.q_time) / self._queue_state.s
             self._queue_state.avg *= (1 - self._queue_state.wq) ** m
 
         if self._queue_len_limit and not len(self._queue) < self._queue_len_limit:
@@ -519,7 +530,7 @@ class PacketQueue(SenderReceiver):
 class PacketInterfaceRx(PacketQueue):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         propagation_delay: Optional[SimTime] = None,
         transmission_len_limit: Optional[int] = None,
         name: Optional[NetSimObjectName] = None,
@@ -540,7 +551,7 @@ class PacketInterfaceRx(PacketQueue):
                 self._packet_sent(packet)
             else:
                 raise RuntimeError(
-                    f"Resumed {self} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self.ctx.now}",
                 )
 
     def put(
@@ -572,7 +583,7 @@ class PacketInterfaceRx(PacketQueue):
 class PacketInterfaceTx(PacketQueue):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         bw: InterfaceBW,
         queue_len_limit: Optional[int] = None,
         admission_params: Optional[Dict[str, Any]] = None,
@@ -600,5 +611,5 @@ class PacketInterfaceTx(PacketQueue):
                 self._busy = False
             else:
                 raise RuntimeError(
-                    f"Resumed {self} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self.ctx.now}",
                 )

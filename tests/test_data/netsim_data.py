@@ -228,7 +228,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interface_queues": {
-                    "from_S": {
+                    "S:SW1:1": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -247,7 +247,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interfaces": {
-                    "from_S": {
+                    "S:SW1:1": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 9.5,
@@ -289,7 +289,7 @@ SCENARIO_6_STAT = {
                 "total_sent_bytes": 3000,
                 "total_sent_pkts": 3,
                 "tx_interface_queues": {
-                    "to_SW2": {
+                    "SW1:SW2:2": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -308,7 +308,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "tx_interfaces": {
-                    "to_SW2": {
+                    "SW1:SW2:2": {
                         "avg_drop_rate_bps": 56000.0,
                         "avg_drop_rate_pps": 7.0,
                         "avg_get_rate_pps": 2.0,
@@ -388,7 +388,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interface_queues": {
-                    "from_S": {
+                    "S:SW1:1": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -407,7 +407,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interfaces": {
-                    "from_S": {
+                    "S:SW1:1": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 9.75,
@@ -449,7 +449,7 @@ SCENARIO_6_STAT = {
                 "total_sent_bytes": 7000,
                 "total_sent_pkts": 7,
                 "tx_interface_queues": {
-                    "to_SW2": {
+                    "SW1:SW2:2": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -468,7 +468,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "tx_interfaces": {
-                    "to_SW2": {
+                    "SW1:SW2:2": {
                         "avg_drop_rate_bps": 60000.0,
                         "avg_drop_rate_pps": 7.5,
                         "avg_get_rate_pps": 2.0,
@@ -550,7 +550,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interface_queues": {
-                    "from_SW1": {
+                    "SW1:SW2:2": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -569,7 +569,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interfaces": {
-                    "from_SW1": {
+                    "SW1:SW2:2": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 1.5,
@@ -611,7 +611,7 @@ SCENARIO_6_STAT = {
                 "total_sent_bytes": 2000,
                 "total_sent_pkts": 2,
                 "tx_interface_queues": {
-                    "to_D": {
+                    "SW2:D:3": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -630,7 +630,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "tx_interfaces": {
-                    "to_D": {
+                    "SW2:D:3": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 1.5,
@@ -710,7 +710,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interface_queues": {
-                    "from_SW1": {
+                    "SW1:SW2:2": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -729,7 +729,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "rx_interfaces": {
-                    "from_SW1": {
+                    "SW1:SW2:2": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 1.75,
@@ -771,7 +771,7 @@ SCENARIO_6_STAT = {
                 "total_sent_bytes": 6000,
                 "total_sent_pkts": 6,
                 "tx_interface_queues": {
-                    "to_D": {
+                    "SW2:D:3": {
                         "avg_get_processed_rate": 0,
                         "avg_get_requested_rate": 0,
                         "avg_put_processed_rate": 0,
@@ -790,7 +790,7 @@ SCENARIO_6_STAT = {
                     }
                 },
                 "tx_interfaces": {
-                    "to_D": {
+                    "SW2:D:3": {
                         "avg_drop_rate_bps": 0.0,
                         "avg_drop_rate_pps": 0.0,
                         "avg_get_rate_pps": 1.75,

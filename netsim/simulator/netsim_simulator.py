@@ -10,7 +10,6 @@ from netsim.simulator.core.sim_common import SimTime, TimeInterval
 
 from netsim.simulator.core.simcore import (
     Event,
-    SimContext,
     Simulator,
     StatCollector,
 )
@@ -26,6 +25,7 @@ from netsim.simulator.netsim_base import (
     Receiver,
     Sender,
     SenderReceiver,
+    NetSimContext,
 )
 from netsim.graphlib.graph import MultiDiGraph
 
@@ -49,7 +49,7 @@ NS_TYPE_MAP: Dict[str, Type[NetSimObject]] = {
 class NetStatCollector(StatCollector):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         nsim: NetSim,
         stat_interval: SimTime,
         stat_container: NetSimStat,
@@ -81,16 +81,17 @@ class NetStatCollector(StatCollector):
 class NetSim(Simulator):
     def __init__(
         self,
-        ctx: Optional[SimContext] = None,
+        ctx: Optional[NetSimContext] = None,
         stat_interval: Optional[float] = None,
     ):
-        super().__init__(ctx, stat_interval=stat_interval)
+        self.ctx: NetSimContext = ctx if ctx is not None else NetSimContext()
+        super().__init__(self.ctx, stat_interval=stat_interval)
         Packet.reset_packet_id()
         self._ns: Dict[NetSimObjectName, NetSimObject] = {}
-        self.nstat: NetSimStat = NetSimStat(self._ctx)
+        self.nstat: NetSimStat = NetSimStat(self.ctx)
         self.add_stat_collector(
             NetStatCollector(
-                self._ctx,
+                self.ctx,
                 nsim=self,
                 stat_interval=stat_interval,
                 stat_container=self.nstat,
@@ -140,12 +141,12 @@ class NetSim(Simulator):
 
             if isinstance(src_ns_obj, PacketSwitch):
                 src_ns_obj = src_ns_obj.create_interface_tx(
-                    f"to_{dst_node}", **ns_edge_attr_tx
+                    f"{src_node}:{dst_node}:{edge_id}", **ns_edge_attr_tx
                 )
 
             if isinstance(dst_ns_obj, PacketSwitch):
                 dst_ns_obj = dst_ns_obj.create_interface_rx(
-                    f"from_{src_node}", **ns_edge_attr_rx
+                    f"{src_node}:{dst_node}:{edge_id}", **ns_edge_attr_rx
                 )
 
             src_ns_obj.subscribe(dst_ns_obj)
@@ -159,6 +160,7 @@ class NetSim(Simulator):
         self._parse_graph_nodes(graph)
         self._parse_graph_edges(graph)
         self._postprocess_ns_obj()
+        self.ctx.add_topology("physical", graph)
 
     def run(
         self,

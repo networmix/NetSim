@@ -70,13 +70,13 @@ class ProcessStatus(IntEnum):
 
 class Process:
     def __init__(self, ctx: SimContext, coro: Coro, name: Optional[ProcessName] = None):
-        self._ctx: SimContext = ctx
+        self.ctx: SimContext = ctx
         self.proc_id: ProcessID = ctx.get_next_process_id()
         self.name = name if name else f"{type(self).__name__}_{self.proc_id}"
         self._coro: Coro = coro
         self._subscribers: List[Process] = [self]
         self._timeout: Optional[EventID] = None
-        self._ctx.add_process(self)
+        self.ctx.add_process(self)
         self.status: ProcessStatus = ProcessStatus.CREATED
         self.stat: ProcessStat = ProcessStat(ctx)
         self.stat_callbacks: List[StatCallback] = []
@@ -99,7 +99,7 @@ class Process:
 
     def _set_active(self) -> None:
         self._timeout = None
-        self._ctx.set_active_process(self)
+        self.ctx.set_active_process(self)
 
     def start(self, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
         _, _ = args, kwargs
@@ -112,7 +112,7 @@ class Process:
             for subscriber in self._subscribers:
                 event.subscribe(subscriber)
             if event.is_planned() and not event.is_scheduled():
-                self._ctx.schedule_event(event)
+                self.ctx.schedule_event(event)
 
     def resume(self, event: Event, *args: List[Any], **kwargs: Dict[str, Any]) -> None:
         _, _ = args, kwargs
@@ -130,7 +130,7 @@ class Process:
                     for subscriber in self._subscribers:
                         next_event.subscribe(subscriber)
                     if next_event.is_planned() and not next_event.is_scheduled():
-                        self._ctx.schedule_event(next_event)
+                        self.ctx.schedule_event(next_event)
             except StopIteration:
                 self.status = ProcessStatus.STOPPED
 
@@ -146,7 +146,7 @@ class Process:
         self._subscribers.append(process)
 
     def timeout(self, delay: SimTime) -> Timeout:
-        event = Timeout(self._ctx, delay=delay, process=self)
+        event = Timeout(self.ctx, delay=delay, process=self)
         self._timeout = event.event_id
         return event
 
@@ -181,7 +181,7 @@ class StatCollector(Process):
     def _collect(self, reset: bool) -> None:
         self._stat_container.advance_time()
 
-        for process in self._ctx.get_process_iter():
+        for process in self.ctx.get_process_iter():
             process.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
@@ -194,7 +194,7 @@ class StatCollector(Process):
             if reset:
                 process.stat.reset_stat()
 
-        for resource in self._ctx.get_resource_iter():
+        for resource in self.ctx.get_resource_iter():
             resource.stat.update_stat()
             interval: TimeInterval = (
                 self._stat_container.prev_timestamp,
@@ -209,7 +209,7 @@ class StatCollector(Process):
     def _collection_trigger(self) -> Event:
         if self._stat_interval:
             while True:
-                yield CollectStat(self._ctx, delay=self._stat_interval, process=self)
+                yield CollectStat(self.ctx, delay=self._stat_interval, process=self)
                 self._collect(reset=True)
         else:
             yield
@@ -227,7 +227,7 @@ class Resource(ABC):
         capacity: Optional[int] = None,
         name: Optional[ResourceName] = None,
     ):
-        self._ctx = ctx
+        self.ctx = ctx
         self._capacity: Optional[int] = capacity
         self.res_id: ResourceID = ctx.get_next_resource_id()
         self.name = name if name else f"{type(self).__name__}_{self.res_id}"
@@ -265,7 +265,7 @@ class Resource(ABC):
             get_event = self._get_queue.popleft()
             if self._get_admission_check(get_event):
                 get_event.add_callback(self._trigger_put)
-                self._ctx.schedule_event(get_event, self._ctx.now)
+                self.ctx.schedule_event(get_event, self.ctx.now)
                 break
             self._get_queue.append(get_event)
 
@@ -280,7 +280,7 @@ class Resource(ABC):
             put_event = self._put_queue.popleft()
             if self._put_admission_check(put_event):
                 put_event.add_callback(self._trigger_get)
-                self._ctx.schedule_event(put_event, self._ctx.now)
+                self.ctx.schedule_event(put_event, self.ctx.now)
                 break
             self._put_queue.append(put_event)
 
@@ -355,13 +355,13 @@ class QueueFIFO(Resource):
         self, item: Any, *args: List[Any], **kwargs: Dict[str, Any]
     ) -> PutQueueFIFO:
         put_event = PutQueueFIFO(
-            self._ctx, self, process=self._ctx.active_process, item=item
+            self.ctx, self, process=self.ctx.active_process, item=item
         )
         self.stat.put_requested(put_event)
         return put_event
 
     def get(self, *args: List[Any], **kwargs: Dict[str, Any]) -> GetQueueFIFO:
-        get_event = GetQueueFIFO(self._ctx, self, process=self._ctx.active_process)
+        get_event = GetQueueFIFO(self.ctx, self, process=self.ctx.active_process)
         self.stat.get_requested(get_event)
         return get_event
 
@@ -384,7 +384,7 @@ class Event:
         process: Optional[Process] = None,
         auto_trigger: bool = False,
     ):
-        self._ctx: SimContext = ctx
+        self.ctx: SimContext = ctx
         self._func: Callable[[Event], Any] = func
         self._callbacks: List[EventCallback] = []
         self._value: Any = None
@@ -464,7 +464,7 @@ class Event:
 
         self.status = EventStatus.SCHEDULED
 
-        self._ctx.add_event(self)
+        self.ctx.add_event(self)
         if self._auto_trigger:
             self.trigger()
 
@@ -522,7 +522,7 @@ class StopSim(Timeout):
     ):
         super().__init__(ctx, ctx.now + delay, priority=priority, process=process)
         self._auto_trigger = True
-        self._callbacks.append(self._ctx.stop)
+        self._callbacks.append(self.ctx.stop)
 
     def __repr__(self) -> str:
         type_name = type(self).__name__
@@ -715,45 +715,41 @@ class Simulator:
     def __init__(
         self, ctx: Optional[SimContext] = None, stat_interval: Optional[float] = None
     ):
-        self._ctx: SimContext = ctx if ctx is not None else SimContext()
+        self.ctx: SimContext = ctx if ctx is not None else SimContext()
         self.event_counter = 0
-        self.stat: SimStat = SimStat(self._ctx)
+        self.stat: SimStat = SimStat(self.ctx)
         self._stat_interval: Optional[float] = stat_interval
         self.stat_collectors: List[StatCollector] = []
         self.add_stat_collector(
             StatCollector(
-                self._ctx, stat_interval=stat_interval, stat_container=self.stat
+                self.ctx, stat_interval=stat_interval, stat_container=self.stat
             )
         )
 
     @property
     def avg_event_rate(self) -> float:
-        return self.event_counter / self._ctx.now
-
-    @property
-    def ctx(self) -> SimContext:
-        return self._ctx
+        return self.event_counter / self.ctx.now
 
     @property
     def now(self) -> SimTime:
-        return self._ctx.now
+        return self.ctx.now
 
     def add_stat_collector(self, stat_collector: StatCollector) -> None:
         self.stat_collectors.append(stat_collector)
 
     def run(self, until_time: Optional[SimTime] = None) -> None:
         if until_time is not None:
-            self._ctx.schedule_event(StopSim(self._ctx, delay=until_time))
+            self.ctx.schedule_event(StopSim(self.ctx, delay=until_time))
         self._run()
 
     def _run(self) -> None:
         started_at = time.time()
-        for proc in self._ctx.get_process_iter():
+        for proc in self.ctx.get_process_iter():
             proc.start()
-        while (event := self._ctx.get_event()) and not self._ctx.is_stopped():
-            if self._ctx.advance_simtime(event.time):
-                self._ctx.exec_all_stat_callbacks()
-                self._ctx.exec_all_tick_callbacks()
+        while (event := self.ctx.get_event()) and not self.ctx.is_stopped():
+            if self.ctx.advance_simtime(event.time):
+                self.ctx.exec_all_stat_callbacks()
+                self.ctx.exec_all_tick_callbacks()
             if event.is_triggered():
                 event.run()
                 self.event_counter += 1
@@ -762,7 +758,7 @@ class Simulator:
                 stat_collector.collect_now()
         logger.info(
             "Simulation ended at %s, it took %s wall clock seconds. Executed %s events.",
-            self._ctx.now,
+            self.ctx.now,
             time.time() - started_at,
             self.event_counter,
         )

@@ -11,10 +11,10 @@ from typing import (
     Optional,
     Union,
 )
+from netsim.simulator.core.simcore import Coro
 from netsim.simulator.netsim_stat import PacketSwitchStat
 from netsim.simulator.core.sim_common import SimTime
 
-from netsim.simulator.core.simcore import Coro, SimContext
 from netsim.simulator.netsim_base import (
     InterfaceBW,
     NetSimObjectName,
@@ -25,6 +25,7 @@ from netsim.simulator.netsim_base import (
     Receiver,
     Sender,
     SenderReceiver,
+    NetSimContext,
 )
 
 LOG_FMT = "%(levelname)s - %(message)s"
@@ -51,7 +52,7 @@ class PacketProcessingOutput(NamedTuple):
 class PacketProcessor(PacketQueue):
     def __init__(
         self,
-        ctx: SimContext,
+        ctx: NetSimContext,
         processing_delay: Optional[Generator] = None,
         name: Optional[NetSimObjectName] = None,
     ):
@@ -118,7 +119,7 @@ class PacketProcessor(PacketQueue):
 
             else:
                 raise RuntimeError(
-                    f"Resumed {self} without packet at {self._ctx.now}",
+                    f"Resumed {self} without packet at {self.ctx.now}",
                 )
 
     def put(
@@ -135,7 +136,7 @@ class PacketProcessor(PacketQueue):
 
 
 class PacketSwitch(SenderReceiver):
-    def __init__(self, ctx: SimContext, name: Optional[NetSimObjectName] = None):
+    def __init__(self, ctx: NetSimContext, name: Optional[NetSimObjectName] = None):
         super().__init__(ctx, name=name)
         self.packet_processors: Dict[PacketProcessorName, PacketProcessor] = {}
         self.rx_interfaces: Dict[InterfaceName, PacketInterfaceRx] = {}
@@ -163,7 +164,7 @@ class PacketSwitch(SenderReceiver):
         queue_len_limit: Optional[int] = None,
     ) -> PacketInterfaceTx:
         name = f"{self.name}_interface_TX_{interface_name}"
-        tx_interface = PacketInterfaceTx(self._ctx, bw, queue_len_limit, name=name)
+        tx_interface = PacketInterfaceTx(self.ctx, bw, queue_len_limit, name=name)
         self.tx_interfaces[interface_name] = tx_interface
         return tx_interface
 
@@ -175,7 +176,7 @@ class PacketSwitch(SenderReceiver):
     ) -> PacketInterfaceRx:
         name = f"{self.name}_interface_RX_{interface_name}"
         rx_interface = PacketInterfaceRx(
-            self._ctx, propagation_delay, transmission_len_limit, name=name
+            self.ctx, propagation_delay, transmission_len_limit, name=name
         )
         self.rx_interfaces[interface_name] = rx_interface
         return rx_interface
@@ -189,7 +190,7 @@ class PacketSwitch(SenderReceiver):
             processor_name = "PacketProcessor"
         if processor_name not in self.packet_processors:
             packet_processor = PacketProcessor(
-                self._ctx, processing_delay, name=processor_name
+                self.ctx, processing_delay, name=processor_name
             )
             packet_processor.extend_name(f"{self.name}_", prepend=True)
             self.packet_processors[processor_name] = packet_processor
