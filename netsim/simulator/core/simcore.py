@@ -19,7 +19,7 @@ from typing import (
     Any,
 )
 import logging
-from netsim.simulator.sim_common import (
+from netsim.simulator.core.sim_common import (
     EventID,
     EventPriority,
     ProcessID,
@@ -30,7 +30,7 @@ from netsim.simulator.sim_common import (
     TimeInterval,
 )
 
-from netsim.simulator.simstat import ProcessStat, QueueStat, ResourceStat, SimStat
+from netsim.simulator.core.simstat import ProcessStat, QueueStat, ResourceStat, SimStat
 
 
 LOG_FMT = "%(levelname)s - %(message)s"

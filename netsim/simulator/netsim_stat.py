@@ -18,9 +18,9 @@ from netsim.simulator.netsim_common import (
     PacketID,
     PacketSize,
 )
-from netsim.simulator.sim_common import SimTime
+from netsim.simulator.core.sim_common import SimTime
 
-from netsim.simulator.simstat import (
+from netsim.simulator.core.simstat import (
     Stat,
     StatFrame,
     StatSamples,

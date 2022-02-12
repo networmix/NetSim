@@ -6,11 +6,16 @@ from json import dumps
 from dataclasses import MISSING, dataclass, fields, field
 from typing import Any, Dict, TYPE_CHECKING, Optional
 
-from netsim.simulator.sim_common import ProcessName, ResourceName, SimTime, TimeInterval
+from netsim.simulator.core.sim_common import (
+    ProcessName,
+    ResourceName,
+    SimTime,
+    TimeInterval,
+)
 
 
 if TYPE_CHECKING:
-    from netsim.simulator.simcore import (
+    from netsim.simulator.core.simcore import (
         Event,
         Get,
         Put,

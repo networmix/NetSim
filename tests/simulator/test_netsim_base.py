@@ -1,7 +1,7 @@
 # pylint: disable=protected-access,invalid-name
 import pprint
 
-from netsim.simulator.simcore import SimTime
+from netsim.simulator.core.simcore import SimTime
 from netsim.simulator.netsim_base import (
     PacketInterfaceTx,
     PacketQueue,

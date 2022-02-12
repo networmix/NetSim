@@ -6,9 +6,9 @@ from typing import Any, Dict, Iterator, Optional, Type, Union
 from netsim.simulator.netsim_common import NetSimObjectName
 from netsim.simulator.netsim_stat import NetSimStat
 from netsim.simulator.netsim_switch import PacketSwitch
-from netsim.simulator.sim_common import SimTime, TimeInterval
+from netsim.simulator.core.sim_common import SimTime, TimeInterval
 
-from netsim.simulator.simcore import (
+from netsim.simulator.core.simcore import (
     Event,
     SimContext,
     Simulator,

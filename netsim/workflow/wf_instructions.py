@@ -29,8 +29,8 @@ from netsim.simulator.netsim_analysis import (
 )
 from netsim.simulator.netsim_common import NetSimObjectName
 from netsim.simulator.netsim_simulator import NetSim
-from netsim.simulator.sim_common import SimTime
-from netsim.simulator.simstat import Stat
+from netsim.simulator.core.sim_common import SimTime
+from netsim.simulator.core.simstat import Stat
 
 
 logging.basicConfig(

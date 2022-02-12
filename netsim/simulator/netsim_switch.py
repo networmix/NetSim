@@ -12,9 +12,9 @@ from typing import (
     Union,
 )
 from netsim.simulator.netsim_stat import PacketSwitchStat
-from netsim.simulator.sim_common import SimTime
+from netsim.simulator.core.sim_common import SimTime
 
-from netsim.simulator.simcore import Coro, SimContext
+from netsim.simulator.core.simcore import Coro, SimContext
 from netsim.simulator.netsim_base import (
     InterfaceBW,
     NetSimObjectName,

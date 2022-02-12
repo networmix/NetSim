@@ -18,18 +18,18 @@ from netsim.simulator.netsim_common import (
     PacketSize,
 )
 from netsim.simulator.netsim_stat import PacketQueueStat, PacketStat
-from netsim.simulator.sim_common import SimTime
+from netsim.simulator.core.sim_common import SimTime
 
-from netsim.simulator.simcore import (
+from netsim.simulator.core.simcore import (
     Coro,
     Process,
     QueueFIFO,
     SimContext,
 )
 
-from netsim.simulator.simstat import Stat
+from netsim.simulator.core.simstat import Stat
 from netsim.stat_base import DistrBuilder, DistrFunc
-from netsim.simulator.simtracer import Tracer
+from netsim.simulator.core.simtracer import Tracer
 
 
 LOG_FMT = "%(levelname)s - %(message)s"

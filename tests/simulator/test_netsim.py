@@ -2,7 +2,7 @@
 import pprint
 
 from netsim.simulator.netsim_switch import PacketSwitch
-from netsim.simulator.simcore import SimTime
+from netsim.simulator.core.simcore import SimTime
 from netsim.simulator.netsim_base import (
     PacketSink,
     PacketSize,
