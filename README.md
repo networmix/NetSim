@@ -6,7 +6,7 @@
 
 ## Introduction
 
-NetSim is a discrete event simulator toolkit adapted for network simulation use-cases.
+NetSim is a discrete event simulation toolkit adapted for network simulation use-cases.
 
 Types of problems this toolkit can help solving:
 
