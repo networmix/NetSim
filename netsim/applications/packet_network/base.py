@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import logging
 from typing import Callable, Dict, List, Optional, Set, Type, Union, Generator, Any
 
-from ngraph.graph import MultiDiGraph
+from ngraph.lib.graph import MultiDiGraph
 from schema import Schema
 
 from netsim.applications.packet_network.common import (

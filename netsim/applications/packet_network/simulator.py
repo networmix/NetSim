@@ -4,7 +4,7 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, Iterator, Optional, Type, Union
 
-from ngraph.graph import MultiDiGraph
+from ngraph.lib.graph import MultiDiGraph
 
 from netsim.des.common import SimTime, TimeInterval
 from netsim.des.core import (

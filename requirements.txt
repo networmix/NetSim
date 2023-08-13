@@ -1,7 +1,8 @@
-ngraph
+ngraph == 0.4.1
 pyyaml
 schema
 jq
+scipy
 pandas
 seaborn
 matplotlib

@@ -1,7 +1,7 @@
 # pylint: disable=protected-access,invalid-name
 import pprint
 
-from ngraph.graph import MultiDiGraph
+from ngraph.lib.graph import MultiDiGraph
 
 from netsim.des.core import SimTime
 from netsim.applications.packet_network.switch import PacketSwitch
