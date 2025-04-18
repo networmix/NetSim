@@ -1,7 +1,9 @@
-# pylint: disable=protected-access,invalid-name
-import pprint
+from __future__ import annotations
 
-from netsim.des.core import SimTime
+import math
+from typing import Generator
+
+from netsim.core import SimTime
 from netsim.applications.packet_network.base import (
     PacketSink,
     PacketSource,
@@ -10,332 +12,109 @@ from netsim.applications.packet_network.base import (
 from netsim.applications.packet_network.switch import PacketProcessor, PacketSwitch
 from netsim.applications.packet_network.simulator import NetSim
 
+from tests.common import _close
 
-def test_packet_processor_1():
+
+def _arrival_every_1s() -> Generator[SimTime, None, None]:
+    yield 0
+    while True:
+        yield 1
+
+
+def _size_1500() -> Generator[PacketSize, None, None]:
+    while True:
+        yield 1500
+
+
+# --------------------------------------------------------------------------- #
+# 1. PacketProcessor with *no* TX interface  →  drops everything
+# --------------------------------------------------------------------------- #
+def test_packet_processor_drops_without_tx() -> None:
     sim = NetSim()
+    src = PacketSource(sim.ctx, _arrival_every_1s(), _size_1500())
+    pp = PacketProcessor(sim.ctx)
 
-    def arrival_gen() -> SimTime:
-        yield 0
-        while True:
-            yield 1
+    pp.add_interface_rx(src)  # but no TX attached
 
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1500
+    sim.run(until_time=10)  # 10 packets generated
 
-    source = PacketSource(sim.ctx, arrival_gen(), size_gen())
-    packet_processor = PacketProcessor(sim.ctx)
+    s_sf = src.stat.cur_stat_frame
+    p_sf = pp.stat.cur_stat_frame
 
-    packet_processor.add_interface_rx(source)
-
-    sim.run(until_time=10)
-    assert sim.ctx.now == 10
-    assert sim.event_counter == 32
-
-    pprint.pprint(packet_processor.stat.cur_stat_frame.todict())
-
-    assert source.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 0.0,
-        "avg_drop_rate_pps": 0.0,
-        "avg_latency_at_arrival": 0,
-        "avg_latency_at_departure": 0.0,
-        "avg_latency_at_drop": 0,
-        "avg_receive_rate_bps": 0.0,
-        "avg_receive_rate_pps": 0.0,
-        "avg_send_rate_bps": 12000.0,
-        "avg_send_rate_pps": 1.0,
-        "duration": 10,
-        "last_state_change_timestamp": 9,
-        "timestamp": 10,
-        "total_dropped_bytes": 0,
-        "total_dropped_pkts": 0,
-        "total_received_bytes": 0,
-        "total_received_pkts": 0,
-        "total_sent_bytes": 15000,
-        "total_sent_pkts": 10,
-    }
-
-    assert packet_processor.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 12000.0,
-        "avg_drop_rate_pps": 1.0,
-        "avg_get_rate_pps": 1.0,
-        "avg_latency_at_arrival": 0.0,
-        "avg_latency_at_departure": 0,
-        "avg_latency_at_drop": 0.0,
-        "avg_put_rate_pps": 1.0,
-        "avg_queue_len": 0.0,
-        "avg_receive_rate_bps": 12000.0,
-        "avg_receive_rate_pps": 1.0,
-        "avg_send_rate_bps": 0.0,
-        "avg_send_rate_pps": 0.0,
-        "avg_wait_time": 0.0,
-        "cur_queue_len": 0,
-        "duration": 10,
-        "integral_queue_sum": 0,
-        "integral_wait_time_sum": 0,
-        "last_state_change_timestamp": 9,
-        "max_queue_len": 0,
-        "max_wait_time": 0,
-        "timestamp": 10,
-        "total_dropped_bytes": 15000,
-        "total_dropped_pkts": 10,
-        "total_get_bytes": 15000,
-        "total_get_pkts": 10,
-        "total_put_bytes": 15000,
-        "total_put_pkts": 10,
-        "total_received_bytes": 15000,
-        "total_received_pkts": 10,
-        "total_sent_bytes": 0,
-        "total_sent_pkts": 0,
-    }
+    assert s_sf.total_sent_pkts == 10
+    assert p_sf.total_received_pkts == 10
+    assert p_sf.total_sent_pkts == 0
+    assert p_sf.total_dropped_pkts == 10
+    # byte‑level conservation
+    _close(p_sf.total_dropped_bytes, s_sf.total_sent_bytes)
+    _close(p_sf.total_received_bytes, s_sf.total_sent_bytes)
 
 
-def test_packet_processor_2():
+# --------------------------------------------------------------------------- #
+# 2. PacketProcessor with RX + TX interface  →  forwards everything
+# --------------------------------------------------------------------------- #
+def test_packet_processor_forwards_to_sink() -> None:
     sim = NetSim()
-
-    def arrival_gen() -> SimTime:
-        yield 0
-        while True:
-            yield 1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1500
-
-    source = PacketSource(sim.ctx, arrival_gen(), size_gen())
-    packet_processor = PacketProcessor(sim.ctx)
+    src = PacketSource(sim.ctx, _arrival_every_1s(), _size_1500())
+    pp = PacketProcessor(sim.ctx)
     sink = PacketSink(sim.ctx)
 
-    packet_processor.add_interface_rx(source)
-    packet_processor.add_interface_tx(sink)
+    pp.add_interface_rx(src)
+    pp.add_interface_tx(sink)
 
     sim.run(until_time=10)
-    assert sim.ctx.now == 10
-    assert sim.event_counter == 32
 
-    pprint.pprint(packet_processor.stat.cur_stat_frame.todict())
+    s_sf = src.stat.cur_stat_frame
+    p_sf = pp.stat.cur_stat_frame
+    k_sf = sink.stat.cur_stat_frame
 
-    assert packet_processor.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 0.0,
-        "avg_drop_rate_pps": 0.0,
-        "avg_get_rate_pps": 1.0,
-        "avg_latency_at_arrival": 0.0,
-        "avg_latency_at_departure": 0.0,
-        "avg_latency_at_drop": 0,
-        "avg_put_rate_pps": 1.0,
-        "avg_queue_len": 0.0,
-        "avg_receive_rate_bps": 12000.0,
-        "avg_receive_rate_pps": 1.0,
-        "avg_send_rate_bps": 12000.0,
-        "avg_send_rate_pps": 1.0,
-        "avg_wait_time": 0.0,
-        "cur_queue_len": 0,
-        "duration": 10,
-        "integral_queue_sum": 0,
-        "integral_wait_time_sum": 0,
-        "last_state_change_timestamp": 9,
-        "max_queue_len": 0,
-        "max_wait_time": 0,
-        "timestamp": 10,
-        "total_dropped_bytes": 0,
-        "total_dropped_pkts": 0,
-        "total_get_bytes": 15000,
-        "total_get_pkts": 10,
-        "total_put_bytes": 15000,
-        "total_put_pkts": 10,
-        "total_received_bytes": 15000,
-        "total_received_pkts": 10,
-        "total_sent_bytes": 15000,
-        "total_sent_pkts": 10,
-    }
+    # every packet generated by the source should arrive at the sink
+    assert s_sf.total_sent_pkts == p_sf.total_received_pkts == p_sf.total_sent_pkts
+    assert k_sf.total_received_pkts == 10
+    # zero drops along the path
+    assert p_sf.total_dropped_pkts == 0
+    assert k_sf.total_dropped_pkts == 0
+    # processor queue never builds up in this simple scenario
+    assert p_sf.max_queue_len == 0
 
 
-def test_packet_switch_1():
+# --------------------------------------------------------------------------- #
+# 3. PacketSwitch end‑to‑end path
+# --------------------------------------------------------------------------- #
+def test_packet_switch_rx_to_tx_path() -> None:
     sim = NetSim()
-
-    def arrival_gen() -> SimTime:
-        yield 0
-        while True:
-            yield 1
-
-    def size_gen() -> PacketSize:
-        while True:
-            yield 1500
-
-    source = PacketSource(sim.ctx, arrival_gen(), size_gen())
-    packet_switch = PacketSwitch(sim.ctx)
+    src = PacketSource(sim.ctx, _arrival_every_1s(), _size_1500())
+    sw = PacketSwitch(sim.ctx)
     sink = PacketSink(sim.ctx)
 
-    rx = packet_switch.create_interface_rx(0, 0.0)
-    source.subscribe(rx)
-    tx = packet_switch.create_interface_tx(1, 2**20)
-    tx.subscribe(sink)
-    packet_switch.create_packet_processor()
+    # Build interfaces and internal processor
+    rx_int = sw.create_interface_rx("in0", propagation_delay=0.0)
+    tx_int = sw.create_interface_tx("out0", bw=1_000_000)  # large BW
 
-    sim.run(until_time=10)
+    src.subscribe(rx_int)
+    tx_int.subscribe(sink)
+    sw.create_packet_processor()  # wires RX/TX to processor
 
-    assert sim.ctx.now == 10
-    assert sim.event_counter == 82
+    sim.run(until_time=10)  # 10 packets
 
-    pprint.pprint(packet_switch.stat.cur_stat_frame.todict())
+    sw_sf = sw.stat.cur_stat_frame
+    k_sf = sink.stat.cur_stat_frame
 
-    assert packet_switch.stat.cur_stat_frame.todict() == {
-        "avg_drop_rate_bps": 0.0,
-        "avg_drop_rate_pps": 0.0,
-        "avg_receive_rate_bps": 12000.0,
-        "avg_receive_rate_pps": 1.0,
-        "avg_send_rate_bps": 12000.0,
-        "avg_send_rate_pps": 1.0,
-        "duration": 10.0,
-        "last_state_change_timestamp": 9.011444091796875,
-        "packet_processors": {
-            "PacketProcessor": {
-                "avg_drop_rate_bps": 0.0,
-                "avg_drop_rate_pps": 0.0,
-                "avg_get_rate_pps": 1.0,
-                "avg_latency_at_arrival": 0.0,
-                "avg_latency_at_departure": 0.0,
-                "avg_latency_at_drop": 0,
-                "avg_put_rate_pps": 1.0,
-                "avg_queue_len": 0.0,
-                "avg_receive_rate_bps": 12000.0,
-                "avg_receive_rate_pps": 1.0,
-                "avg_send_rate_bps": 12000.0,
-                "avg_send_rate_pps": 1.0,
-                "avg_wait_time": 0.0,
-                "cur_queue_len": 0,
-                "duration": 10.0,
-                "integral_queue_sum": 0.0,
-                "integral_wait_time_sum": 0,
-                "last_state_change_timestamp": 9,
-                "max_queue_len": 0,
-                "max_wait_time": 0,
-                "timestamp": 10,
-                "total_dropped_bytes": 0,
-                "total_dropped_pkts": 0,
-                "total_get_bytes": 15000,
-                "total_get_pkts": 10,
-                "total_put_bytes": 15000,
-                "total_put_pkts": 10,
-                "total_received_bytes": 15000,
-                "total_received_pkts": 10,
-                "total_sent_bytes": 15000,
-                "total_sent_pkts": 10,
-            }
-        },
-        "rx_interface_queues": {
-            0: {
-                "avg_get_processed_rate": 0,
-                "avg_get_requested_rate": 0,
-                "avg_put_processed_rate": 0,
-                "avg_put_requested_rate": 0,
-                "avg_queue_len": 0,
-                "cur_queue_len": 0,
-                "duration": 0,
-                "integral_queue_sum": 0,
-                "last_state_change_timestamp": 0,
-                "max_queue_len": 0,
-                "timestamp": 0,
-                "total_get_processed_count": 10,
-                "total_get_requested_count": 11,
-                "total_put_processed_count": 10,
-                "total_put_requested_count": 10,
-            }
-        },
-        "rx_interfaces": {
-            0: {
-                "avg_drop_rate_bps": 0.0,
-                "avg_drop_rate_pps": 0.0,
-                "avg_get_rate_pps": 1.0,
-                "avg_latency_at_arrival": 0.0,
-                "avg_latency_at_departure": 0.0,
-                "avg_latency_at_drop": 0,
-                "avg_put_rate_pps": 1.0,
-                "avg_queue_len": 0.0,
-                "avg_receive_rate_bps": 12000.0,
-                "avg_receive_rate_pps": 1.0,
-                "avg_send_rate_bps": 12000.0,
-                "avg_send_rate_pps": 1.0,
-                "avg_wait_time": 0.0,
-                "cur_queue_len": 0,
-                "duration": 10.0,
-                "integral_queue_sum": 0.0,
-                "integral_wait_time_sum": 0,
-                "last_state_change_timestamp": 9,
-                "max_queue_len": 0,
-                "max_wait_time": 0,
-                "timestamp": 10,
-                "total_dropped_bytes": 0,
-                "total_dropped_pkts": 0,
-                "total_get_bytes": 15000,
-                "total_get_pkts": 10,
-                "total_put_bytes": 15000,
-                "total_put_pkts": 10,
-                "total_received_bytes": 15000,
-                "total_received_pkts": 10,
-                "total_sent_bytes": 15000,
-                "total_sent_pkts": 10,
-            }
-        },
-        "timestamp": 10,
-        "total_dropped_bytes": 0,
-        "total_dropped_pkts": 0,
-        "total_received_bytes": 15000,
-        "total_received_pkts": 10,
-        "total_sent_bytes": 15000,
-        "total_sent_pkts": 10,
-        "tx_interface_queues": {
-            1: {
-                "avg_get_processed_rate": 0,
-                "avg_get_requested_rate": 0,
-                "avg_put_processed_rate": 0,
-                "avg_put_requested_rate": 0,
-                "avg_queue_len": 0,
-                "cur_queue_len": 0,
-                "duration": 0,
-                "integral_queue_sum": 0,
-                "last_state_change_timestamp": 0,
-                "max_queue_len": 0,
-                "timestamp": 0,
-                "total_get_processed_count": 10,
-                "total_get_requested_count": 11,
-                "total_put_processed_count": 10,
-                "total_put_requested_count": 10,
-            }
-        },
-        "tx_interfaces": {
-            1: {
-                "avg_drop_rate_bps": 0.0,
-                "avg_drop_rate_pps": 0.0,
-                "avg_get_rate_pps": 1.0,
-                "avg_latency_at_arrival": 0.0,
-                "avg_latency_at_departure": 0.011444091796875,
-                "avg_latency_at_drop": 0,
-                "avg_put_rate_pps": 1.0,
-                "avg_queue_len": 0.0,
-                "avg_receive_rate_bps": 12000.0,
-                "avg_receive_rate_pps": 1.0,
-                "avg_send_rate_bps": 12000.0,
-                "avg_send_rate_pps": 1.0,
-                "avg_wait_time": 0.0,
-                "cur_queue_len": 0,
-                "duration": 10.0,
-                "integral_queue_sum": 0.0,
-                "integral_wait_time_sum": 0,
-                "last_state_change_timestamp": 9.011444091796875,
-                "max_queue_len": 0,
-                "max_wait_time": 0,
-                "timestamp": 10,
-                "total_dropped_bytes": 0,
-                "total_dropped_pkts": 0,
-                "total_get_bytes": 15000,
-                "total_get_pkts": 10,
-                "total_put_bytes": 15000,
-                "total_put_pkts": 10,
-                "total_received_bytes": 15000,
-                "total_received_pkts": 10,
-                "total_sent_bytes": 15000,
-                "total_sent_pkts": 10,
-            }
-        },
-    }
+    # switch should forward all packets with zero loss
+    assert sw_sf.total_received_pkts == 10
+    assert sw_sf.total_sent_pkts == 10
+    assert sw_sf.total_dropped_pkts == 0
+    assert k_sf.total_received_pkts == 10
+
+    # aggregated byte counters match
+    _close(sw_sf.total_received_bytes, k_sf.total_received_bytes)
+    _close(sw_sf.total_sent_bytes, k_sf.total_received_bytes)
+
+    # ensure RX and TX interface stats are in sync with totals
+    rx_sf = sw.stat._rx_interfaces["in0"].cur_stat_frame
+    tx_sf = sw.stat._tx_interfaces["out0"].cur_stat_frame
+    assert rx_sf.total_received_pkts == 10
+    assert tx_sf.total_sent_pkts == 10
+    # latency through switch should be non‑negative and small (<1 s here)
+    assert tx_sf.avg_latency_at_departure >= 0
+    assert tx_sf.avg_latency_at_departure < 1

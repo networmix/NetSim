@@ -14,6 +14,10 @@ RateBPS = float  # in bits per second
 
 
 class PacketAction(IntEnum):
+    """
+    Represents a set of actions that can be performed on a packet: received, sent, dropped.
+    """
+
     RECEIVED = 1
     SENT = 2
     DROPPED = 3

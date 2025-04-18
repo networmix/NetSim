@@ -1,3 +1,43 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "netsim"
+version = "0.3.0"
+description = "A discrete event simulator toolkit adapted for network simulation use-cases."
+readme = "README.md"
+authors = [{ name = "Andrey Golovanov" }]
+license = "MIT"
+requires-python = ">=3.9"
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "ngraph",
+    "pyyaml",
+    "schema",
+    "jq",
+    "scipy",
+    "pandas",
+    "seaborn",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "black",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing"
+
+# Ensure the licence file is included in the sdist and wheel
+[tool.setuptools]
+license-files = ["LICENSE"]

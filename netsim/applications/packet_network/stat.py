@@ -12,8 +12,8 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
 
-from netsim.des.common import SimTime
-from netsim.des.stat import (
+from netsim.common import SimTime
+from netsim.stat import (
     Stat,
     StatFrame,
     StatSamples,
@@ -36,7 +36,12 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class PacketStatFrame(StatFrame):  # pylint: disable=too-many-instance-attributes
+class PacketStatFrame(StatFrame):
+    """
+    Base statistics frame for tracking sent, received, and dropped packet counts and bytes,
+    plus average latencies and rates.
+    """
+
     total_sent_pkts: int = 0
     total_received_pkts: int = 0
     total_dropped_pkts: int = 0
@@ -60,39 +65,46 @@ class PacketStatFrame(StatFrame):  # pylint: disable=too-many-instance-attribute
     def packet_sent(self, packet: Packet):
         self.total_sent_pkts += 1
         self.total_sent_bytes += packet.size
-        self.avg_latency_at_departure = (
-            self.avg_latency_at_departure * (self.total_sent_pkts - 1)
-            + self.timestamp
-            - packet.generated_timestamp
-        ) / self.total_sent_pkts
+        if self.total_sent_pkts == 1:
+            self.avg_latency_at_departure = self.timestamp - packet.generated_timestamp
+        else:
+            self.avg_latency_at_departure = (
+                self.avg_latency_at_departure * (self.total_sent_pkts - 1)
+                + (self.timestamp - packet.generated_timestamp)
+            ) / self.total_sent_pkts
 
     def packet_received(self, packet: Packet):
         self.total_received_pkts += 1
         self.total_received_bytes += packet.size
-        self.avg_latency_at_arrival = (
-            self.avg_latency_at_arrival * (self.total_received_pkts - 1)
-            + self.timestamp
-            - packet.generated_timestamp
-        ) / self.total_received_pkts
+        if self.total_received_pkts == 1:
+            self.avg_latency_at_arrival = self.timestamp - packet.generated_timestamp
+        else:
+            self.avg_latency_at_arrival = (
+                self.avg_latency_at_arrival * (self.total_received_pkts - 1)
+                + (self.timestamp - packet.generated_timestamp)
+            ) / self.total_received_pkts
 
     def packet_dropped(self, packet: Packet):
         self.total_dropped_pkts += 1
         self.total_dropped_bytes += packet.size
-        self.avg_latency_at_drop = (
-            self.avg_latency_at_drop * (self.total_dropped_pkts - 1)
-            + self.timestamp
-            - packet.generated_timestamp
-        ) / self.total_dropped_pkts
+        if self.total_dropped_pkts == 1:
+            self.avg_latency_at_drop = self.timestamp - packet.generated_timestamp
+        else:
+            self.avg_latency_at_drop = (
+                self.avg_latency_at_drop * (self.total_dropped_pkts - 1)
+                + (self.timestamp - packet.generated_timestamp)
+            ) / self.total_dropped_pkts
 
     def _calc_avg(self):
-        self.avg_send_rate_pps = self.total_sent_pkts / self.duration
-        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
+        if self.duration > 0:
+            self.avg_send_rate_pps = self.total_sent_pkts / self.duration
+            self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
 
-        self.avg_receive_rate_pps = self.total_received_pkts / self.duration
-        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
+            self.avg_receive_rate_pps = self.total_received_pkts / self.duration
+            self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
 
-        self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
-        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
+            self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
+            self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
 
     def update_stat(self) -> None:
         self._calc_avg()
@@ -100,6 +112,10 @@ class PacketStatFrame(StatFrame):  # pylint: disable=too-many-instance-attribute
 
 @dataclass
 class PacketStat(Stat):
+    """
+    Statistics container for general objects sending/receiving/dropping packets.
+    """
+
     cur_stat_frame: PacketStatFrame = field(default_factory=PacketStatFrame)
     prev_stat_frame: PacketStatFrame = field(default_factory=PacketStatFrame)
     _packet_tracer: Optional[NamedTemporaryFile] = None
@@ -126,9 +142,9 @@ class PacketStat(Stat):
         if self._packet_tracer:
             self._packet_tracer.write(dumps(packet.todict()) + "\n")
 
-    def enable_packet_trace(self, prefix: Optional[None]) -> None:
+    def enable_packet_trace(self, prefix: Optional[str] = None) -> None:
         self._packet_tracer = NamedTemporaryFile(
-            mode="r+", encoding="utf8", prefix=prefix
+            mode="w", encoding="utf8", prefix=prefix
         )
 
     def get_packet_tracer(self) -> Optional[NamedTemporaryFile]:
@@ -136,9 +152,12 @@ class PacketStat(Stat):
 
 
 @dataclass
-class PacketQueueStatFrame(
-    PacketStatFrame
-):  # pylint: disable=too-many-instance-attributes
+class PacketQueueStatFrame(PacketStatFrame):
+    """
+    Extended statistics frame for queue objects, tracking put/get operations,
+    queue lengths, and waiting times.
+    """
+
     _wait_tracker: Dict[PacketID, SimTime] = field(default_factory=dict)
 
     total_get_pkts: int = 0
@@ -160,6 +179,9 @@ class PacketQueueStatFrame(
     max_wait_time: SimTime = 0
 
     def packet_get(self, packet: Packet):
+        """
+        Called whenever a packet is removed from the queue.
+        """
         self.cur_queue_len -= 1
         if self.cur_queue_len < 0:
             raise RuntimeError(f"cur_queue_len can't become negative. {self}")
@@ -171,31 +193,36 @@ class PacketQueueStatFrame(
         self.integral_wait_time_sum += wait_time
 
     def packet_put(self, packet: Packet):
+        """
+        Called whenever a packet is inserted into the queue.
+        """
         self.total_put_pkts += 1
         self.total_put_bytes += packet.size
         self.cur_queue_len += 1
         self._wait_tracker[packet.packet_id] = self.timestamp
 
     def _calc_avg(self) -> None:
-        self.avg_send_rate_pps = self.total_sent_pkts / self.duration
-        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
+        # Calculate base rates from PacketStatFrame
+        super()._calc_avg()
 
-        self.avg_receive_rate_pps = self.total_received_pkts / self.duration
-        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
-
-        self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
-        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
-
-        self.avg_put_rate_pps = self.total_put_pkts / self.duration
-        self.avg_get_rate_pps = self.total_get_pkts / self.duration
+        if self.duration > 0:
+            self.avg_put_rate_pps = self.total_put_pkts / self.duration
+            self.avg_get_rate_pps = self.total_get_pkts / self.duration
 
     def _update_queue_stat(self) -> None:
+        """
+        Update aggregated queue stats (max queue length, average queue length, average wait time).
+        """
         self.max_queue_len = max(self.max_queue_len, self.cur_queue_len)
-        self.avg_queue_len = self.integral_queue_sum / self.duration
+        if self.duration > 0:
+            self.avg_queue_len = self.integral_queue_sum / self.duration
         if self.total_get_pkts:
             self.avg_wait_time = self.integral_wait_time_sum / self.total_get_pkts
 
     def _update_queue_integral(self, prev_frame: PacketQueueStatFrame) -> None:
+        """
+        Accumulate the queue length integral over the interval since the last sample.
+        """
         self.integral_queue_sum += prev_frame.cur_queue_len * (
             self.timestamp - prev_frame.timestamp
         )
@@ -211,6 +238,10 @@ class PacketQueueStatFrame(
 
 @dataclass
 class PacketQueueStat(PacketStat):
+    """
+    Statistics object for queue-like entities. Extends PacketStat with queue-specific operations.
+    """
+
     cur_stat_frame: PacketQueueStatFrame = field(default_factory=PacketQueueStatFrame)
     prev_stat_frame: PacketQueueStatFrame = field(default_factory=PacketQueueStatFrame)
 
@@ -227,6 +258,10 @@ class PacketQueueStat(PacketStat):
 
 @dataclass
 class PacketSwitchStatFrame(StatFrame):
+    """
+    Statistics frame specialized for packet switches, holding interface-level stats and totals.
+    """
+
     rx_interfaces: Dict[InterfaceName, PacketStatFrame] = field(default_factory=dict)
     tx_interfaces: Dict[InterfaceName, PacketStatFrame] = field(default_factory=dict)
 
@@ -258,6 +293,9 @@ class PacketSwitchStatFrame(StatFrame):
     avg_drop_rate_bps: RateBPS = 0
 
     def _update_total(self, switch_stat: PacketSwitchStat) -> None:
+        """
+        Aggregate totals from all switch interfaces and processors.
+        """
         for rx_interface in switch_stat._rx_interfaces.values():
             self.total_received_pkts += rx_interface.cur_stat_frame.total_received_pkts
             self.total_received_bytes += (
@@ -289,14 +327,21 @@ class PacketSwitchStatFrame(StatFrame):
             )
 
     def _update_avg(self) -> None:
-        self.avg_send_rate_pps = self.total_sent_pkts / self.duration
-        self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
-        self.avg_receive_rate_pps = self.total_received_pkts / self.duration
-        self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
-        self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
-        self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
+        """
+        Compute overall average rates for the switch.
+        """
+        if self.duration > 0:
+            self.avg_send_rate_pps = self.total_sent_pkts / self.duration
+            self.avg_send_rate_bps = self.total_sent_bytes * 8 / self.duration
+            self.avg_receive_rate_pps = self.total_received_pkts / self.duration
+            self.avg_receive_rate_bps = self.total_received_bytes * 8 / self.duration
+            self.avg_drop_rate_pps = self.total_dropped_pkts / self.duration
+            self.avg_drop_rate_bps = self.total_dropped_bytes * 8 / self.duration
 
     def _fill_frames(self, switch_stat: PacketSwitchStat) -> None:
+        """
+        Copy the current frames from the switch into this object for final reporting.
+        """
         for fld_name in [
             "_rx_interfaces",
             "_tx_interfaces",
@@ -308,6 +353,9 @@ class PacketSwitchStatFrame(StatFrame):
                 getattr(self, fld_name[1:])[entity_name] = entity_stat.cur_stat_frame
 
     def fill_stat(self, switch_stat: PacketSwitchStat) -> None:
+        """
+        Main routine that collects and aggregates all stats from the switch's sub-entities.
+        """
         self._update_total(switch_stat)
         if self.duration:
             self._update_avg()
@@ -332,6 +380,10 @@ class PacketSwitchStatFrame(StatFrame):
 
 @dataclass
 class PacketSwitchStat(Stat):
+    """
+    Statistics container for a PacketSwitch, which aggregates interface and processor stats.
+    """
+
     _rx_interfaces: Dict[InterfaceName, PacketStat] = field(default_factory=dict)
     _tx_interfaces: Dict[InterfaceName, PacketStat] = field(default_factory=dict)
     _rx_interface_queues: Dict[InterfaceName, PacketQueueStat] = field(
@@ -351,46 +403,51 @@ class PacketSwitchStat(Stat):
 
     def advance_time(self) -> None:
         """
-        Handle to advance time of the stat container.
+        Overriding advance_time to handle collecting sub-entity stats before final snapshot.
         """
-
         if self._stat_tracer:
-            # dump stat frame to a temp file
             self.dump_stat_trace()
 
-        # update timestamps in the stat block
         self.prev_timestamp, self.cur_timestamp = self.cur_timestamp, self._ctx.now
         self.cur_interval_duration += self.cur_timestamp - self.prev_timestamp
 
-        # move the cur frame to prev, create new cur
         self.prev_stat_frame, self.cur_stat_frame = (
             self.cur_stat_frame,
             PacketSwitchStatFrame(),
         )
 
-        # update timestamps in the cur frame
         self.cur_stat_frame.set_time(self.cur_timestamp, self.cur_interval_duration)
-
-        # fill in the stat
         self.fill_stat()
 
     def fill_stat(self) -> None:
+        """
+        Populate the current stat frame with aggregated data from sub-entities.
+        """
         self.cur_stat_frame.fill_stat(self)
 
 
 @dataclass
 class NetSimStat(Stat):
+    """
+    Overall statistics container for the entire NetSim environment.
+    """
+
     stat_samples: Dict[NetSimObjectName, StatSamples] = field(default_factory=dict)
 
     def dump_stat_trace(self) -> None:
+        """
+        No-op or specialized logic for NetSim-level stat trace. Overridden in real usage if needed.
+        """
         ...
 
     def dump_stat_samples(self, data_dict: Dict[str, Any]) -> None:
+        """
+        Write the aggregated data samples to the stat tracer if one is enabled.
+        """
         self._stat_tracer.write(dumps(data_dict) + "\n")
 
     def todict(self) -> Dict[str, Any]:
         ret = defaultdict(dict)
-
         for item_dict_name in ["stat_samples"]:
             for name, stat in getattr(self, item_dict_name).items():
                 for interval, statsample in stat.items():

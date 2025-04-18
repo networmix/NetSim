@@ -1,5 +1,5 @@
-from netsim.des.core import Event, SimContext
-from netsim.des.stat import (
+from netsim.core import Event, SimContext
+from netsim.stat import (
     ProcessStat,
     ProcessStatFrame,
     QueueStat,

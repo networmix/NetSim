@@ -1,4 +1,4 @@
-ngraph == 0.4.1
+ngraph
 pyyaml
 schema
 jq
