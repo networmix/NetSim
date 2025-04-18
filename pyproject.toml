@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "A discrete event simulator toolkit adapted for network simulation
 readme = "README.md"
 authors = [{ name = "Andrey Golovanov" }]
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 
 classifiers = [
@@ -31,13 +32,11 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pytest-cov",
+    "pytest-benchmark",
+    "pytest-mock",
     "black",
-    "ruff",
+    "isort",
 ]
 
 [tool.pytest.ini_options]
 addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing"
-
-# Ensure the licence file is included in the sdist and wheel
-[tool.setuptools]
-license-files = ["LICENSE"]
