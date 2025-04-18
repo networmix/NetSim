@@ -24,4 +24,4 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          pytest --cov=ngraph --cov-fail-under=85
+          pytest --cov=netsim --cov-fail-under=85

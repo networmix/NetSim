@@ -1,6 +1,6 @@
 # NetSim
 
-![Python-test](https://github.com/networmix/NetSim/workflows/Python-test/badge.svg?branch=main)
+[![Python-test](https://github.com/networmix/NetSim/actions/workflows/python-test.yml/badge.svg?branch=main)](https://github.com/networmix/NetSim/actions/workflows/python-test.yml)
 
 ## Introduction
 
