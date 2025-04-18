@@ -1,4 +1,3 @@
-# pylint: disable=invalid-name
 from enum import IntEnum
 import random
 import statistics
@@ -27,6 +26,7 @@ random.seed(SEED)
 
 
 class DistrFunc(IntEnum):
+    """Enum for supported distribution functions."""
 
     Constant = 0
     Normal = 1
@@ -35,6 +35,16 @@ class DistrFunc(IntEnum):
 
 
 def make_generator(func: Callable) -> Generator[Any, None, None]:
+    """
+    Decorator that turns a distribution function into an infinite generator.
+
+    Args:
+      func: A callable that, when invoked, returns a random sample (float).
+
+    Returns:
+      A generator that yields infinite samples from the given distribution.
+    """
+
     @functools.wraps(func)
     def wrapper_decorator(
         *args: List[Any], **kwargs: Dict[str, Any]
@@ -48,9 +58,14 @@ def make_generator(func: Callable) -> Generator[Any, None, None]:
 @make_generator
 def uniform(a: float, b: float) -> float:
     """
-    Uniform distribution in [a, b) range.
+    Uniform distribution in [a, b).
 
-    Simple "shift and scale" of the Uniform distribution [0.0, 1.0).
+    Args:
+      a: Lower bound
+      b: Upper bound
+
+    Returns:
+      Single draw from Uniform(a, b).
     """
     return a + (b - a) * random.random()
 
@@ -58,11 +73,14 @@ def uniform(a: float, b: float) -> float:
 @make_generator
 def normal(mu: float, sigma: float) -> float:
     """
-    Normal distribution.
-    mu - mean
-    sigma - standard deviation
+    Normal distribution generator using built-in Python normalvariate.
 
-    Uses the Kinderman and Monahan method.
+    Args:
+      mu: Mean of distribution
+      sigma: Standard deviation
+
+    Returns:
+      Single draw from Normal(mu, sigma).
     """
     return random.normalvariate(mu, sigma)
 
@@ -70,27 +88,46 @@ def normal(mu: float, sigma: float) -> float:
 @make_generator
 def exponential(lambd: float) -> float:
     """
-    Exponential distribution.
-    lambda = 1/mean
+    Exponential distribution generator.
 
-    Wrapper around the following formula:
-    -ln(1.0 - random.random()) / lambda
+    Args:
+      lambd: Rate parameter (1 / mean)
+
+    Returns:
+      Single draw from Exponential(1 / lambd).
     """
     return random.expovariate(lambd)
 
 
 class DistrBuilder:
+    """
+    Factory-style builder that creates a (potentially finite) generator for
+    the requested distribution, based on the parameters.
+    """
+
     @classmethod
     def create(
         cls, distr_func: DistrFunc, params: Dict[str, Union[int, float]]
     ) -> Generator[Any, None, None]:
+        """
+        Creates and returns a generator for the specified distribution function.
 
+        Args:
+          distr_func: Distribution enum (Constant, Normal, Uniform, Exponential)
+          params: Dictionary of parameters required by the distribution. Common keys:
+            - 'count': (Optional) finite number of samples to yield
+            - distribution-specific parameters
+
+        Returns:
+          A generator that yields samples from the specified distribution.
+        """
         if distr_func == DistrFunc.Constant:
             constant = params["constant"]
             first = params.get("first", constant)
             count = params.get("count")
 
             def gen():
+                # Yield 'first' once if specified, then always the same constant
                 if first is not None:
                     yield first
                 while True:
@@ -102,108 +139,144 @@ class DistrBuilder:
             mu = params["mu"]
             sigma = params["sigma"]
             count = params.get("count")
-            return (
-                normal(mu, sigma)
-                if not count
-                else itertools.islice(normal(mu, sigma), count)
-            )
+            gen = normal(mu, sigma)
+            return gen if not count else itertools.islice(gen, count)
 
         if distr_func == DistrFunc.Uniform:
             a = params["a"]
             b = params["b"]
             count = params.get("count")
-            return (
-                uniform(a, b) if not count else itertools.islice(uniform(a, b), count)
-            )
+            gen = uniform(a, b)
+            return gen if not count else itertools.islice(gen, count)
 
         if distr_func == DistrFunc.Exponential:
             lambd = params["lambda"]
             count = params.get("count")
-            return (
-                exponential(lambd)
-                if not count
-                else itertools.islice(exponential(lambd), count)
-            )
+            gen = exponential(lambd)
+            return gen if not count else itertools.islice(gen, count)
 
         raise RuntimeError(f"Unknown distribution function: {distr_func}")
 
 
 def sample_df(sample: Sample, r: int) -> int:
     """
-    Degrees of freedom is the number of values that are free to vary in a data set.
-    It is a mathematical restriction that needs to be put in place when estimating one statistic
-    from an estimate of another. In other words, it is the number of ways or dimensions an independent
-    value can move without violating constraints.
+    Computes a general-purpose degrees of freedom measure:
+    df = n - 1 - r
 
-    To calculate degrees of freedom, subtract the number of "relations" from the number of observations.
+    This is often used for sampling-based calculations (e.g., sample variance).
+    However, this is not the correct df for a Chi-Square goodness-of-fit test
+    (that depends on bin count and parameters, not the raw sample size).
 
-    df - degrees of freedom is n - 1 - r where
-      n is the number of observations and
-      r is the number of "relations" or the number of parameters estimated for the distribution
+    Args:
+      sample: The sample data.
+      r: Number of estimated parameters.
+
+    Returns:
+      Degrees of freedom (integer).
     """
     return len(sample) - 1 - r
 
 
 def sample_mean(sample: Sample) -> float:
     """
-    Mean or arithmetic average:
-    mu = sum(samples)/n
-    can also be denote as x_bar
+    Computes the arithmetic mean of the sample.
+
+    Args:
+      sample: The sample data.
+
+    Returns:
+      Mean (float).
     """
     return statistics.fmean(sample)
 
 
 def sample_stdev(sample: Sample) -> float:
     """
-    Standard deviation of a sample:
-    sigma = sqrt(sum(ai - mu)^2/(n - 1))
+    Computes the sample standard deviation.
 
-    Note: denominator is (n - 1) because we don't have a complete population.
-    Dividing by n would underestimate the variability.
-    Standard deviation for a complete population is called "sigma"
+    Args:
+      sample: The sample data.
+
+    Returns:
+      Standard deviation (float).
     """
     return statistics.stdev(sample)
 
 
 def sample_variance(sample: Sample) -> float:
     """
-    Variance of a sample:
-    sigma^2 = sum(ai - mu)^2/(n - 1)
+    Computes the sample variance.
 
-    Note: denominator is (n - 1) because we don't have a complete population.
-    Dividing by n would underestimate the variability.
-    Variance is the square of a standard deviation and is called "sigma squared"
+    Args:
+      sample: The sample data.
+
+    Returns:
+      Variance (float).
     """
-    return (statistics.stdev(sample)) ** 2
+    return statistics.variance(sample)
 
 
 def chi_square_critical(df: int, p: float = 0.05) -> float:
     """
-    find Chi-Square critical value
-    Degrees of freedom of an estimate is the number of independent pieces of information
-    that went into calculating the estimate.
+    Finds the Chi-Square critical value for a given df and significance level p.
 
-    df - degrees of freedom
+    Args:
+      df: Degrees of freedom
+      p: Significance level (default 0.05)
+
+    Returns:
+      Critical value from the chi-squared distribution.
     """
     return scipy.stats.chi2.ppf(1 - p, df)
 
 
-def chi_square(observed: Union[int, float], expected: Union[int, float]):
+def chi_square(observed: float, expected: float) -> float:
+    """
+    Computes the basic Chi-Square term for a single bin/category.
+
+    (observed - expected)^2 / expected
+
+    Args:
+      observed: Observed count
+      expected: Expected count
+
+    Returns:
+      Single chi-square component.
+    """
+    # Avoid dividing by extremely small expected values:
+    if expected <= 1e-12:
+        return 0.0 if abs(observed) < 1e-12 else float("inf")
     return (observed - expected) ** 2 / expected
 
 
-def normal_cdf(x: float, mu: float, sigma: float) -> Tuple[List[float], List[float]]:
+def normal_cdf(x: float, mu: float, sigma: float) -> float:
     """
-    Cumulative Distribution Function (CDF) of a Normal distribution
+    Computes the CDF of a Normal distribution at x.
+
+    Args:
+      x: Point at which to evaluate
+      mu: Mean
+      sigma: Standard deviation
+
+    Returns:
+      The probability that a Normal(mu, sigma) random variable <= x.
     """
-    return scipy.stats.norm.cdf(x, loc=mu, scale=sigma)
+    return float(scipy.stats.norm.cdf(x, loc=mu, scale=sigma))
 
 
 def histogram(
     sample: Sample, bins: int, normalize: bool = False
 ) -> Tuple[List[float], List[float]]:
     """
-    Compute the histogram of a sample
+    Computes the histogram of a sample using numpy.histogram.
+
+    Args:
+      sample: The sample data
+      bins: Number of bins
+      normalize: If True, returns the normalized histogram (pdf-like)
+
+    Returns:
+      (hist, bin_edges) as lists (not numpy arrays).
     """
     hist, bin_edges = np.histogram(sample, bins=bins, density=normalize)
     return list(hist), list(bin_edges)
@@ -214,18 +287,34 @@ def sample_chi_square(
     exp_distr: str,
     intervals_num: Optional[int] = None,
 ) -> float:
+    """
+    Computes the Chi-Square statistic comparing a sample's histogram to an
+    expected distribution (currently "uniform" or "normal" supported).
 
+    For "uniform", we assume the distribution is uniform over the sample's range,
+    so expected = n / intervals for each bin.
+
+    For "normal", we use the sample's mean and stdev to parameterize a normal,
+    then the expected count in each bin is:
+       (CDF(bin_right) - CDF(bin_left)) * sample_size
+
+    Args:
+      sample: The sample data
+      exp_distr: "uniform" or "normal"
+      intervals_num: Number of histogram bins. If None, it’s chosen based on sample size.
+
+    Returns:
+      The Chi-Square statistic (float).
+    """
     sample_size = len(sample)
-    # applicability test
     if sample_size < 20:
-        raise AttributeError(
-            f"Can't apply Chi-Square test: the sample size {sample_size} is less than 20"
+        raise ValueError(
+            f"Can't apply Chi-Square test: sample size {sample_size} is less than 20"
         )
 
-    # calculate the number of intervals if not given
     if intervals_num is None:
         if sample_size > 100:
-            intervals_num = math.floor(sample_size ** 0.5)
+            intervals_num = math.floor(sample_size**0.5)
         elif sample_size > 50:
             intervals_num = 10
         else:
@@ -235,21 +324,21 @@ def sample_chi_square(
 
     mu = sample_mean(sample)
     sigma = sample_stdev(sample)
+
     if exp_distr == "uniform":
-        expected_nums = [len(sample) / intervals_num for _ in range(intervals_num)]
-        print(expected_nums)
+        # each bin has the same expected count
+        expected_nums = [sample_size / intervals_num for _ in range(intervals_num)]
     elif exp_distr == "normal":
+        # difference of normal CDFs times sample_size
         pairs = zip(bin_edges, bin_edges[1:])
         expected_nums = [
-            normal_cdf(right, mu, sigma) - normal_cdf(left, mu, sigma)
+            sample_size * (normal_cdf(right, mu, sigma) - normal_cdf(left, mu, sigma))
             for left, right in pairs
         ]
     else:
-        raise AttributeError(f"Unknown distribution {exp_distr}")
+        raise ValueError(f"Unknown distribution {exp_distr}")
 
-    for o, e in zip(observed_nums, expected_nums):
-        print(o, e, chi_square(o, e))
-    return sum([chi_square(o, e) for o, e in zip(observed_nums, expected_nums)])
+    return sum(chi_square(o, e) for o, e in zip(observed_nums, expected_nums))
 
 
 def sample_chi_square_test(
@@ -258,11 +347,51 @@ def sample_chi_square_test(
     p: float,
     intervals_num: Optional[int] = None,
 ) -> bool:
+    """
+    Performs a Chi-Square goodness-of-fit test for either 'uniform' or 'normal'.
+    Returns True if the Chi-Square statistic < critical value => we do NOT reject
+    the hypothesis at significance p.
+
+    NOTE: For a standard chi-square gof test:
+        df = (number_of_bins - 1 - number_of_parameters_estimated)
+
+    Args:
+      sample: The sample data
+      exp_distr: "uniform" or "normal"
+      p: significance level
+      intervals_num: Number of bins (optional)
+
+    Returns:
+      Boolean indicating whether the distribution is accepted at level p.
+    """
+    if intervals_num is None:
+        sample_size = len(sample)
+        if sample_size > 100:
+            intervals_num = math.floor(sample_size**0.5)
+        elif sample_size > 50:
+            intervals_num = 10
+        else:
+            intervals_num = 5
+
+    # Number of parameters estimated from the data:
     if exp_distr == "uniform":
+        # No parameters estimated from sample for uniform test
         r = 0
-    if exp_distr == "normal":
+    elif exp_distr == "normal":
+        # We estimate mean and stdev from sample
         r = 2
-    df = sample_df(sample, r)
-    return sample_chi_square(sample, exp_distr, intervals_num) < chi_square_critical(
-        df, p
-    )
+    else:
+        raise ValueError(f"Unknown distribution {exp_distr}")
+
+    # For Chi-Square GOF: df = k - 1 - r
+    # k = intervals_num
+    df = intervals_num - 1 - r
+    if df < 1:
+        # Can't run a proper test if df < 1
+        raise ValueError(
+            f"Invalid df for Chi-Square test (bins={intervals_num}, r={r})."
+        )
+
+    chi_sq_value = sample_chi_square(sample, exp_distr, intervals_num)
+    critical = chi_square_critical(df, p)
+    return chi_sq_value < critical

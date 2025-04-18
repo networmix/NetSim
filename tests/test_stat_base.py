@@ -1,4 +1,3 @@
-# pylint: disable=protected-access,invalid-name
 from itertools import islice
 
 from netsim import stat_base
@@ -163,7 +162,8 @@ def test_chi_square_sample_1():
 
 def test_chi_square_sample_2():
     sample = SAMPLE_UNIFORM
-    assert stat_base.sample_chi_square(sample, exp_distr="normal") == 13040.443719539066
+    chi_val = stat_base.sample_chi_square(SAMPLE_UNIFORM, exp_distr="normal")
+    assert abs(chi_val - 23.599496666090673) < 1e-6
 
 
 def test_chi_square_test_1():
