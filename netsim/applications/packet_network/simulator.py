@@ -4,7 +4,7 @@ import logging
 from copy import deepcopy
 from typing import Any, Dict, Iterator, Optional, Type, Union
 
-from ngraph.lib.graph import StrictMultiDiGraph
+from netsim.applications.packet_network.graph import SimpleGraph
 
 from netsim.common import SimTime, TimeInterval
 from netsim.core import (
@@ -147,7 +147,7 @@ class NetSim(Simulator):
             if getattr(ns_obj.stat, "enable_packet_trace", None):
                 ns_obj.stat.enable_packet_trace(prefix=ns_obj.name)
 
-    def _parse_graph_nodes(self, graph: StrictMultiDiGraph) -> None:
+    def _parse_graph_nodes(self, graph: SimpleGraph) -> None:
         """
         Parse the nodes of the input graph, creating NetSimObjects accordingly.
         """
@@ -165,7 +165,7 @@ class NetSim(Simulator):
 
             self._ns[node] = ns_node_obj
 
-    def _parse_graph_edges(self, graph: StrictMultiDiGraph) -> None:
+    def _parse_graph_edges(self, graph: SimpleGraph) -> None:
         """
         Parse edges of the input graph, hooking up subscriptions or creating interfaces for PacketSwitch objects.
         """
@@ -196,7 +196,7 @@ class NetSim(Simulator):
             if isinstance(ns_node_obj, PacketSwitch):
                 ns_node_obj.create_packet_processor()
 
-    def load_graph(self, graph: StrictMultiDiGraph) -> None:
+    def load_graph(self, graph: SimpleGraph) -> None:
         """
         Load a topology graph into the simulation, creating NetSimObjects and hooking them up.
         """

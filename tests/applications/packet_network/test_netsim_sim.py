@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Dict
 
-from ngraph.lib.graph import StrictMultiDiGraph
+from netsim.applications.packet_network.graph import SimpleGraph
 
 from netsim.applications.packet_network.simulator import NetSim
 from netsim.applications.packet_network.base import (
@@ -37,7 +37,7 @@ def _src_profile(size: int = 1000, interval: float = 1.0, count: int = 10) -> Di
 # --------------------------------------------------------------------------- #
 def test_load_graph_creates_objects() -> None:
     sim = NetSim()
-    g = StrictMultiDiGraph()
+    g = SimpleGraph()
     g.add_node("S", ns_type="PacketSource", ns_attr=_src_profile())
     g.add_node("D", ns_type="PacketSink", ns_attr={})
     g.add_edge("S", "D", key=1, ns_attr={})
@@ -58,7 +58,7 @@ def test_load_graph_creates_objects() -> None:
 # --------------------------------------------------------------------------- #
 def test_run_until_time_collects_stats() -> None:
     sim = NetSim(stat_interval=1.0)  # 1 s snapshots
-    g = StrictMultiDiGraph()
+    g = SimpleGraph()
     g.add_node("S", ns_type="PacketSource", ns_attr=_src_profile(count=6))
     g.add_node("D", ns_type="PacketSink", ns_attr={})
     g.add_edge("S", "D", key=1, ns_attr={})
@@ -82,7 +82,7 @@ def test_run_until_time_collects_stats() -> None:
 # --------------------------------------------------------------------------- #
 def test_switch_interfaces_and_forwarding() -> None:
     sim = NetSim()
-    g = StrictMultiDiGraph()
+    g = SimpleGraph()
 
     g.add_node("SRC", ns_type="PacketSource", ns_attr=_src_profile(count=5))
     g.add_node("SW", ns_type="PacketSwitch", ns_attr={})
@@ -131,7 +131,7 @@ def test_tracing_toggles_create_tempfiles(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(_Packet, "todict", _safe_todict, raising=True)
 
     sim = NetSim()
-    g = StrictMultiDiGraph()
+    g = SimpleGraph()
     g.add_node("S", ns_type="PacketSource", ns_attr=_src_profile(count=2))
     g.add_node("D", ns_type="PacketSink", ns_attr={})
     g.add_edge("S", "D", key=1, ns_attr={})

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import logging
 from typing import Callable, Dict, List, Optional, Set, Type, Union, Generator, Any
 
-from ngraph.lib.graph import StrictMultiDiGraph
+from netsim.applications.packet_network.graph import SimpleGraph
 from schema import Schema
 
 from netsim.applications.packet_network.common import (
@@ -111,16 +111,16 @@ class NetSimContext(SimContext):
             starttime: The simulation start time (default 0).
         """
         super().__init__(starttime=starttime)
-        self.topology: Dict[str, StrictMultiDiGraph] = {}
+        self.topology: Dict[str, SimpleGraph] = {}
         self.state_db: Dict[NetSimObjectName, Any] = {}
 
-    def add_topology(self, name: str, graph: StrictMultiDiGraph) -> None:
+    def add_topology(self, name: str, graph: SimpleGraph) -> None:
         """
         Register a topology graph object in the context.
 
         Args:
             name: A unique name for the topology.
-            graph: The StrictMultiDiGraph object representing the topology.
+            graph: The SimpleGraph object representing the topology.
         """
         self.topology[name] = graph
 
