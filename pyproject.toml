@@ -10,7 +10,7 @@ readme = "README.md"
 authors = [{ name = "Andrey Golovanov" }]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 
 classifiers = [
     "Programming Language :: Python :: 3",
