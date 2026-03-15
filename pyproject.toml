@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netsim"
-version = "1.0.0"
+version = "0.1.0"
 description = "A discrete-event simulation engine."
 readme = "README.md"
 authors = [{ name = "Andrey Golovanov" }]
