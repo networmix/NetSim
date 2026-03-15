@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netsim"
-version = "0.3.0"
-description = "A discrete event simulator toolkit adapted for network simulation use-cases."
+version = "1.0.0"
+description = "A discrete-event simulation engine."
 readme = "README.md"
 authors = [{ name = "Andrey Golovanov" }]
 license = "MIT"
@@ -14,19 +14,14 @@ requires-python = ">=3.11"
 
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
 
-dependencies = [
-    "ngraph",
-    "pyyaml",
-    "schema",
-    "jq",
-    "scipy",
-    "pandas",
-    "seaborn",
-    "matplotlib",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -34,9 +29,52 @@ dev = [
     "pytest-cov",
     "pytest-benchmark",
     "pytest-mock",
-    "black",
-    "isort",
+    "pytest-timeout",
+    "ruff==0.11.13",
+    "pyright==1.1.401",
+    "pre-commit",
+    "build",
+    "twine",
 ]
 
+[tool.setuptools.packages.find]
+include = ["netsim*"]
+exclude = ["tests*"]
+
 [tool.pytest.ini_options]
-addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing"
+addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing --benchmark-disable"
+timeout = 10
+markers = [
+    "slow: marks tests as slow",
+    "benchmark: marks tests as benchmarks",
+]
+
+[tool.coverage.run]
+source = ["netsim"]
+omit = ["*/tests/*", "*/test_*"]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I"]
+fixable = ["ALL"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["netsim"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.11"
+venvPath = "."
+venv = "venv"
+exclude = [
+    "tests/**",
+    "**/venv/**",
+    "build/**",
+    "dist/**",
+]

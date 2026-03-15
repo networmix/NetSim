@@ -1,8 +1,0 @@
-ngraph
-pyyaml
-schema
-jq
-scipy
-pandas
-seaborn
-matplotlib

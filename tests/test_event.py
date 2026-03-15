@@ -1,156 +1,223 @@
+"""Tests for Event creation, triggering, callbacks, and state transitions."""
+
 import pytest
-from netsim.core import (
-    Event,
-    EventStatus,
-    EventPriority,
-    SimContext,
-    Process,
-    Timeout,
-    CollectStat,
-)
+
+import netsim
 
 
-def test_simcontext_basic_event_scheduling():
-    """Validate that an event can be scheduled and then retrieved in correct order."""
-    ctx = SimContext()
-    event = Event(ctx, time=1, func=lambda e: "TestEvent")
-    ctx.schedule_event(event)
+class TestEventCreate:
+    def test_new_event_is_pending(self):
+        env = netsim.Environment()
+        evt = env.event()
+        assert not evt.triggered
+        assert not evt.processed
+        assert not evt.ok
 
-    fetched = ctx.get_event()
-    assert fetched is event
-    assert fetched.time == 1
-
-
-def test_simcontext_schedule_into_past_raises():
-    """Ensure scheduling an event into a past time triggers a RuntimeError."""
-    ctx = SimContext(starttime=10)
-    event = Event(ctx, time=9)
-    with pytest.raises(RuntimeError, match="into the past"):
-        ctx.schedule_event(event)
+    def test_event_belongs_to_env(self):
+        env = netsim.Environment()
+        evt = env.event()
+        assert evt.env is env
 
 
-def test_event_lifecycle():
-    """
-    Check the full lifecycle transition of an event:
-    CREATED -> PLANNED -> SCHEDULED -> TRIGGERED -> PROCESSED.
-    """
-    ctx = SimContext()
-    event = Event(ctx, func=lambda e: "TestEventValue")
+class TestEventSucceed:
+    def test_succeed_sets_triggered(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.succeed(value=42)
+        assert evt.triggered
+        assert evt.ok
 
-    assert event.status == EventStatus.CREATED
+    def test_succeed_with_default_value(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.succeed()
+        env.step()
+        assert evt.value is None
 
-    event.plan(time=1)
-    assert event.status == EventStatus.PLANNED
-    assert event.time == 1
+    def test_succeed_with_value(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.succeed(value='hello')
+        env.step()
+        assert evt.value == 'hello'
 
-    event.schedule()
-    assert event.status == EventStatus.SCHEDULED
-    assert event.is_scheduled
-
-    event.trigger()
-    assert event.status == EventStatus.TRIGGERED
-    assert event.is_triggered
-
-    event.run()
-    assert event.status == EventStatus.PROCESSED
-    assert event.value == "TestEventValue"
-
-
-def test_event_plan_already_planned_raises():
-    """Confirm that planning an event already in PLANNED state raises RuntimeError."""
-    ctx = SimContext()
-    event = Event(ctx, time=1)
-    assert event.status == EventStatus.PLANNED
-
-    with pytest.raises(RuntimeError, match="already been planned"):
-        event.plan(time=2)
+    def test_succeed_returns_self(self):
+        env = netsim.Environment()
+        evt = env.event()
+        result = evt.succeed()
+        assert result is evt
 
 
-def test_event_schedule_already_scheduled_raises():
-    """Confirm that scheduling an event already in SCHEDULED state raises RuntimeError."""
-    ctx = SimContext()
-    event = Event(ctx, time=1)
-    event.schedule()
-    assert event.status == EventStatus.SCHEDULED
+class TestEventFail:
+    def test_fail_sets_triggered(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('boom'))
+        assert evt.triggered
+        assert not evt.ok
 
-    with pytest.raises(RuntimeError, match="has already been scheduled"):
-        event.schedule(time=1)
+    def test_fail_value_is_exception(self):
+        env = netsim.Environment()
+        evt = env.event()
+        exc = ValueError('boom')
+        evt.fail(exc)
+        assert evt.value is exc
 
+    def test_fail_requires_exception_instance(self):
+        env = netsim.Environment()
+        evt = env.event()
+        with pytest.raises(TypeError):
+            evt.fail('not an exception')
 
-def test_event_trigger_not_scheduled_raises():
-    """Ensure triggering an event that isn't in SCHEDULED state raises RuntimeError."""
-    ctx = SimContext()
-    event = Event(ctx)
-    with pytest.raises(RuntimeError, match="wasn't scheduled"):
-        event.trigger()
+    def test_fail_returns_self(self):
+        env = netsim.Environment()
+        evt = env.event()
+        result = evt.fail(RuntimeError('oops'))
+        assert result is evt
 
-
-def test_event_callback_subscribe():
-    """
-    Verify that subscribing a process to an event causes the process to resume
-    when event.run() is called.
-    """
-    ctx = SimContext()
-
-    def coro(_ctx):
-        yield
-        return
-
-    proc = Process(ctx, coro(ctx))
-    proc.start()
-    event = Event(ctx, time=0)
-    event.subscribe(proc)
-
-    # Schedule and trigger the event so run() occurs
-    event.schedule()
-    event.trigger()
-    event.run()
-
-    # Process got a single yield => should be stopped
-    assert proc.is_stopped()
+    def test_undefused_failed_event_raises_on_step(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('boom'))
+        with pytest.raises(ValueError, match='boom'):
+            env.step()
 
 
-def test_event_callback_arbitrary():
-    """Confirm arbitrary callbacks added to an event are invoked upon event.run()."""
-    ctx = SimContext()
-    called_flags = []
+class TestEventTrigger:
+    def test_trigger_chains_success(self):
+        env = netsim.Environment()
+        source = env.event()
+        target = env.event()
+        source.callbacks.append(target.trigger)
+        source.succeed(value=99)
+        env.run()
+        assert target.triggered
+        assert target.ok
+        assert target.value == 99
 
-    def callback(_evt):
-        called_flags.append(True)
+    def test_trigger_chains_failure(self):
+        env = netsim.Environment()
+        source = env.event()
+        target = env.event()
+        source.callbacks.append(target.trigger)
+        exc = RuntimeError('fail')
+        source.fail(exc)
+        # Defuse the source so stepping doesn't raise, then defuse target too
+        source.defused = True
+        target.defused = True
+        env.run()
+        assert target.triggered
+        assert not target.ok
+        assert target.value is exc
 
-    event = Event(ctx, time=0)
-    event.add_callback(callback)
-    event.schedule()
-    event.trigger()
-    event.run()
+    def test_double_trigger_raises(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.succeed()
+        with pytest.raises(RuntimeError):
+            evt.succeed()
 
-    assert len(called_flags) == 1
+    def test_double_fail_raises(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('first'))
+        with pytest.raises(RuntimeError):
+            evt.fail(ValueError('second'))
+
+    def test_succeed_after_fail_raises(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('first'))
+        with pytest.raises(RuntimeError):
+            evt.succeed()
 
 
-def test_timeout_auto_trigger():
-    """Check that a Timeout event sets itself to triggered as soon as it's scheduled."""
-    ctx = SimContext()
-    timeout_event = Timeout(ctx, delay=5)
-    assert timeout_event._auto_trigger is True
+class TestEventCallbacks:
+    def test_callbacks_executed_on_processing(self):
+        env = netsim.Environment()
+        evt = env.event()
+        results = []
+        evt.callbacks.append(lambda e: results.append(e.value))
+        evt.succeed(value=10)
+        env.step()
+        assert results == [10]
 
-    timeout_event.schedule()
-    assert timeout_event.is_triggered
+    def test_callbacks_set_to_none_after_processing(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.succeed()
+        env.step()
+        assert evt.callbacks is None
+        assert evt.processed
+
+    def test_multiple_callbacks_all_called(self):
+        env = netsim.Environment()
+        evt = env.event()
+        called = []
+        evt.callbacks.append(lambda e: called.append('a'))
+        evt.callbacks.append(lambda e: called.append('b'))
+        evt.succeed()
+        env.step()
+        assert called == ['a', 'b']
 
 
-def test_collect_stat():
-    """Validate that a CollectStat event auto-triggers and can be scheduled before simulation stop."""
-    ctx = SimContext()
-    cstat1 = CollectStat(ctx, delay=2)
-    cstat2 = CollectStat(ctx, delay=4)
+class TestEventValueAccess:
+    def test_value_before_trigger_raises_attribute_error(self):
+        env = netsim.Environment()
+        evt = env.event()
+        with pytest.raises(AttributeError):
+            _ = evt.value
 
-    ctx.schedule_event(cstat1)
-    ctx.schedule_event(cstat2)
 
-    # Just fetch them to ensure they are scheduled in ascending order
-    e1 = ctx.get_event()
-    e2 = ctx.get_event()
-    assert e1.time == 2
-    assert e2.time == 4
-    # Both are triggered due to auto_trigger
-    assert e1.is_triggered
-    assert e2.is_triggered
+class TestEventDefused:
+    def test_defused_flag_default(self):
+        env = netsim.Environment()
+        evt = env.event()
+        assert not evt.defused
+
+    def test_defused_flag_can_be_set(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.defused = True
+        assert evt.defused
+
+    def test_defused_failed_event_does_not_raise(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('boom'))
+        evt.defused = True
+        # Should not raise
+        env.step()
+        assert evt.processed
+
+
+class TestTriggerDoubleTriggerRaises:
+    def test_trigger_double_trigger_raises(self):
+        """Calling event.trigger(source) on an already-triggered event raises RuntimeError."""
+        env = netsim.Environment()
+        source = env.event()
+        target = env.event()
+        source.succeed(value=1)
+        # Trigger target via trigger()
+        target.trigger(source)
+        assert target.triggered
+        # Now trigger again on the already-triggered target -- should raise
+        source2 = env.event()
+        source2.succeed(value=2)
+        with pytest.raises(RuntimeError):
+            target.trigger(source2)
+
+
+class TestTriggerUsedAsCallbackChaining:
+    def test_trigger_used_as_callback_chaining(self):
+        """Register target.trigger as a callback on source; after step, target has same value."""
+        env = netsim.Environment()
+        source = env.event()
+        target = env.event()
+        source.callbacks.append(target.trigger)
+        source.succeed(value='chained')
+        env.step()  # process source, which fires target.trigger callback
+        assert target.triggered
+        assert target.ok
+        env.step()  # process target
+        assert target.value == 'chained'

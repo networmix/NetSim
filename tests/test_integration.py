@@ -1,93 +1,195 @@
-import pytest
-from netsim.core import SimContext, Simulator, Process, QueueFIFO, ProcessStatus
-from netsim.stat import SimStat
+"""Integration tests: multi-process interactions and complex scenarios."""
+
+import netsim
 
 
-def test_integration_advanced_stats():
-    """
-    Integration test with multiple producers and consumers sharing a single FIFO queue.
-    - 2 producers each produce 5 items total => 10 items enqueued.
-    - 2 consumers each consume 3 items total => 6 items dequeued.
-    - Run until time=10 to force partial completion.
-    - Verify leftover items, and confirm final stats in sim.stat for processes and the resource.
-    """
+class TestProducerConsumerThroughStore:
+    def test_multi_process_producer_consumer(self):
+        env = netsim.Environment()
+        store = netsim.Store(env)
+        produced = []
+        consumed = []
 
-    ctx = SimContext()
-    # stat_interval=None => final stats are collected automatically at the end
-    sim = Simulator(ctx, stat_interval=None)
+        def producer(env, name, items):
+            for item in items:
+                yield env.timeout(1)
+                yield store.put(f'{name}:{item}')
+                produced.append(f'{name}:{item}')
 
-    queue = QueueFIFO(ctx, capacity=None, name="SharedQueue")
+        def consumer(env, name, count):
+            for _ in range(count):
+                item = yield store.get()
+                consumed.append((name, item))
+                yield env.timeout(2)
 
-    def producer_coro(_ctx, pid):
-        """Each producer enqueues 5 items, one per time unit."""
-        for i in range(5):
-            yield ctx.active_process.timeout(1)
-            yield queue.put(f"producer{pid}_item_{i}")
+        env.process(producer(env, 'P1', [1, 2, 3]))
+        env.process(producer(env, 'P2', [4, 5, 6]))
+        env.process(consumer(env, 'C1', 3))
+        env.process(consumer(env, 'C2', 3))
+        env.run()
 
-    def consumer_coro(_ctx, cid):
-        """Each consumer dequeues 3 items, with a small timeout between gets."""
-        for _ in range(3):
-            yield ctx.active_process.timeout(0.5)
-            _ = yield queue.get()
+        assert len(produced) == 6
+        assert len(consumed) == 6
+        # All produced items should be consumed
+        produced_set = set(produced)
+        consumed_items = {item for _, item in consumed}
+        assert produced_set == consumed_items
 
-    # Create 2 producers
-    p_prod1 = Process(ctx, producer_coro(ctx, pid=1), name="Producer1")
-    p_prod2 = Process(ctx, producer_coro(ctx, pid=2), name="Producer2")
 
-    # Create 2 consumers
-    p_cons1 = Process(ctx, consumer_coro(ctx, cid=1), name="Consumer1")
-    p_cons2 = Process(ctx, consumer_coro(ctx, cid=2), name="Consumer2")
+class TestComplexSynchronization:
+    def test_allof_anyof_sync(self):
+        env = netsim.Environment()
+        log = []
 
-    # All processes are automatically registered in the context; run them
-    sim.run(until_time=10)
+        def task(env, name, duration):
+            yield env.timeout(duration)
+            log.append((name, env.now))
+            return name
 
-    # 10 items produced total; 6 items consumed => 4 items remain
-    assert len(queue) == 4
-    # Verify that the simulation time is exactly 10
-    assert ctx.now == 10
-    # Processes should be STOPPED (they yield only a finite number of events)
-    assert p_prod1.status == ProcessStatus.STOPPED
-    assert p_prod2.status == ProcessStatus.STOPPED
-    assert p_cons1.status == ProcessStatus.STOPPED
-    assert p_cons2.status == ProcessStatus.STOPPED
+        def coordinator(env):
+            t1 = env.process(task(env, 'fast', 2))
+            t2 = env.process(task(env, 'medium', 5))
+            t3 = env.process(task(env, 'slow', 10))
 
-    # ---- Check final aggregated statistics ----
-    # sim.stat is a SimStat that holds process_stat_samples and resource_stat_samples
-    sim_stat: SimStat = sim.stat
+            # Wait for any one to finish
+            yield t1 | t2 | t3
+            log.append(('any_done', env.now))
 
-    # 1) Check resource stats (for our queue) in the time interval (0,10)
-    assert (
-        queue.name in sim_stat.resource_stat_samples
-    ), "Queue stats not found in SimStat!"
-    intervals = list(sim_stat.resource_stat_samples[queue.name].keys())
-    assert (
-        len(intervals) == 1
-    ), "Expected exactly one interval for final stats collection."
-    (start_t, end_t) = intervals[0]
-    assert (start_t, end_t) == (0, 10)
+            # Wait for all to finish
+            yield t1 & t2 & t3
+            log.append(('all_done', env.now))
 
-    queue_stats = sim_stat.resource_stat_samples[queue.name][(0, 10)]
-    # At minimum, we expect 10 put requests and 6 get requests
-    assert queue_stats.total_put_requested_count == 10
-    assert queue_stats.total_put_processed_count == 10
-    assert queue_stats.total_get_requested_count == 6
-    assert queue_stats.total_get_processed_count == 6
+        env.process(coordinator(env))
+        env.run()
 
-    # 2) Check process stats. Each producer generated 5 Put events and 5 Timeout events, so total_event_gen_count=10
-    #    and each consumer generated 3 Get events and 3 Timeout events, so total_event_gen_count=6.
-    for proc in (p_prod1, p_prod2, p_cons1, p_cons2):
-        proc_name = proc.name
-        assert proc_name in sim_stat.process_stat_samples, f"{proc_name} stats missing!"
-        intervals = list(sim_stat.process_stat_samples[proc_name].keys())
-        # Should have exactly one final interval (0,10)
-        assert len(intervals) == 1
-        (start_t, end_t) = intervals[0]
-        assert (start_t, end_t) == (0, 10)
-        proc_stats = sim_stat.process_stat_samples[proc_name][(0, 10)]
+        assert ('any_done', 2) in log
+        assert ('all_done', 10) in log
 
-        if "Producer" in proc_name:
-            # Each producer should have generated 10 events
-            assert proc_stats.total_event_gen_count == 10
-        else:
-            # Each consumer should have generated 6 events
-            assert proc_stats.total_event_gen_count == 6
+
+class TestInterruptDuringResourceWait:
+    def test_interrupt_while_waiting_for_resource(self):
+        env = netsim.Environment()
+        res = netsim.Resource(env, capacity=1)
+        log = []
+
+        def holder(env):
+            req = res.request()
+            yield req
+            log.append(('holder_acquired', env.now))
+            yield env.timeout(100)
+            res.release(req)
+
+        def waiter(env):
+            req = res.request()
+            try:
+                yield req
+                log.append(('waiter_acquired', env.now))
+            except netsim.Interrupt as e:
+                log.append(('waiter_interrupted', env.now, e.cause))
+                req.cancel()
+
+        def interrupter(env, target):
+            yield env.timeout(5)
+            target.interrupt('abort')
+
+        env.process(holder(env))
+        w = env.process(waiter(env))
+        env.process(interrupter(env, w))
+        env.run(until=20)
+
+        assert ('holder_acquired', 0) in log
+        assert ('waiter_interrupted', 5, 'abort') in log
+        assert ('waiter_acquired', 5) not in log
+
+
+class TestProcessWaitingForProcess:
+    def test_yield_process_gets_return_value(self):
+        env = netsim.Environment()
+        results = []
+
+        def child1(env):
+            yield env.timeout(3)
+            return 'child1_done'
+
+        def child2(env):
+            yield env.timeout(5)
+            return 'child2_done'
+
+        def parent(env):
+            p1 = env.process(child1(env))
+            p2 = env.process(child2(env))
+
+            r1 = yield p1
+            results.append((r1, env.now))
+
+            r2 = yield p2
+            results.append((r2, env.now))
+
+        env.process(parent(env))
+        env.run()
+
+        assert results == [('child1_done', 3), ('child2_done', 5)]
+
+
+class TestPipelineProcessing:
+    def test_multi_stage_pipeline(self):
+        env = netsim.Environment()
+        stage1_out = netsim.Store(env)
+        stage2_out = netsim.Store(env)
+        final_results = []
+
+        def stage1(env):
+            for i in range(5):
+                yield env.timeout(1)
+                yield stage1_out.put(i * 10)
+
+        def stage2(env):
+            for _ in range(5):
+                item = yield stage1_out.get()
+                yield env.timeout(2)
+                yield stage2_out.put(item + 1)
+
+        def collector(env):
+            for _ in range(5):
+                item = yield stage2_out.get()
+                final_results.append(item)
+
+        env.process(stage1(env))
+        env.process(stage2(env))
+        env.process(collector(env))
+        env.run()
+
+        assert final_results == [1, 11, 21, 31, 41]
+
+
+class TestResourcePreemptionChain:
+    def test_preemption_chain(self):
+        env = netsim.Environment()
+        res = netsim.PreemptiveResource(env, capacity=1)
+        log = []
+
+        def user(env, name, priority, duration):
+            req = res.request(priority=priority)
+            try:
+                yield req
+                log.append((name, 'start', env.now))
+                yield env.timeout(duration)
+                log.append((name, 'finish', env.now))
+            except netsim.Interrupt:
+                log.append((name, 'preempted', env.now))
+            finally:
+                res.release(req)
+
+        # Low priority starts first
+        env.process(user(env, 'low', 10, 100))
+        # Medium arrives, preempts low
+        env.process(user(env, 'med', 5, 50))
+        # High arrives, preempts medium
+        env.process(user(env, 'high', 1, 5))
+
+        env.run()
+
+        assert ('low', 'preempted', 0) in log
+        assert ('med', 'preempted', 0) in log
+        assert ('high', 'start', 0) in log
+        assert ('high', 'finish', 5) in log

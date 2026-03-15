@@ -1,995 +1,709 @@
+"""Core discrete-event simulation primitives.
+
+Environment, Event, Timeout, Process, and condition types (AllOf, AnyOf).
+"""
+
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-import time
-from enum import IntEnum
-from copy import deepcopy
-from collections import deque
 from heapq import heappop, heappush
-from typing import (
-    Deque,
-    Generator,
-    Iterator,
-    List,
-    Union,
-    Optional,
-    Dict,
-    Callable,
-    Any,
-)
-import logging
-from netsim.common import (
-    EventID,
-    EventPriority,
-    ProcessID,
-    ProcessName,
-    ResourceID,
-    ResourceName,
-    SimTime,
-    TimeInterval,
-)
-from netsim.stat import ProcessStat, QueueStat, ResourceStat, SimStat
+from itertools import count
+from typing import Any, Callable, Generator, Iterable, Iterator
 
+from netsim.exceptions import EmptySchedule, Interrupt
 
-LOG_FMT = "%(levelname)s - %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FMT)
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+URGENT: int = 0
+"""Priority for interrupts and process initialization events."""
 
-class EventStatus(IntEnum):
-    """
-    A given Event can be in one of the following states:
+NORMAL: int = 1
+"""Default event priority."""
 
-    - CREATED: newly created event
-    - PLANNED: event's time is set (planned), but not yet scheduled
-    - SCHEDULED: event is placed in the event queue and can be triggered
-    - TRIGGERED: the event is triggered and will be processed
-    - PROCESSED: event happened and is removed from the queue
-    """
+Infinity: float = float('inf')
 
-    CREATED = 1
-    PLANNED = 2
-    SCHEDULED = 3
-    TRIGGERED = 4
-    PROCESSED = 5
+_PENDING: object = object()
+"""Sentinel for an event whose value has not yet been set."""
 
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
 
-class ProcessStatus(IntEnum):
-    """
-    A given Process can be in one of the following states:
+EventPriority = int
+SimTime = int | float
+EventCallback = Callable[['Event'], None]
+ProcessGenerator = Generator['Event', Any, Any]
 
-    - CREATED: newly created process
-    - RUNNING: process is running
-    - STOPPED: process ended and cannot resume
-    """
-
-    CREATED = 1
-    RUNNING = 2
-    STOPPED = 3
-
-
-class Process:
-    """
-    Represents a simulation process.
-
-    Attributes:
-        ctx: The simulation context.
-        proc_id: The unique ID for this process in the context.
-        name: Optional name of the process.
-        status: Current status of the process.
-        stat: Statistics object for the process.
-    """
-
-    def __init__(self, ctx: SimContext, coro: Coro, name: Optional[ProcessName] = None):
-        """
-        Initializes a new Process.
-
-        Args:
-            ctx: The simulation context.
-            coro: The coroutine that defines this process's behavior.
-            name: Optional name of the process.
-        """
-        self.ctx: SimContext = ctx
-        self.proc_id: ProcessID = ctx.get_next_process_id()
-        self.name: str = name if name else f"{type(self).__name__}_{self.proc_id}"
-        self._coro: Coro = coro
-        self._subscribers: List[Process] = [self]
-        self._timeout: Optional[EventID] = None
-        self.ctx.add_process(self)
-        self.status: ProcessStatus = ProcessStatus.CREATED
-        self.stat: ProcessStat = ProcessStat(ctx)
-        self.stat_callbacks: List[StatCallback] = []
-        self.tick_callbacks: List[TickCallback] = []
-
-    def __repr__(self) -> str:
-        return f"{self.name}(proc_id={self.proc_id}, coro={self._coro})"
-
-    def extend_name(self, extension: str, prepend: bool = False) -> None:
-        """
-        Extend the process name with the given string extension.
-
-        Args:
-            extension: String to be appended or prepended.
-            prepend: If True, prepend; otherwise, append.
-        """
-        if prepend:
-            self.name = extension + self.name
-        else:
-            self.name = self.name + extension
-
-    def in_timeout(self) -> bool:
-        """
-        Check if the process is currently waiting for a timeout event.
-
-        Returns:
-            True if waiting for a timeout event; False otherwise.
-        """
-        return self._timeout is not None
-
-    def is_stopped(self) -> bool:
-        """
-        Check if the process status is STOPPED.
-
-        Returns:
-            True if STOPPED; False otherwise.
-        """
-        return self.status == ProcessStatus.STOPPED
-
-    def _set_active(self) -> None:
-        """
-        Mark this process as the active one in the context.
-        """
-        self._timeout = None
-        self.ctx.set_active_process(self)
-
-    def start(self) -> None:
-        """
-        Start the process by advancing its coroutine until it yields an event or stops.
-        """
-        self.status = ProcessStatus.RUNNING
-        self._set_active()
-        try:
-            event: Optional[Event] = next(self._coro)
-        except StopIteration:
-            self.status = ProcessStatus.STOPPED
-            return  # No events, process stops immediately
-
-        if event is not None:
-            event.process = self
-            self.stat.event_generated(event)
-            for subscriber in self._subscribers:
-                event.subscribe(subscriber)
-            if event.is_planned and not event.is_scheduled:
-                self.ctx.schedule_event(event)
-
-    def resume(self, event: Event) -> None:
-        """
-        Resume the process coroutine, sending the event's value into it.
-
-        Args:
-            event: The event causing the process to resume.
-
-        Raises:
-            RuntimeError: If attempting to resume a non-running process or if the event
-                does not match the one this process is waiting for.
-        """
-        if self.status != ProcessStatus.RUNNING:
-            raise RuntimeError(f"Can't resume the process {self} that is not running!")
-
-        # Only the timeout event that originally put the process to sleep can wake it
-        if self._timeout is None or self._timeout == event.event_id:
-            self._set_active()
-            try:
-                next_event: Optional[Event] = self._coro.send(event.value)
-                if next_event is not None:
-                    next_event.process = self
-                    self.stat.event_generated(next_event)
-                    for subscriber in self._subscribers:
-                        next_event.subscribe(subscriber)
-                    if next_event.is_planned and not next_event.is_scheduled:
-                        self.ctx.schedule_event(next_event)
-            except StopIteration:
-                self.status = ProcessStatus.STOPPED
-        else:
-            raise RuntimeError(
-                f"Wrong {event} to resume the process in timeout {self}!"
-            )
-
-    def subscribe(self, process: Process) -> None:
-        """
-        Add a process to the subscribers of the current process.
-
-        Args:
-            process: Process to subscribe.
-        """
-        self._subscribers.append(process)
-
-    def timeout(self, delay: SimTime) -> Timeout:
-        """
-        Create a timeout event for this process to wait on.
-
-        Args:
-            delay: Time interval to wait.
-
-        Returns:
-            A Timeout event.
-        """
-        event = Timeout(self.ctx, delay=delay, process=self)
-        self._timeout = event.event_id
-        return event
-
-    def exec_stat_callbacks(self) -> None:
-        """
-        Execute any registered statistic callbacks.
-        """
-        for stat_callback in self.stat_callbacks:
-            stat_callback()
-
-    def add_stat_callback(self, callback: StatCallback) -> None:
-        """
-        Register a callback function to be called when statistic data is collected.
-        """
-        self.stat_callbacks.append(callback)
-
-    def exec_tick_callbacks(self) -> None:
-        """
-        Execute any registered tick callbacks.
-        """
-        for tick_callback in self.tick_callbacks:
-            tick_callback()
-
-    def add_tick_callback(self, callback: TickCallback) -> None:
-        """
-        Register a callback function to be called on simulation ticks.
-        """
-        self.tick_callbacks.append(callback)
-
-
-class StatCollector(Process):
-    """
-    A dedicated process to collect (and optionally reset) simulation statistics at intervals.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        stat_interval: SimTime,
-        stat_container: SimStat,
-        name: Optional[ProcessName] = None,
-    ):
-        """
-        Initialize a new StatCollector.
-
-        Args:
-            ctx: Simulation context.
-            stat_interval: Interval (time) between statistic collections.
-            stat_container: The SimStat object where stats are accumulated.
-            name: Optional name for this collector process.
-        """
-        self._stat_interval = stat_interval
-        self._stat_container = stat_container
-        super().__init__(ctx, self._collection_trigger(), name=name)
-        self.add_stat_callback(self.stat.advance_time)
-
-    def _collect(self, reset: bool) -> None:
-        """
-        Iterate over all processes and resources in the context and collect stats.
-
-        Args:
-            reset: If True, reset stats after collection; otherwise, accumulate.
-        """
-        self._stat_container.advance_time()
-
-        for process in self.ctx.get_process_iter():
-            process.stat.update_stat()
-            interval: TimeInterval = (
-                self._stat_container.prev_timestamp,
-                self._stat_container.cur_timestamp,
-            )
-            self._stat_container.process_stat_samples.setdefault(process.name, {})[
-                interval
-            ] = deepcopy(process.stat.cur_stat_frame)
-            if reset:
-                process.stat.reset_stat()
-
-        for resource in self.ctx.get_resource_iter():
-            resource.stat.update_stat()
-            interval: TimeInterval = (
-                self._stat_container.prev_timestamp,
-                self._stat_container.cur_timestamp,
-            )
-            self._stat_container.resource_stat_samples.setdefault(resource.name, {})[
-                interval
-            ] = deepcopy(resource.stat.cur_stat_frame)
-            if reset:
-                resource.stat.reset_stat()
-
-    def _collection_trigger(self) -> Generator[Optional[Event], None, None]:
-        """
-        Coroutine that yields events to trigger periodic collection.
-
-        Yields:
-            CollectStat events if a stat interval is set; otherwise stops immediately.
-        """
-        if self._stat_interval:
-            while True:
-                yield CollectStat(self.ctx, delay=self._stat_interval, process=self)
-                self._collect(reset=True)
-        else:
-            yield
-
-    def collect_now(self) -> None:
-        """
-        Manual statistic collection without resetting.
-        """
-        self._collect(reset=False)
-
-
-class Resource(ABC):
-    """
-    Abstract base class for a resource entity in the simulation.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        capacity: Optional[int] = None,
-        name: Optional[ResourceName] = None,
-    ):
-        """
-        Initialize a new Resource.
-
-        Args:
-            ctx: Simulation context.
-            capacity: Optional capacity limit of the resource.
-            name: Resource name.
-        """
-        self.ctx = ctx
-        self._capacity: Optional[int] = capacity
-        self.res_id: ResourceID = ctx.get_next_resource_id()
-        self.name: str = name if name else f"{type(self).__name__}_{self.res_id}"
-        self._put_queue: Deque[Put] = deque()
-        self._get_queue: Deque[Get] = deque()
-        self.stat = ResourceStat(ctx)
-        self.stat_callbacks: List[StatCallback] = []
-        self.tick_callbacks: List[TickCallback] = []
-        self.ctx.add_resource(self)
-
-    def __repr__(self) -> str:
-        return f"{self.name}(res_id={self.res_id}, capacity={self._capacity})"
-
-    def extend_name(self, extension: str, prepend: bool = False) -> None:
-        """
-        Extend the resource name with the given string extension.
-        """
-        if prepend:
-            self.name = extension + self.name
-        else:
-            self.name = self.name + extension
-
-    @abstractmethod
-    def _put_admission_check(self, event: Put) -> bool:
-        """
-        Define when a put event can be admitted (e.g., depends on capacity).
-        """
-        raise NotImplementedError("Subclasses must implement _put_admission_check.")
-
-    @abstractmethod
-    def _get_admission_check(self, event: Get) -> bool:
-        """
-        Define when a get event can be admitted (e.g., depends on availability).
-        """
-        raise NotImplementedError("Subclasses must implement _get_admission_check.")
-
-    def add_put(self, event: Put) -> None:
-        """
-        Register a new put request on this resource.
-        """
-        self._put_queue.append(event)
-        self._trigger_put(event)
-
-    def add_get(self, event: Get) -> None:
-        """
-        Register a new get request on this resource.
-        """
-        self._get_queue.append(event)
-        self._trigger_get(event)
-
-    def _trigger_get(self, event: Event) -> None:
-        """
-        Attempt to admit any pending get events that can be satisfied.
-        """
-        for _ in range(len(self._get_queue)):
-            get_event = self._get_queue.popleft()
-            if self._get_admission_check(get_event):
-                get_event.add_callback(self._trigger_put)
-                self.ctx.schedule_event(get_event, self.ctx.now)
-                get_event.trigger()
-                break
-            self._get_queue.append(get_event)
-
-    def _trigger_put(self, event: Event) -> None:
-        """
-        Attempt to admit any pending put events that can be satisfied.
-        """
-        for _ in range(len(self._put_queue)):
-            put_event = self._put_queue.popleft()
-            if self._put_admission_check(put_event):
-                put_event.add_callback(self._trigger_get)
-                self.ctx.schedule_event(put_event, self.ctx.now)
-                put_event.trigger()
-                break
-            self._put_queue.append(put_event)
-
-    def request(self) -> Get:
-        """
-        Syntactic sugar for resource get.
-        """
-        raise NotImplementedError("Subclasses must implement request.")
-
-    def release(self) -> Put:
-        """
-        Syntactic sugar for resource put.
-        """
-        raise NotImplementedError("Subclasses must implement release.")
-
-    @abstractmethod
-    def put(self, *args: Any, **kwargs: Any) -> Put:
-        """
-        Create and return a put event.
-        """
-        raise NotImplementedError("Subclasses must implement put.")
-
-    @abstractmethod
-    def get(self, *args: Any, **kwargs: Any) -> Get:
-        """
-        Create and return a get event.
-        """
-        raise NotImplementedError("Subclasses must implement get.")
-
-    @abstractmethod
-    def _put_callback(self, event: Put) -> None:
-        """
-        Callback executed when a put event is admitted.
-        """
-        raise NotImplementedError("Subclasses must implement _put_callback.")
-
-    @abstractmethod
-    def _get_callback(self, event: Get) -> None:
-        """
-        Callback executed when a get event is admitted.
-        """
-        raise NotImplementedError("Subclasses must implement _get_callback.")
-
-    def exec_stat_callbacks(self) -> None:
-        """
-        Execute registered callbacks related to statistics.
-        """
-        for stat_callback in self.stat_callbacks:
-            stat_callback()
-
-    def add_stat_callback(self, callback: StatCallback) -> None:
-        """
-        Register a callback function to be called when statistic data is collected.
-        """
-        self.stat_callbacks.append(callback)
-
-    def exec_tick_callbacks(self) -> None:
-        """
-        Execute registered callbacks on simulation tick.
-        """
-        for tick_callback in self.tick_callbacks:
-            tick_callback()
-
-    def add_tick_callback(self, callback: TickCallback) -> None:
-        """
-        Register a callback function to be called on simulation ticks.
-        """
-        self.tick_callbacks.append(callback)
-
-
-class QueueFIFO(Resource):
-    """
-    A FIFO queue resource, supporting put (enqueuing) and get (dequeuing) events.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        capacity: Optional[int] = None,
-        name: Optional[ResourceName] = None,
-    ):
-        super().__init__(ctx, capacity, name)
-        self._queue: Deque[Any] = deque()
-        self.stat = QueueStat(ctx)
-
-    def __len__(self) -> int:
-        return len(self._queue)
-
-    def _put_admission_check(self, event: PutQueueFIFO) -> bool:
-        """
-        Check if the queue can accept a new item.
-        """
-        if event.process.in_timeout():
-            return False
-        if self._capacity is None:
-            return True
-        return len(self._queue) < self._capacity
-
-    def _get_admission_check(self, event: GetQueueFIFO) -> bool:
-        """
-        Check if there is an item available to get.
-        """
-        if event.process.in_timeout():
-            return False
-        return bool(self._queue)
-
-    def put(self, item: Any) -> PutQueueFIFO:
-        """
-        Create and return a PutQueueFIFO event.
-        """
-        put_event = PutQueueFIFO(
-            self.ctx, self, process=self.ctx.active_process, item=item
-        )
-        self.stat.put_requested(put_event)
-        return put_event
-
-    def get(self) -> GetQueueFIFO:
-        """
-        Create and return a GetQueueFIFO event.
-        """
-        get_event = GetQueueFIFO(self.ctx, self, process=self.ctx.active_process)
-        self.stat.get_requested(get_event)
-        return get_event
-
-    def _put_callback(self, event: PutQueueFIFO) -> None:
-        """
-        Enqueue the item and update stats.
-        """
-        self._queue.append(event.item)
-        self.stat.put_processed(event)
-
-    def _get_callback(self, event: GetQueueFIFO) -> None:
-        """
-        Dequeue the item and update stats.
-        """
-        event.item = self._queue.popleft()
-        self.stat.get_processed(event)
+# ---------------------------------------------------------------------------
+# Event
+# ---------------------------------------------------------------------------
 
 
 class Event:
+    """An event that may happen at some point in time.
+
+    Pending until triggered via ``succeed()``, ``fail()``, or ``trigger()``.
+    Once triggered it is scheduled for processing by the environment.
+    After processing (all callbacks invoked), ``callbacks`` is set to ``None``.
     """
-    An event in the simulation.
-    """
 
-    def __init__(
-        self,
-        ctx: SimContext,
-        time: Optional[SimTime] = None,
-        func: Optional[Callable[[Event], Any]] = None,
-        priority: EventPriority = 10,
-        process: Optional[Process] = None,
-        auto_trigger: bool = False,
-    ):
-        self.ctx: SimContext = ctx
-        self._func: Optional[Callable[[Event], Any]] = func
-        self._callbacks: List[EventCallback] = []
-        self._value: Any = None
-        self.time: Optional[SimTime] = time
-        self.priority: EventPriority = priority
-        self.event_id: EventID = ctx.get_next_event_id()
-        self.process: Optional[Process] = process
-        self.status: EventStatus = (
-            EventStatus.CREATED if self.time is None else EventStatus.PLANNED
-        )
-        self._auto_trigger: bool = auto_trigger
+    __slots__ = ('env', 'callbacks', '_value', '_ok', '_defused')
 
-    def __hash__(self) -> EventID:
-        return self.event_id
-
-    def __eq__(self, other: Event) -> bool:
-        return self.event_id == other.event_id
-
-    def __lt__(self, other: Event) -> bool:
-        if self.time < other.time:
-            return True
-        if self.time == other.time:
-            if self.priority < other.priority:
-                return True
-            if self.priority == other.priority:
-                return self.event_id < other.event_id
-        return False
+    def __init__(self, env: Environment) -> None:
+        self.env = env
+        self.callbacks: list[EventCallback] | None = []
+        self._value: Any = _PENDING
+        self._ok: bool = False
+        self._defused: bool = False
 
     def __repr__(self) -> str:
-        type_name = type(self).__name__
-        process_name = self.process.name if self.process else None
-        return f"{type_name}(time={self.time}, event_id={self.event_id}, proc={process_name})"
+        return f'<{self._desc()} object at {id(self):#x}>'
+
+    def _desc(self) -> str:
+        return f'{type(self).__name__}()'
+
+    # -- State queries ------------------------------------------------------
+
+    @property
+    def triggered(self) -> bool:
+        """True once the event has been triggered."""
+        return self._value is not _PENDING
+
+    @property
+    def processed(self) -> bool:
+        """True once callbacks have been invoked."""
+        return self.callbacks is None
+
+    @property
+    def ok(self) -> bool:
+        """True if the event succeeded."""
+        return self._ok
+
+    @property
+    def defused(self) -> bool:
+        """True if a failed event's exception has been handled."""
+        return self._defused
+
+    @defused.setter
+    def defused(self, value: bool) -> None:
+        self._defused = value
 
     @property
     def value(self) -> Any:
+        """The event's value.
+
+        Raises:
+            AttributeError: If the event is still pending.
         """
-        The computed value of the event if func is set, otherwise the stored value.
-        """
-        if self._func is not None:
-            self._value = self._func(self)
+        if self._value is _PENDING:
+            raise AttributeError(f'Value of {self} is not yet available')
         return self._value
 
-    @property
-    def is_planned(self) -> bool:
-        return self.status >= EventStatus.PLANNED
+    # -- Triggering ---------------------------------------------------------
 
-    @property
-    def is_scheduled(self) -> bool:
-        return self.status >= EventStatus.SCHEDULED
+    def succeed(self, value: Any = None) -> Event:
+        """Mark as successful and schedule for processing.
 
-    @property
-    def is_triggered(self) -> bool:
-        return self.status >= EventStatus.TRIGGERED
+        Args:
+            value: The value to attach to this event.
 
-    def plan(self, time: SimTime) -> None:
-        if self.status < EventStatus.PLANNED:
-            if self.time is None:
-                if time is None:
-                    raise RuntimeError(f"Cannot plan {self}. No time set!")
-                self.time = time
-            self.status = EventStatus.PLANNED
-        else:
-            raise RuntimeError(f"Cannot plan {self}. It has already been planned!")
+        Raises:
+            RuntimeError: If already triggered.
+        """
+        if self._value is not _PENDING:
+            raise RuntimeError(f'{self} has already been triggered')
+        self._ok = True
+        self._value = value
+        self.env.schedule(self)
+        return self
 
-    def schedule(self, time: Optional[SimTime] = None) -> None:
-        if not self.is_planned:
-            self.plan(time)
-        elif self.status == EventStatus.SCHEDULED:
-            raise RuntimeError(f"{self} has already been scheduled!")
+    def fail(self, exception: BaseException) -> Event:
+        """Mark as failed and schedule for processing.
 
-        self.status = EventStatus.SCHEDULED
-        self.ctx.add_event(self)
-        if self._auto_trigger:
-            self.trigger()
+        Args:
+            exception: The exception to attach.
 
-    def trigger(self) -> None:
-        if self.status != EventStatus.SCHEDULED:
-            raise RuntimeError(f"{self} cannot be triggered as it wasn't scheduled!")
-        self.status = EventStatus.TRIGGERED
+        Raises:
+            TypeError: If *exception* is not a BaseException.
+            RuntimeError: If already triggered.
+        """
+        if self._value is not _PENDING:
+            raise RuntimeError(f'{self} has already been triggered')
+        if not isinstance(exception, BaseException):
+            raise TypeError(f'{exception} is not an exception.')
+        self._ok = False
+        self._value = exception
+        self.env.schedule(self)
+        return self
 
-    def subscribe(self, proc: Process) -> None:
-        self.add_callback(proc.resume)
+    def trigger(self, event: Event) -> None:
+        """Copy ok/value from *event* and schedule. Used for chaining.
 
-    def add_callback(self, callback: EventCallback) -> None:
-        self._callbacks.append(callback)
+        Args:
+            event: Source event to copy state from.
 
-    def run(self) -> None:
-        if self.status < EventStatus.TRIGGERED:
-            raise RuntimeError(f"Cannot run event {self}. It was not triggered!")
-        if self.process:
-            self.process.stat.event_exec(self)
+        Raises:
+            RuntimeError: If already triggered.
+        """
+        if self._value is not _PENDING:
+            raise RuntimeError(f'{self} has already been triggered')
+        self._ok = event._ok
+        self._value = event._value
+        self.env.schedule(self)
 
-        for callback in self._callbacks:
-            callback(self)
+    # -- Composition --------------------------------------------------------
 
-        self.status = EventStatus.PROCESSED
+    def __and__(self, other: Event) -> Condition:
+        return Condition(self.env, Condition.all_events, [self, other])
+
+    def __or__(self, other: Event) -> Condition:
+        return Condition(self.env, Condition.any_events, [self, other])
+
+
+# ---------------------------------------------------------------------------
+# Timeout
+# ---------------------------------------------------------------------------
 
 
 class Timeout(Event):
+    """Event that auto-triggers after *delay* time units.
+
+    Args:
+        env: The simulation environment.
+        delay: Non-negative delay before triggering.
+        value: Value attached to the event on trigger.
     """
-    An event that automatically triggers after a given delay from now.
-    """
+
+    __slots__ = ('_delay',)
 
     def __init__(
         self,
-        ctx: SimContext,
+        env: Environment,
         delay: SimTime,
-        priority: EventPriority = 11,
-        process: Optional[Process] = None,
-    ):
+        value: Any = None,
+    ) -> None:
+        if delay < 0:
+            raise ValueError(f'Negative delay {delay}')
+        # Inline Event.__init__ for performance.
+        self.env = env
+        self.callbacks: list[EventCallback] | None = []
+        self._value = value
         self._delay = delay
-        super().__init__(ctx, ctx.now + delay, priority=priority, process=process)
-        # Timeout retains auto_trigger
-        self._auto_trigger = True
+        self._ok = True
+        self._defused = False
+        env.schedule(self, NORMAL, delay)
 
-    def __repr__(self) -> str:
-        type_name = type(self).__name__
-        process_name = self.process.name if self.process else None
-        return (
-            f"{type_name}(time={self.time}, event_id={self.event_id}, "
-            f"proc={process_name}, delay={self._delay})"
-        )
+    def _desc(self) -> str:
+        return f'Timeout({self._delay})'
 
 
-class StopSim(Timeout):
+# ---------------------------------------------------------------------------
+# Process internals
+# ---------------------------------------------------------------------------
+
+
+class _Initialize(Event):
+    """Schedules the first ``_resume`` call for a Process."""
+
+    __slots__ = ()
+
+    def __init__(self, env: Environment, process: Process) -> None:
+        self.env = env
+        self.callbacks: list[EventCallback] | None = [process._resume]
+        self._value: Any = None
+        self._ok = True
+        self._defused = False
+        env.schedule(self, URGENT)
+
+
+class _Interruption(Event):
+    """Schedules an Interrupt exception on a process."""
+
+    __slots__ = ('process',)
+
+    def __init__(self, process: Process, cause: Any) -> None:
+        self.env = process.env
+        self.callbacks: list[EventCallback] | None = [self._interrupt]
+        self._value: Any = Interrupt(cause)
+        self._ok = False
+        self._defused = True
+
+        if process._value is not _PENDING:
+            raise RuntimeError(f'{process} has terminated and cannot be interrupted.')
+        if process is self.env.active_process:
+            raise RuntimeError('A process is not allowed to interrupt itself.')
+
+        self.process = process
+        self.env.schedule(self, URGENT)
+
+    def _interrupt(self, event: Event) -> None:
+        if self.process._value is not _PENDING:
+            return  # Process already dead (concurrent interrupts).
+        # Remove the process from the target event's callbacks.
+        target_cbs = self.process._target.callbacks
+        if target_cbs is not None:
+            target_cbs.remove(self.process._resume)
+        self.process._resume(self)
+
+
+# ---------------------------------------------------------------------------
+# Process
+# ---------------------------------------------------------------------------
+
+
+class Process(Event):
+    """Generator-based simulation process.
+
+    A process is an Event. It triggers when the generator terminates,
+    so ``yield process`` waits for completion and returns the generator's
+    return value.
+
+    Args:
+        env: The simulation environment.
+        generator: A generator yielding Event instances.
+        name: Optional name (defaults to generator function name).
     """
-    Event that stops the simulation after the specified delay.
-    """
+
+    __slots__ = ('_generator', '_target', '_name')
 
     def __init__(
         self,
-        ctx: SimContext,
-        delay: SimTime,
-        priority: EventPriority = 2,
-        process: Optional[Process] = None,
-    ):
-        super().__init__(ctx, delay, priority=priority, process=process)
-        self._auto_trigger = True
-        self._callbacks.append(self.ctx.stop)
+        env: Environment,
+        generator: ProcessGenerator,
+        name: str | None = None,
+    ) -> None:
+        if not hasattr(generator, 'throw'):
+            raise ValueError(f'{generator} is not a generator.')
 
-    def __repr__(self) -> str:
-        type_name = type(self).__name__
-        process_name = self.process.name if self.process else None
-        return (
-            f"{type_name}(time={self.time}, event_id={self.event_id}, "
-            f"proc={process_name}, delay={self._delay})"
-        )
+        self.env = env
+        self.callbacks: list[EventCallback] | None = []
+        self._value: Any = _PENDING
+        self._ok: bool = False
+        self._defused: bool = False
 
+        self._generator = generator
+        self._name = name
+        self._target: Event = _Initialize(env, self)
 
-class CollectStat(Timeout):
-    """
-    Periodic statistic collection event.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        delay: SimTime,
-        priority: EventPriority = 1,
-        process: Optional[Process] = None,
-    ):
-        super().__init__(ctx, delay, priority=priority, process=process)
-        self._auto_trigger = True
-
-    def __repr__(self) -> str:
-        type_name = type(self).__name__
-        process_name = self.process.name if self.process else None
-        return (
-            f"{type_name}(time={self.time}, event_id={self.event_id}, "
-            f"proc={process_name}, delay={self._delay})"
-        )
-
-
-class Put(Event):
-    """
-    Base put event that attempts to put data into a resource.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        resource: Resource,
-        process: Process,
-        priority: EventPriority = 10,
-    ):
-        """
-        Initialize a base Put event.
-        """
-        super().__init__(ctx, priority=priority, process=process)
-        self._resource = resource
-        self._callbacks.append(self._resource._put_callback)
-        self._resource.add_put(self)
-
-
-class PutQueueFIFO(Put):
-    """
-    Put event for QueueFIFO resources.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        resource: QueueFIFO,
-        process: Process,
-        item: Any,
-    ):
-        super().__init__(ctx, resource, process)
-        self.item: Any = item
-
-
-class Get(Event):
-    """
-    Base get event that attempts to retrieve data from a resource.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        resource: Resource,
-        process: Process,
-        priority: EventPriority = 9,
-    ):
-        super().__init__(ctx, priority=priority, process=process)
-        self._resource = resource
-        self._callbacks.append(self._resource._get_callback)
-        self._resource.add_get(self)
-
-
-class GetQueueFIFO(Get):
-    """
-    Get event for QueueFIFO resources.
-    """
-
-    def __init__(
-        self,
-        ctx: SimContext,
-        resource: QueueFIFO,
-        process: Process,
-    ):
-        super().__init__(ctx, resource, process)
-        self.item: Any = None
-        self._func = lambda event: event.item
-
-
-class SimContext:
-    """
-    Maintains the global state of the simulation, including event queue,
-    time, processes, and resources.
-    """
-
-    def __init__(self, starttime: SimTime = 0):
-        self.now: SimTime = starttime
-        self.active_process: Optional[Process] = None
-        self._event_queue: List[Event] = []
-        self._procs: Dict[ProcessID, Process] = {}
-        self._resources: Dict[ResourceID, Resource] = {}
-        self._stopped: bool = False
-        self._nextevent_id: EventID = 0
-        self._next_process_id: ProcessID = 1  # 0 is reserved for the simulator
-        self._next_resource_id: ResourceID = 0
-        self.stat = None
-
-    def __deepcopy__(self, memo: Dict[Any, Any]) -> None:
-        # Prevent copying references that must remain unique.
-        return None
-
-    def get_next_event_id(self) -> EventID:
-        nextevent_id = self._nextevent_id
-        self._nextevent_id += 1
-        return nextevent_id
-
-    def get_next_process_id(self) -> ProcessID:
-        next_process_id = self._next_process_id
-        self._next_process_id += 1
-        return next_process_id
-
-    def get_next_resource_id(self) -> ResourceID:
-        next_resource_id = self._next_resource_id
-        self._next_resource_id += 1
-        return next_resource_id
-
-    def is_stopped(self) -> bool:
-        return self._stopped
-
-    def get_event(self) -> Optional[Event]:
-        if self._event_queue:
-            return heappop(self._event_queue)
-        return None
-
-    def add_event(self, event: Event) -> None:
-        if not event.is_scheduled:
-            raise RuntimeError(f"Cannot add {event}. The event has not been scheduled.")
-        if event.time is not None and event.time < self.now:
-            raise RuntimeError(
-                f"Cannot add {event}. The event.time {event.time} is in the past. Now is {self.now}"
-            )
-        heappush(self._event_queue, event)
-
-    def schedule_event(self, event: Event, time: Optional[SimTime] = None) -> None:
-        if event.time is None:
-            if time is None:
-                raise RuntimeError(f"Cannot schedule {event}. No time set!")
-        else:
-            time = event.time
-        if time < self.now:
-            raise RuntimeError(
-                f"Cannot schedule {event} into the past ({time}). Now is {self.now}."
-            )
-        event.schedule(time)
-
-    def stop(self, event: Optional[Event] = None) -> None:
-        _ = event
-        self._stopped = True
-
-    def advance_simtime(self, newtime: SimTime) -> bool:
-        if newtime > self.now:
-            self.now = newtime
-            return True
-        return False
-
-    def create_process(self, coro: Coro, name: Optional[ProcessName]) -> Process:
-        return Process(ctx=self, coro=coro, name=name)
-
-    def add_process(self, process: Process) -> None:
-        self._procs[process.proc_id] = process
-
-    def add_resource(self, resource: Resource) -> None:
-        self._resources[resource.res_id] = resource
-
-    def get_process_iter(self) -> Iterator[Process]:
-        return iter(self._procs.values())
-
-    def get_resource_iter(self) -> Iterator[Resource]:
-        return iter(self._resources.values())
-
-    def set_active_process(self, process: Process) -> None:
-        self.active_process = process
-
-    def exec_all_stat_callbacks(self) -> None:
-        for proc in self._procs.values():
-            proc.exec_stat_callbacks()
-        for resource in self._resources.values():
-            resource.exec_stat_callbacks()
-
-    def exec_all_tick_callbacks(self) -> None:
-        for proc in self._procs.values():
-            proc.exec_tick_callbacks()
-        for resource in self._resources.values():
-            resource.exec_tick_callbacks()
-
-
-class Simulator:
-    """
-    Main driver that handles simulation execution and optional stat collection intervals.
-    """
-
-    def __init__(
-        self, ctx: Optional[SimContext] = None, stat_interval: Optional[float] = None
-    ):
-        self.ctx: SimContext = ctx if ctx is not None else SimContext()
-        self.event_counter = 0
-        self.stat: SimStat = SimStat(self.ctx)
-        self._stat_interval: Optional[float] = stat_interval
-        self.stat_collectors: List[StatCollector] = []
-        self.add_stat_collector(
-            StatCollector(
-                self.ctx, stat_interval=stat_interval, stat_container=self.stat
-            )
-        )
+    def _desc(self) -> str:
+        return f'Process({self.name})'
 
     @property
-    def avg_event_rate(self) -> float:
-        if self.ctx.now == 0:
-            return 0.0
-        return self.event_counter / self.ctx.now
+    def name(self) -> str:
+        """Process name. Explicit if provided, else the generator function name."""
+        if self._name is not None:
+            return self._name
+        if self._generator is not None:
+            return self._generator.__name__  # type: ignore[attr-defined]
+        return f'Process@{id(self):#x}'
+
+    @property
+    def target(self) -> Event:
+        """The event the process is currently waiting for."""
+        return self._target
+
+    @property
+    def is_alive(self) -> bool:
+        """True until the generator exits."""
+        return self._value is _PENDING
+
+    def interrupt(self, cause: Any = None) -> None:
+        """Interrupt this process optionally providing a *cause*.
+
+        Raises:
+            RuntimeError: If the process has terminated or interrupts itself.
+        """
+        _Interruption(self, cause)
+
+    def _resume(self, event: Event) -> None:
+        """Resume the generator with *event*'s value or exception.
+
+        Loops eagerly when the yielded event is already processed
+        (``callbacks is None``), sending its value back immediately.
+        """
+        self.env._active_proc = self
+
+        gen = self._generator
+        assert gen is not None  # Alive processes always have a generator.
+
+        while True:
+            # Advance the generator.
+            try:
+                if event._ok:
+                    event = gen.send(event._value)
+                else:
+                    event._defused = True
+                    event = gen.throw(_copy_exception(event._value))
+            except StopIteration as e:
+                # Generator returned — trigger this Process event.
+                event = None  # type: ignore[assignment]
+                self._ok = True
+                self._value = e.args[0] if e.args else None
+                self._generator = None  # type: ignore[assignment]
+                self.env.schedule(self)
+                break
+            except BaseException as e:
+                # Generator raised — fail this Process event.
+                event = None  # type: ignore[assignment]
+                self._ok = False
+                if e.__traceback__ is not None:
+                    e.__traceback__ = e.__traceback__.tb_next
+                self._value = e
+                self._generator = None  # type: ignore[assignment]
+                self.env.schedule(self)
+                break
+
+            # The generator yielded an event to wait on.
+            try:
+                if event.callbacks is not None:
+                    # Event not yet processed — register for callback.
+                    event.callbacks.append(self._resume)
+                    break
+                # Event already processed — loop back and send its value.
+            except AttributeError:
+                if hasattr(event, 'callbacks'):
+                    raise
+                descr = _describe_frame(gen.gi_frame)  # type: ignore[attr-defined]
+                raise RuntimeError(f'\n{descr}Invalid yield value "{event}"') from None
+
+        self._target = event  # type: ignore[assignment]
+        self.env._active_proc = None
+
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+
+class ConditionValue:
+    """Dict-like result of a Condition.
+
+    Access individual event values via ``result[event]``.
+    Supports ``keys()``, ``values()``, ``items()``, ``todict()``.
+    """
+
+    __slots__ = ('events',)
+
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+
+    def __getitem__(self, key: Event) -> Any:
+        if key not in self.events:
+            raise KeyError(str(key))
+        return key._value
+
+    def __contains__(self, key: Event) -> bool:
+        return key in self.events
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ConditionValue):
+            return self.events == other.events
+        if isinstance(other, dict):
+            return self.todict() == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f'<ConditionValue {self.todict()}>'
+
+    def __iter__(self) -> Iterator[Event]:
+        return self.keys()
+
+    def keys(self) -> Iterator[Event]:
+        return (e for e in self.events)
+
+    def values(self) -> Iterator[Any]:
+        return (e._value for e in self.events)
+
+    def items(self) -> Iterator[tuple[Event, Any]]:
+        return ((e, e._value) for e in self.events)
+
+    def todict(self) -> dict[Event, Any]:
+        return {e: e._value for e in self.events}
+
+
+class Condition(Event):
+    """Composite event that triggers when ``evaluate(events, count)`` is True.
+
+    Value is a ConditionValue of events that triggered before the condition
+    was processed. Fails immediately if any sub-event fails.
+
+    Args:
+        env: The simulation environment.
+        evaluate: Function ``(events, count) -> bool``.
+        events: Sub-events to monitor.
+    """
+
+    __slots__ = ('_evaluate', '_events', '_count')
+
+    def __init__(
+        self,
+        env: Environment,
+        evaluate: Callable[[tuple[Event, ...], int], bool],
+        events: Iterable[Event],
+    ) -> None:
+        super().__init__(env)
+        self._evaluate = evaluate
+        self._events = tuple(events)
+        self._count = 0
+
+        if not self._events:
+            self.succeed(ConditionValue())
+            return
+
+        for event in self._events:
+            if self.env != event.env:
+                raise ValueError(
+                    'It is not allowed to mix events from different environments'
+                )
+
+        for event in self._events:
+            if event.callbacks is None:
+                self._check(event)
+            else:
+                event.callbacks.append(self._check)
+
+        assert isinstance(self.callbacks, list)
+        self.callbacks.append(self._build_value)
+
+    def _check(self, event: Event) -> None:
+        if self._value is not _PENDING:
+            return
+        self._count += 1
+        if not event._ok:
+            event._defused = True
+            self.fail(event._value)
+        elif self._evaluate(self._events, self._count):
+            self.succeed()
+
+    def _build_value(self, event: Event) -> None:
+        self._remove_check_callbacks()
+        if event._ok:
+            self._value = ConditionValue()
+            self._populate_value(self._value)
+
+    def _populate_value(self, value: ConditionValue) -> None:
+        for event in self._events:
+            if isinstance(event, Condition):
+                if event.triggered:
+                    event._populate_value(value)
+            elif event.callbacks is None:
+                value.events.append(event)
+
+    def _remove_check_callbacks(self) -> None:
+        for event in self._events:
+            if event.callbacks and self._check in event.callbacks:
+                event.callbacks.remove(self._check)
+            if isinstance(event, Condition):
+                event._remove_check_callbacks()
+
+    @staticmethod
+    def all_events(events: tuple[Event, ...], count: int) -> bool:
+        return len(events) == count
+
+    @staticmethod
+    def any_events(events: tuple[Event, ...], count: int) -> bool:
+        return count > 0 or len(events) == 0
+
+
+class AllOf(Condition):
+    """Triggered when all *events* have been triggered."""
+
+    def __init__(self, env: Environment, events: Iterable[Event]) -> None:
+        super().__init__(env, Condition.all_events, events)
+
+
+class AnyOf(Condition):
+    """Triggered when any of *events* has been triggered."""
+
+    def __init__(self, env: Environment, events: Iterable[Event]) -> None:
+        super().__init__(env, Condition.any_events, events)
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+
+class StopSimulation(Exception):
+    """Raised internally by the *until* callback to stop ``Environment.run()``."""
+
+    @classmethod
+    def callback(cls, event: Event) -> None:
+        if event.ok:
+            raise cls(event.value)
+        raise event._value
+
+
+class Environment:
+    """Simulation clock and event scheduler.
+
+    Events are stored as ``(time, priority, eid, event)`` tuples in a
+    heap for O(log n) scheduling.
+    """
+
+    __slots__ = ('_now', '_queue', '_eid', '_active_proc')
+
+    def __init__(self, initial_time: SimTime = 0) -> None:
+        self._now: SimTime = initial_time
+        self._queue: list[tuple[SimTime, EventPriority, int, Event]] = []
+        self._eid = count()
+        self._active_proc: Process | None = None
 
     @property
     def now(self) -> SimTime:
-        return self.ctx.now
+        """Current simulation time."""
+        return self._now
 
-    def add_stat_collector(self, stat_collector: StatCollector) -> None:
-        self.stat_collectors.append(stat_collector)
+    @property
+    def active_process(self) -> Process | None:
+        """The currently active process, or ``None``."""
+        return self._active_proc
 
-    def run(self, until_time: Optional[SimTime] = None) -> None:
-        if until_time is not None:
-            self.ctx.schedule_event(StopSim(self.ctx, delay=until_time))
-        self._run()
+    # -- Factory methods ----------------------------------------------------
 
-    def _run(self) -> None:
-        started_at = time.time()
+    def process(
+        self,
+        generator: ProcessGenerator,
+        name: str | None = None,
+    ) -> Process:
+        """Create and return a new Process."""
+        return Process(self, generator, name=name)
 
-        # Start all processes
-        for proc in self.ctx.get_process_iter():
-            proc.start()
+    def timeout(
+        self,
+        delay: SimTime = 0,
+        value: Any = None,
+    ) -> Timeout:
+        """Return a Timeout that triggers after *delay*."""
+        return Timeout(self, delay, value)
 
-        # Main event loop
-        while (event := self.ctx.get_event()) and not self.ctx.is_stopped():
-            if self.ctx.advance_simtime(event.time):
-                self.ctx.exec_all_stat_callbacks()
-                self.ctx.exec_all_tick_callbacks()
-            if event.is_triggered:
-                event.run()
-                self.event_counter += 1
+    def event(self) -> Event:
+        """Return a new pending Event."""
+        return Event(self)
 
-        # If no stat interval was set, do one final collection
-        if not self._stat_interval:
-            for stat_collector in self.stat_collectors:
-                stat_collector.collect_now()
+    def all_of(self, events: Iterable[Event]) -> AllOf:
+        """Return an AllOf condition for *events*."""
+        return AllOf(self, events)
 
-        logger.info(
-            "Simulation ended at %s, it took %s wall clock seconds. Executed %s events.",
-            self.ctx.now,
-            time.time() - started_at,
-            self.event_counter,
+    def any_of(self, events: Iterable[Event]) -> AnyOf:
+        """Return an AnyOf condition for *events*."""
+        return AnyOf(self, events)
+
+    # -- Scheduling ---------------------------------------------------------
+
+    def schedule(
+        self,
+        event: Event,
+        priority: EventPriority = NORMAL,
+        delay: SimTime = 0,
+    ) -> None:
+        """Schedule *event* at ``now + delay`` with *priority*."""
+        heappush(
+            self._queue,
+            (self._now + delay, priority, next(self._eid), event),
         )
 
+    def peek(self) -> SimTime:
+        """Time of the next scheduled event, or ``Infinity``."""
+        try:
+            return self._queue[0][0]
+        except IndexError:
+            return Infinity
 
-StatCallback = Callable[[], None]
-TickCallback = Callable[[], None]
-EventCallback = Callable[[Event], None]
-Coro = Generator[Optional[Event], Any, Optional[Event]]
+    def step(self) -> None:
+        """Process the next event.
+
+        Raises:
+            EmptySchedule: If no events remain.
+        """
+        try:
+            self._now, _, _, event = heappop(self._queue)
+        except IndexError:
+            raise EmptySchedule from None
+
+        callbacks, event.callbacks = event.callbacks, None  # type: ignore[assignment]
+        for callback in callbacks:  # type: ignore[union-attr]
+            callback(event)
+
+        if not event._ok and not event._defused:
+            raise _copy_exception(event._value)
+
+    def run(self, until: SimTime | Event | None = None) -> Any:
+        """Run the simulation.
+
+        Args:
+            until: Stop condition. ``None`` runs until no events remain.
+                A number runs until simulation time reaches that value.
+                An Event runs until that event is processed.
+
+        Returns:
+            The *until* event's value, or None.
+        """
+        if until is not None:
+            if not isinstance(until, Event):
+                at: SimTime = until
+                if at <= self.now:
+                    raise ValueError(f'until ({at}) must be > current simulation time')
+                until = Event(self)
+                until._ok = True
+                until._value = None
+                self.schedule(until, URGENT, at - self.now)
+            elif until.callbacks is None:
+                return until.value
+
+            assert until.callbacks is not None
+            until.callbacks.append(StopSimulation.callback)
+
+        try:
+            while True:
+                self.step()
+        except StopSimulation as exc:
+            return exc.args[0]
+        except EmptySchedule:
+            if until is not None:
+                assert not until.triggered
+                raise RuntimeError(
+                    f'No scheduled events left but "until" event was not '
+                    f'triggered: {until}'
+                ) from None
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _copy_exception(exc: BaseException) -> BaseException:
+    """Create a copy of *exc* with a fresh traceback.
+
+    Falls back to the original exception if re-construction fails
+    (e.g. custom ``__init__`` signature).
+    """
+    try:
+        copy = type(exc)(*exc.args)
+    except Exception:
+        copy = exc  # Can't reconstruct; reuse original.
+    copy.__cause__ = exc
+    return copy
+
+
+def _describe_frame(frame: Any) -> str:
+    """Format source location for error messages."""
+    if frame is None:
+        return ''
+    filename = frame.f_code.co_filename
+    name = frame.f_code.co_name
+    lineno = frame.f_lineno
+    try:
+        with open(filename) as f:
+            for no, line in enumerate(f):
+                if no + 1 == lineno:
+                    return (
+                        f'  File "{filename}", line {lineno}, in {name}\n'
+                        f'    {line.strip()}\n'
+                    )
+    except OSError:
+        pass
+    return f'  File "{filename}", line {lineno}, in {name}\n'

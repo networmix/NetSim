@@ -1,39 +1,30 @@
-# MacOS stuff
+# OS
 .DS_Store
 
-# VSCode stuff
+# Editors
 **/.vscode
+.idea/
 
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+*.egg
+dist/
+build/
 
-# Distribution / packaging / testing
-.Python
-bin/
+# Virtual environments
 env/
 venv/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-pyvenv.cfg
-.pytest_cache
-.coverage
 
-# NetSim artifacts
+# Testing / coverage
+.pytest_cache/
+.coverage
+.benchmarks/
+htmlcov/
+
+# Artifacts
 *.jsonl
 *.png
 *.csv
-.ipynb_checkpoints

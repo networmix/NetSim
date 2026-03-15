@@ -1,151 +1,217 @@
+"""Tests for Process lifecycle, yielding, and properties."""
+
 import pytest
-from netsim.core import (
-    SimContext,
-    Process,
-    Timeout,
-    Event,
-    ProcessStatus,
-)
+
+import netsim
 
 
-def test_process_basic_lifecycle():
-    """
-    Ensure a process transitions from CREATED to RUNNING when started,
-    using a simple coroutine with multiple yields.
-    """
-    ctx = SimContext()
+class TestProcessStartAndYield:
+    def test_process_starts_immediately(self):
+        env = netsim.Environment()
+        started = []
 
-    def coro(_ctx):
-        yield Event(ctx, time=1)
-        yield Event(ctx, time=2)
+        def proc(env):
+            started.append(True)
+            yield env.timeout(0)
 
-    proc = Process(ctx, coro(ctx))
-    assert proc.status == ProcessStatus.CREATED
-    proc.start()
-    assert proc.status == ProcessStatus.RUNNING
+        env.process(proc(env))
+        env.run()
+        assert started == [True]
 
+    def test_process_yields_timeout(self):
+        env = netsim.Environment()
 
-def test_process_resume_incorrect_timeout():
-    """Verify that resuming a process with a mismatched timeout event raises RuntimeError."""
-    ctx = SimContext()
+        def proc(env):
+            yield env.timeout(5)
+            yield env.timeout(3)
 
-    def coro(_ctx):
-        yield ctx.active_process.timeout(5)
-        return
-
-    proc = Process(ctx, coro(ctx))
-    proc.start()
-
-    # Create a different event that does not match proc's timeout
-    other_event = Event(ctx, time=5)
-    with pytest.raises(RuntimeError, match="Wrong .* to resume the process in timeout"):
-        proc.resume(other_event)
+        env.process(proc(env))
+        env.run()
+        assert env.now == 8
 
 
-def test_process_subscribe():
-    """
-    Check that multiple processes can subscribe to a single process's generated event.
-    The second process should resume once and then stop.
-    """
-    ctx = SimContext()
+class TestProcessResumeWithValue:
+    def test_yield_returns_event_value(self):
+        env = netsim.Environment()
+        received = []
 
-    def p1_coro(_ctx):
-        evt = Event(ctx, time=0)
-        yield evt  # after this yields, p1 stops
+        def proc(env):
+            val = yield env.timeout(1, value=42)
+            received.append(val)
 
-    def p2_coro(_ctx):
-        # We'll yield once; on the second resume, we actually stop
-        dummy_event = yield
-        return dummy_event
-
-    p1 = Process(ctx, p1_coro(ctx))
-    p2 = Process(ctx, p2_coro(ctx))
-
-    p1.subscribe(p2)
-    p1.start()
-    p2.start()
-
-    evt = ctx.get_event()  # event from p1
-    evt.trigger()
-    evt.run()
-
-    # By now, p2 has resumed once and should be STOPPED
-    assert p2.status == ProcessStatus.STOPPED
+        env.process(proc(env))
+        env.run()
+        assert received == [42]
 
 
-def test_process_with_no_events():
-    """A process that yields no events stops immediately upon start()."""
-    ctx = SimContext()
+class TestProcessReturn:
+    def test_return_value_via_stop_iteration(self):
+        env = netsim.Environment()
 
-    def p_coro(_ctx):
-        return
-        yield  # never reached
+        def child(env):
+            yield env.timeout(1)
+            return 'done'
 
-    proc = Process(ctx, p_coro(ctx))
-    proc.start()
-    assert proc.is_stopped()
+        def parent(env):
+            result = yield env.process(child(env))
+            assert result == 'done'
+
+        env.process(parent(env))
+        env.run()
+
+    def test_process_is_event_yield_gets_return(self):
+        """Process IS Event: yielding a process from another gets the return value."""
+        env = netsim.Environment()
+        results = []
+
+        def worker(env):
+            yield env.timeout(2)
+            return 100
+
+        def boss(env):
+            val = yield env.process(worker(env))
+            results.append(val)
+
+        env.process(boss(env))
+        env.run()
+        assert results == [100]
+        assert env.now == 2
 
 
-def test_timeout_resume_mechanic():
-    """
-    Check that a process yielding a timeout can only be resumed by that specific timeout event.
-    """
-    ctx = SimContext()
+class TestProcessExceptionPropagation:
+    def test_generator_exception_propagates(self):
+        env = netsim.Environment()
 
-    def p_coro(_ctx):
-        yield ctx.active_process.timeout(3)
+        def bad_proc(env):
+            yield env.timeout(1)
+            raise RuntimeError('process error')
 
-    proc = Process(ctx, p_coro(ctx))
-    proc.start()
-
-    e = ctx.get_event()
-    assert isinstance(e, Timeout)
-    assert e.process is proc
-
-    other_evt = Event(ctx, time=3)
-    with pytest.raises(RuntimeError, match="Wrong .* to resume"):
-        proc.resume(other_evt)
+        env.process(bad_proc(env))
+        with pytest.raises(RuntimeError, match='process error'):
+            env.run()
 
 
-def test_subscriber_mechanic_multiple():
-    """
-    Multiple processes subscribed to a single process's events
-    should each receive resume calls.
-    """
-    ctx = SimContext()
+class TestProcessName:
+    def test_explicit_name(self):
+        env = netsim.Environment()
 
-    def main_coro(_ctx):
-        for i in range(3):
-            yield Event(ctx, time=ctx.now, auto_trigger=True, func=lambda e, i=i: i)
+        def my_gen(env):
+            yield env.timeout(0)
 
-    def side_coro(_ctx, collector):
-        while True:
-            val = yield
-            collector.append(val)
+        p = env.process(my_gen(env), name='custom')
+        assert p.name == 'custom'
 
-    collector1 = []
-    collector2 = []
+    def test_name_from_generator(self):
+        env = netsim.Environment()
 
-    p_main = Process(ctx, main_coro(ctx), name="main")
-    p_side1 = Process(ctx, side_coro(ctx, collector1), name="side1")
-    p_side2 = Process(ctx, side_coro(ctx, collector2), name="side2")
+        def my_generator(env):
+            yield env.timeout(0)
 
-    # Subscribe side processes to main, so they get resumed by main's events
-    p_main.subscribe(p_side1)
-    p_main.subscribe(p_side2)
+        p = env.process(my_generator(env))
+        assert p.name == 'my_generator'
 
-    # Start all
-    p_main.start()
-    p_side1.start()
-    p_side2.start()
 
-    # Process the queued events
-    while True:
-        evt = ctx.get_event()
-        if not evt:
-            break
-        evt.run()
+class TestProcessIsAlive:
+    def test_is_alive_before_completion(self):
+        env = netsim.Environment()
 
-    # Each side process should have collected 3 values
-    assert len(collector1) == 3
-    assert len(collector2) == 3
+        def proc(env):
+            yield env.timeout(10)
+
+        p = env.process(proc(env))
+        assert p.is_alive
+
+    def test_is_alive_after_completion(self):
+        env = netsim.Environment()
+
+        def proc(env):
+            yield env.timeout(1)
+
+        p = env.process(proc(env))
+        env.run()
+        assert not p.is_alive
+
+
+class TestProcessTarget:
+    def test_target_property(self):
+        env = netsim.Environment()
+
+        def proc(env):
+            yield env.timeout(5)
+
+        p = env.process(proc(env))
+        # After init, target should be an event (the timeout).
+        # We need to step past _Initialize first.
+        env.step()
+        assert p.target is not None
+
+
+class TestProcessNotAGenerator:
+    def test_non_generator_raises(self):
+        env = netsim.Environment()
+        with pytest.raises(ValueError, match='is not a generator'):
+            env.process('not a generator')
+
+
+class TestProcessYieldsAlreadyProcessedEvent:
+    def test_process_yields_already_processed_event(self):
+        """A process that yields an already-processed event should immediately
+        receive the value without blocking."""
+        env = netsim.Environment()
+        results = []
+
+        def proc(env):
+            # Create a timeout and let it be processed
+            t = env.timeout(0, value='immediate')
+            yield env.timeout(1)  # wait so t is processed
+            # Now t is already processed (callbacks is None)
+            val = yield t
+            results.append(val)
+
+        env.process(proc(env))
+        env.run()
+        assert results == ['immediate']
+
+
+class TestProcessYieldsNonEventRaisesRuntimeError:
+    def test_process_yields_non_event_raises_runtime_error(self):
+        """A process that yields a string (not an Event) should raise RuntimeError."""
+        env = netsim.Environment()
+
+        def bad_proc(env):
+            yield 'not an event'
+
+        env.process(bad_proc(env))
+        with pytest.raises(RuntimeError, match='Invalid yield value'):
+            env.run()
+
+
+class TestProcessGeneratorClearedAfterTermination:
+    def test_process_generator_cleared_after_termination(self):
+        """After a process terminates, process._generator should be None."""
+        env = netsim.Environment()
+
+        def proc(env):
+            yield env.timeout(1)
+
+        p = env.process(proc(env))
+        env.run()
+        assert not p.is_alive
+        assert p._generator is None
+
+
+class TestProcessNameAfterGeneratorCleared:
+    def test_process_name_after_generator_cleared(self):
+        """After termination with no explicit name, process.name should not crash."""
+        env = netsim.Environment()
+
+        def my_proc(env):
+            yield env.timeout(1)
+
+        p = env.process(my_proc(env))
+        env.run()
+        assert p._generator is None
+        # Should return fallback string, not crash
+        name = p.name
+        assert isinstance(name, str)
+        assert len(name) > 0

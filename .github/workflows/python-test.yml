@@ -1,27 +1,25 @@
-# Run unit tests and check test coverage
-name: Python-test
+name: CI
 
 on: [push, pull_request]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v4          # latest stable
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install project (dev extras)
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: Run tests with coverage
+          python -m pip install -U pip
+          python -m pip install -e '.[dev]'
+      - name: CI checks (lint + tests)
         run: |
-          pytest --cov=netsim --cov-fail-under=85
+          make check-ci
