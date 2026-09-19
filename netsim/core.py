@@ -23,9 +23,6 @@ NORMAL: int = 1
 
 Infinity: float = float('inf')
 
-_PENDING: object = object()
-"""Sentinel for an event whose value has not yet been set."""
-
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
@@ -46,14 +43,20 @@ class Event:
     Pending until triggered via ``succeed()``, ``fail()``, or ``trigger()``.
     Once triggered it is scheduled for processing by the environment.
     After processing (all callbacks invoked), ``callbacks`` is set to ``None``.
+
+    The triggered state is an explicit flag rather than a module-level
+    sentinel value: every event touches that state, and a shared sentinel
+    object serializes threads through its reference count on free-threaded
+    builds.
     """
 
-    __slots__ = ('env', 'callbacks', '_value', '_ok', '_defused')
+    __slots__ = ('env', 'callbacks', '_triggered', '_value', '_ok', '_defused')
 
     def __init__(self, env: Environment) -> None:
         self.env = env
         self.callbacks: list[EventCallback] | None = []
-        self._value: Any = _PENDING
+        self._triggered: bool = False
+        self._value: Any = None
         self._ok: bool = False
         self._defused: bool = False
 
@@ -68,7 +71,7 @@ class Event:
     @property
     def triggered(self) -> bool:
         """True once the event has been triggered."""
-        return self._value is not _PENDING
+        return self._triggered
 
     @property
     def processed(self) -> bool:
@@ -96,7 +99,7 @@ class Event:
         Raises:
             AttributeError: If the event is still pending.
         """
-        if self._value is _PENDING:
+        if not self._triggered:
             raise AttributeError(f'Value of {self} is not yet available')
         return self._value
 
@@ -111,8 +114,9 @@ class Event:
         Raises:
             RuntimeError: If already triggered.
         """
-        if self._value is not _PENDING:
+        if self._triggered:
             raise RuntimeError(f'{self} has already been triggered')
+        self._triggered = True
         self._ok = True
         self._value = value
         self.env.schedule(self)
@@ -128,10 +132,11 @@ class Event:
             TypeError: If *exception* is not a BaseException.
             RuntimeError: If already triggered.
         """
-        if self._value is not _PENDING:
+        if self._triggered:
             raise RuntimeError(f'{self} has already been triggered')
         if not isinstance(exception, BaseException):
             raise TypeError(f'{exception} is not an exception.')
+        self._triggered = True
         self._ok = False
         self._value = exception
         self.env.schedule(self)
@@ -146,10 +151,11 @@ class Event:
         Raises:
             RuntimeError: If already triggered, or if *event* is not.
         """
-        if self._value is not _PENDING:
+        if self._triggered:
             raise RuntimeError(f'{self} has already been triggered')
-        if event._value is _PENDING:
+        if not event._triggered:
             raise RuntimeError(f'{event} has not been triggered yet')
+        self._triggered = True
         self._ok = event._ok
         self._value = event._value
         self.env.schedule(self)
@@ -192,6 +198,7 @@ class Timeout(Event):
         # that every slot is set.
         self.env = env
         self.callbacks: list[EventCallback] | None = []
+        self._triggered = True
         self._value = value
         self._delay = delay
         self._ok = True
@@ -215,6 +222,7 @@ class _Initialize(Event):
     def __init__(self, env: Environment, process: Process) -> None:
         self.env = env
         self.callbacks: list[EventCallback] | None = [process._resume]
+        self._triggered = True
         self._value: Any = None
         self._ok = True
         self._defused = False
@@ -229,11 +237,12 @@ class _Interruption(Event):
     def __init__(self, process: Process, cause: Any) -> None:
         self.env = process.env
         self.callbacks: list[EventCallback] | None = [self._interrupt]
+        self._triggered = True
         self._value: Any = Interrupt(cause)
         self._ok = False
         self._defused = True
 
-        if process._value is not _PENDING:
+        if process._triggered:
             raise RuntimeError(f'{process} has terminated and cannot be interrupted.')
         if process is self.env.active_process:
             raise RuntimeError('A process is not allowed to interrupt itself.')
@@ -242,7 +251,7 @@ class _Interruption(Event):
         self.env.schedule(self, URGENT)
 
     def _interrupt(self, event: Event) -> None:
-        if self.process._value is not _PENDING:
+        if self.process._triggered:
             return  # Process already dead (concurrent interrupts).
         # Remove the process from the target event's callbacks.
         target_cbs = self.process._target.callbacks
@@ -282,7 +291,8 @@ class Process(Event):
 
         self.env = env
         self.callbacks: list[EventCallback] | None = []
-        self._value: Any = _PENDING
+        self._triggered: bool = False
+        self._value: Any = None
         self._ok: bool = False
         self._defused: bool = False
 
@@ -309,7 +319,7 @@ class Process(Event):
     @property
     def is_alive(self) -> bool:
         """True until the generator exits."""
-        return self._value is _PENDING
+        return not self._triggered
 
     def interrupt(self, cause: Any = None) -> None:
         """Interrupt this process optionally providing a *cause*.
@@ -341,6 +351,7 @@ class Process(Event):
             except StopIteration as e:
                 # Generator returned — trigger this Process event.
                 event = None  # type: ignore[assignment]
+                self._triggered = True
                 self._ok = True
                 self._value = e.args[0] if e.args else None
                 self._generator = None  # type: ignore[assignment]
@@ -349,6 +360,7 @@ class Process(Event):
             except BaseException as e:
                 # Generator raised — fail this Process event.
                 event = None  # type: ignore[assignment]
+                self._triggered = True
                 self._ok = False
                 if e.__traceback__ is not None:
                     e.__traceback__ = e.__traceback__.tb_next
@@ -473,7 +485,7 @@ class Condition(Event):
         self.callbacks.append(self._build_value)
 
     def _check(self, event: Event) -> None:
-        if self._value is not _PENDING:
+        if self._triggered:
             return
         self._count += 1
         if not event._ok:
@@ -662,8 +674,8 @@ class Environment:
                         f'until ({at!r}) must be > current simulation time'
                     )
                 until = Event(self)
+                until._triggered = True
                 until._ok = True
-                until._value = None
                 self.schedule(until, URGENT, at - self._now)
             elif until.env is not self:
                 raise ValueError(f'{until} belongs to a different environment')
