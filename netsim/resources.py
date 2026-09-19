@@ -6,9 +6,27 @@ from __future__ import annotations
 import bisect
 from collections import deque
 from heapq import heappop, heappush
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple, Protocol
 
 from netsim.core import Environment, Event, Process, SimTime
+
+
+class RequestQueue(Protocol):
+    """Container protocol for pending put/get requests.
+
+    Satisfied by ``collections.deque`` (FIFO) and ``SortedQueue``
+    (priority order). The trigger loop scans by index and removes the head
+    with ``popleft()``; ``del q[i]`` is used only for non-head removal.
+    """
+
+    def append(self, item: Any, /) -> None: ...
+    def remove(self, item: Any, /) -> None: ...
+    def popleft(self) -> Any: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[Any]: ...
+    def __getitem__(self, index: int, /) -> Any: ...
+    def __delitem__(self, index: int, /) -> None: ...
+
 
 # ---------------------------------------------------------------------------
 # Base Put / Get events
@@ -77,18 +95,25 @@ class BaseResource:
 
     Subclasses implement ``_do_put()`` and ``_do_get()`` to define
     when put/get requests are satisfied.
+
+    ``_do_put()`` / ``_do_get()`` return a truthy value to let the trigger
+    loop continue with the next queued request, or a falsy value to stop
+    after the current one (whether or not it was satisfied).
+
+    Resources carry a ``__dict__`` so users can attach attributes to them;
+    only the Event types use ``__slots__``.
     """
 
-    __slots__ = ('_env', '_capacity', 'put_queue', 'get_queue')
-
-    PutQueue: type = list
-    GetQueue: type = list
+    PutQueue: Callable[[], RequestQueue] = deque
+    """Factory for the pending-put queue (see ``RequestQueue``)."""
+    GetQueue: Callable[[], RequestQueue] = deque
+    """Factory for the pending-get queue (see ``RequestQueue``)."""
 
     def __init__(self, env: Environment, capacity: float | int) -> None:
         self._env = env
         self._capacity = capacity
-        self.put_queue: list = self.PutQueue()
-        self.get_queue: list = self.GetQueue()
+        self.put_queue: RequestQueue = self.PutQueue()
+        self.get_queue: RequestQueue = self.GetQueue()
 
     @property
     def capacity(self) -> float | int:
@@ -108,27 +133,39 @@ class BaseResource:
 
     def _trigger_put(self, get_event: Get | None) -> None:
         """Try to satisfy pending put requests via ``_do_put()``."""
+        queue = self.put_queue
         idx = 0
-        while idx < len(self.put_queue):
-            put_event = self.put_queue[idx]
+        while idx < len(queue):
+            put_event = queue[idx]
             proceed = self._do_put(put_event)
             if not put_event.triggered:
                 idx += 1
-            elif self.put_queue.pop(idx) != put_event:
-                raise RuntimeError('Put queue invariant violated')
+            elif idx == 0:
+                if queue.popleft() is not put_event:
+                    raise RuntimeError('Put queue invariant violated')
+            else:
+                if queue[idx] is not put_event:
+                    raise RuntimeError('Put queue invariant violated')
+                del queue[idx]
             if not proceed:
                 break
 
     def _trigger_get(self, put_event: Put | None) -> None:
         """Try to satisfy pending get requests via ``_do_get()``."""
+        queue = self.get_queue
         idx = 0
-        while idx < len(self.get_queue):
-            get_event = self.get_queue[idx]
+        while idx < len(queue):
+            get_event = queue[idx]
             proceed = self._do_get(get_event)
             if not get_event.triggered:
                 idx += 1
-            elif self.get_queue.pop(idx) != get_event:
-                raise RuntimeError('Get queue invariant violated')
+            elif idx == 0:
+                if queue.popleft() is not get_event:
+                    raise RuntimeError('Get queue invariant violated')
+            else:
+                if queue[idx] is not get_event:
+                    raise RuntimeError('Get queue invariant violated')
+                del queue[idx]
             if not proceed:
                 break
 
@@ -156,8 +193,6 @@ class StoreGet(Get):
 
 class Store(BaseResource):
     """FIFO store with optional *capacity* (default unlimited)."""
-
-    __slots__ = ('items',)
 
     def __init__(
         self,
@@ -350,7 +385,8 @@ class PriorityRequest(Request):
 class SortedQueue(list):
     """List that maintains sorted order by each item's ``key`` attribute.
 
-    Uses ``bisect.insort()`` for O(n) insertion.
+    Uses ``bisect.insort()``: O(log n) comparisons, O(n) insertion. Head
+    removal is O(n) as well; a list is required so bisect can index it.
     """
 
     __slots__ = ('maxlen',)
@@ -363,6 +399,10 @@ class SortedQueue(list):
         if self.maxlen is not None and len(self) >= self.maxlen:
             raise RuntimeError('Cannot append event. Queue is full.')
         bisect.insort(self, item, key=lambda e: e.key)
+
+    def popleft(self) -> Any:
+        """Remove and return the head (deque-compatible; O(n) on a list)."""
+        return self.pop(0)
 
 
 class Preempted:
@@ -383,8 +423,6 @@ class Preempted:
 
 class Resource(BaseResource):
     """Mutual-exclusion resource with *capacity* usage slots."""
-
-    __slots__ = ('users', 'queue')
 
     def __init__(self, env: Environment, capacity: int = 1) -> None:
         if capacity <= 0:
@@ -433,22 +471,29 @@ class PriorityResource(Resource):
 
 class PreemptiveResource(PriorityResource):
     """PriorityResource where higher-priority requests preempt lower-priority
-    users via Interrupt."""
+    users via Interrupt.
+
+    Only users whose request was made from within a process can be
+    preempted (there is nothing to interrupt otherwise); a request made
+    outside any process holds its slot until released.
+    """
 
     users: list[PriorityRequest]  # type: ignore[assignment]
 
     def _do_put(self, event: PriorityRequest) -> None:  # type: ignore[override]
         if len(self.users) >= self.capacity and event.preempt:
-            preempt = sorted(self.users, key=lambda e: e.key)[-1]
-            if preempt.key > event.key:
-                self.users.remove(preempt)
-                preempt.proc.interrupt(  # type: ignore[union-attr]
-                    Preempted(
-                        by=event.proc,
-                        usage_since=preempt.usage_since,
-                        resource=self,
+            candidates = [u for u in self.users if u.proc is not None]
+            if candidates:
+                preempt = max(candidates, key=lambda u: u.key)
+                if preempt.key > event.key:
+                    self.users.remove(preempt)
+                    preempt.proc.interrupt(  # type: ignore[union-attr]
+                        Preempted(
+                            by=event.proc,
+                            usage_since=preempt.usage_since,
+                            resource=self,
+                        )
                     )
-                )
         return super()._do_put(event)
 
 
@@ -486,8 +531,6 @@ class Container(BaseResource):
 
     The *level* tracks the current amount.
     """
-
-    __slots__ = ('_level',)
 
     def __init__(
         self,

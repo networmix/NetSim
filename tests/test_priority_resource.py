@@ -152,3 +152,58 @@ class TestPreemptiveResourceNoPreemptFlag:
         assert ('low', 'preempted', 1) not in log
         # High-priority (no preempt) user gets the resource after low finishes
         assert ('high_no_preempt', 'acquired', 5) in log
+
+
+class TestPreemptionOfRequestOutsideProcess:
+    def test_holder_without_process_is_not_preempted(self):
+        """A request made outside any process has no process to interrupt,
+        so it keeps its slot; the preempting request waits for release."""
+        env = netsim.Environment()
+        res = netsim.PreemptiveResource(env, capacity=1)
+        holder = res.request(priority=10)  # env.active_process is None here
+        log = []
+
+        def high(env):
+            with res.request(priority=0) as req:
+                yield req
+                log.append(('high_acquired', env.now))
+
+        def releaser(env):
+            yield env.timeout(5)
+            res.release(holder)
+
+        env.process(high(env))
+        env.process(releaser(env))
+        env.run()
+        assert holder.proc is None
+        assert log == [('high_acquired', 5)]
+
+    def test_preemption_skips_processless_user_and_picks_lowest_priority_process(
+        self,
+    ):
+        env = netsim.Environment()
+        res = netsim.PreemptiveResource(env, capacity=2)
+        outside = res.request(priority=0)  # highest priority, no process
+        log = []
+
+        def low(env):
+            req = res.request(priority=10)
+            try:
+                yield req
+                yield env.timeout(100)
+            except netsim.Interrupt:
+                log.append(('low_preempted', env.now))
+            finally:
+                res.release(req)
+
+        def high(env):
+            yield env.timeout(1)
+            with res.request(priority=5) as req:
+                yield req
+                log.append(('high_acquired', env.now))
+
+        env.process(low(env))
+        env.process(high(env))
+        env.run()
+        assert outside in res.users
+        assert log == [('low_preempted', 1), ('high_acquired', 1)]

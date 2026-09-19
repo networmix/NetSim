@@ -221,3 +221,14 @@ class TestTriggerUsedAsCallbackChaining:
         assert target.ok
         env.step()  # process target
         assert target.value == 'chained'
+
+
+class TestTriggerRequiresTriggeredSource:
+    def test_trigger_from_untriggered_source_raises(self):
+        env = netsim.Environment()
+        src = env.event()
+        dst = env.event()
+        with pytest.raises(RuntimeError, match='not been triggered'):
+            dst.trigger(src)
+        assert not dst.triggered
+        assert env.peek() == netsim.Infinity

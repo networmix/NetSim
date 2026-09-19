@@ -209,9 +209,112 @@ class TestProcessNameAfterGeneratorCleared:
             yield env.timeout(1)
 
         p = env.process(my_proc(env))
+        assert p.name == 'my_proc'
         env.run()
         assert p._generator is None
-        # Should return fallback string, not crash
-        name = p.name
-        assert isinstance(name, str)
-        assert len(name) > 0
+        # The name must not change when the generator is released.
+        assert p.name == 'my_proc'
+        assert repr(p) == f'<Process(my_proc) object at {id(p):#x}>'
+
+    def test_name_fallback_for_nameless_generator(self):
+        env = netsim.Environment()
+
+        class Gen:
+            """A generator-like object without __name__."""
+
+            def __init__(self):
+                self._it = iter([env.timeout(1)])
+
+            def send(self, value):
+                return next(self._it)
+
+            def throw(self, exc):
+                raise exc
+
+        p = env.process(Gen())
+        assert p.name == f'Process@{id(p):#x}'
+        env.run()
+        assert p.name == f'Process@{id(p):#x}'
+
+
+class TestInvalidYieldResetsActiveProcess:
+    def test_active_process_cleared_after_invalid_yield(self):
+        env = netsim.Environment()
+
+        def bad_proc(env):
+            yield 'not an event'
+
+        env.process(bad_proc(env))
+        with pytest.raises(RuntimeError, match='Invalid yield value'):
+            env.run()
+        assert env.active_process is None
+
+
+class TestExceptionCopy:
+    def test_reconstructable_exception_is_copied_with_cause(self):
+        env = netsim.Environment()
+        original = ValueError('boom')
+        caught = []
+
+        def child(env):
+            yield env.timeout(1)
+            raise original
+
+        def parent(env):
+            try:
+                yield env.process(child(env))
+            except ValueError as e:
+                caught.append(e)
+
+        env.process(parent(env))
+        env.run()
+        (e,) = caught
+        assert e is not original
+        assert e.__cause__ is original
+
+    def test_unreconstructable_exception_is_passed_through_without_cycle(self):
+        """An exception whose __init__ cannot be called with *args is reused
+        as-is; it must not end up as its own __cause__."""
+        env = netsim.Environment()
+
+        class Custom(Exception):
+            def __init__(self, msg, *, code):
+                super().__init__(msg)
+                self.code = code
+
+        original = Custom('bad', code=7)
+        caught = []
+
+        def child(env):
+            yield env.timeout(1)
+            raise original
+
+        def parent(env):
+            try:
+                yield env.process(child(env))
+            except Custom as e:
+                caught.append(e)
+
+        env.process(parent(env))
+        env.run()
+        (e,) = caught
+        assert e is original
+        assert e.code == 7
+        assert e.__cause__ is not e
+
+    def test_unreconstructable_exception_crashes_run_cleanly(self):
+        env = netsim.Environment()
+
+        class Custom(Exception):
+            def __init__(self, msg, *, code):
+                super().__init__(msg)
+                self.code = code
+
+        def proc(env):
+            yield env.timeout(1)
+            raise Custom('bad', code=7)
+
+        env.process(proc(env))
+        with pytest.raises(Custom) as info:
+            env.run()
+        assert info.value.__cause__ is not info.value

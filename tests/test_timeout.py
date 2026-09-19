@@ -34,8 +34,20 @@ class TestTimeoutBasic:
 
     def test_negative_delay_raises(self):
         env = netsim.Environment()
-        with pytest.raises(ValueError, match='Negative delay'):
+        with pytest.raises(ValueError, match='non-negative'):
             env.timeout(-1)
+
+    def test_nan_delay_raises(self):
+        """NaN compares false with everything and would corrupt heap order."""
+        env = netsim.Environment()
+        with pytest.raises(ValueError, match='non-negative'):
+            env.timeout(float('nan'))
+
+    def test_infinite_delay_is_allowed(self):
+        env = netsim.Environment()
+        evt = env.timeout(netsim.Infinity)
+        assert env.peek() == netsim.Infinity
+        assert not evt.processed
 
     def test_timeout_default_value_is_none(self):
         env = netsim.Environment()

@@ -167,3 +167,152 @@ class TestRunUntilFailedEventRaises:
         p = env.process(bad_proc(env))
         with pytest.raises(ValueError, match='process failed'):
             env.run(until=p)
+
+
+class TestRunUntilRunsAllCallbacks:
+    def test_stop_does_not_leave_waiters_stranded(self):
+        """Stopping at the *until* event must not skip its other callbacks:
+        a process that started waiting on it during run() is still resumed."""
+        env = netsim.Environment()
+        log = []
+
+        def worker(env):
+            yield env.timeout(2)
+            return 'done'
+
+        def starter(env, w):
+            yield env.timeout(1)
+            env.process(waiter(env, w))
+
+        def waiter(env, w):
+            v = yield w
+            log.append(v)
+
+        w = env.process(worker(env))
+        env.process(starter(env, w))
+        assert env.run(until=w) == 'done'
+        assert log == ['done']
+        assert w.processed
+
+    def test_stale_until_event_does_not_stop_a_later_run(self):
+        """An *until* event left over from an aborted run() is an ordinary
+        event for later runs; only the current call's *until* stops it."""
+        env = netsim.Environment()
+
+        def crasher(env):
+            yield env.timeout(1)
+            raise ValueError('boom')
+
+        def ticker(env):
+            while True:
+                yield env.timeout(1)
+
+        env.process(crasher(env))
+        env.process(ticker(env))
+        with pytest.raises(ValueError):
+            env.run(until=3)
+        env.run(until=10)
+        assert env.now == 10
+
+
+class TestRunUntilProcessedFailedEventRaises:
+    def test_run_until_processed_failed_event_raises(self):
+        env = netsim.Environment()
+        evt = env.event()
+        evt.fail(ValueError('boom'))
+        evt.defused = True
+        env.step()
+        with pytest.raises(ValueError, match='boom'):
+            env.run(until=evt)
+
+    def test_run_until_defused_failed_event_raises(self):
+        """Even if a process handles the failure, run(until=evt) reports it."""
+        env = netsim.Environment()
+        evt = env.event()
+
+        def handler(env):
+            try:
+                yield evt
+            except ValueError:
+                pass
+
+        env.process(handler(env))
+        evt.fail(ValueError('boom'))
+        with pytest.raises(ValueError, match='boom'):
+            env.run(until=evt)
+
+
+class TestRunUntilValidation:
+    def test_until_nan_raises(self):
+        env = netsim.Environment()
+        with pytest.raises(ValueError, match='must be >'):
+            env.run(until=float('nan'))
+
+    def test_until_event_of_other_env_raises(self):
+        env1 = netsim.Environment()
+        env2 = netsim.Environment()
+        with pytest.raises(ValueError, match='different environment'):
+            env1.run(until=env2.event())
+
+
+class TestStepReturnsEvent:
+    def test_step_returns_processed_event(self):
+        env = netsim.Environment()
+        t = env.timeout(3, value='x')
+        assert env.step() is t
+        assert t.processed
+
+
+class TestRunMatchesStep:
+    """run() inlines step(); both must process the same events in the same
+    order with the same clock."""
+
+    @staticmethod
+    def _scenario(env, trace):
+        store = netsim.Store(env, capacity=1)
+        res = netsim.Resource(env, capacity=1)
+
+        def producer(env):
+            for i in range(5):
+                yield store.put(i)
+                trace.append(('put', i, env.now))
+                yield env.timeout(1)
+
+        def consumer(env):
+            for _ in range(5):
+                item = yield store.get() | env.timeout(3)
+                trace.append(('got', list(item.values()), env.now))
+                with res.request() as r:
+                    yield r
+                    yield env.timeout(2)
+
+        def victim(env):
+            try:
+                yield env.timeout(100)
+            except netsim.Interrupt as e:
+                trace.append(('interrupted', e.cause, env.now))
+
+        def attacker(env, v):
+            yield env.timeout(4)
+            v.interrupt('hi')
+
+        env.process(producer(env))
+        env.process(consumer(env))
+        v = env.process(victim(env))
+        env.process(attacker(env, v))
+
+    def test_run_and_step_loop_produce_identical_traces(self):
+        env_run = netsim.Environment()
+        trace_run = []
+        self._scenario(env_run, trace_run)
+        env_run.run()
+
+        env_step = netsim.Environment()
+        trace_step = []
+        self._scenario(env_step, trace_step)
+        with pytest.raises(netsim.EmptySchedule):
+            while True:
+                env_step.step()
+
+        assert trace_run == trace_step
+        assert env_run.now == env_step.now

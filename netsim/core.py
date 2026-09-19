@@ -141,13 +141,15 @@ class Event:
         """Copy ok/value from *event* and schedule. Used for chaining.
 
         Args:
-            event: Source event to copy state from.
+            event: Source event to copy state from. Must be triggered.
 
         Raises:
-            RuntimeError: If already triggered.
+            RuntimeError: If already triggered, or if *event* is not.
         """
         if self._value is not _PENDING:
             raise RuntimeError(f'{self} has already been triggered')
+        if event._value is _PENDING:
+            raise RuntimeError(f'{event} has not been triggered yet')
         self._ok = event._ok
         self._value = event._value
         self.env.schedule(self)
@@ -183,9 +185,11 @@ class Timeout(Event):
         delay: SimTime,
         value: Any = None,
     ) -> None:
-        if delay < 0:
-            raise ValueError(f'Negative delay {delay}')
-        # Inline Event.__init__ for performance.
+        # ``not delay >= 0`` also rejects NaN, which would corrupt heap order.
+        if not delay >= 0:
+            raise ValueError(f'delay must be a non-negative number, got {delay!r}')
+        # Event.__init__ inlined for speed; tests/test_invariants.py checks
+        # that every slot is set.
         self.env = env
         self.callbacks: list[EventCallback] | None = []
         self._value = value
@@ -283,7 +287,8 @@ class Process(Event):
         self._defused: bool = False
 
         self._generator = generator
-        self._name = name
+        # Read the name now; the generator is dropped when the process ends.
+        self._name = name if name is not None else getattr(generator, '__name__', None)
         self._target: Event = _Initialize(env, self)
 
     def _desc(self) -> str:
@@ -294,8 +299,6 @@ class Process(Event):
         """Process name. Explicit if provided, else the generator function name."""
         if self._name is not None:
             return self._name
-        if self._generator is not None:
-            return self._generator.__name__  # type: ignore[attr-defined]
         return f'Process@{id(self):#x}'
 
     @property
@@ -364,6 +367,7 @@ class Process(Event):
             except AttributeError:
                 if hasattr(event, 'callbacks'):
                     raise
+                self.env._active_proc = None
                 descr = _describe_frame(gen.gi_frame)  # type: ignore[attr-defined]
                 raise RuntimeError(f'\n{descr}Invalid yield value "{event}"') from None
 
@@ -425,8 +429,10 @@ class ConditionValue:
 class Condition(Event):
     """Composite event that triggers when ``evaluate(events, count)`` is True.
 
-    Value is a ConditionValue of events that triggered before the condition
-    was processed. Fails immediately if any sub-event fails.
+    Value is a ConditionValue of the leaf events processed before the
+    condition itself was processed. Leaves of a nested Condition are included
+    only if that nested Condition was triggered. Fails immediately if any
+    sub-event fails.
 
     Args:
         env: The simulation environment.
@@ -491,9 +497,13 @@ class Condition(Event):
                 value.events.append(event)
 
     def _remove_check_callbacks(self) -> None:
+        check = self._check
         for event in self._events:
-            if event.callbacks and self._check in event.callbacks:
-                event.callbacks.remove(self._check)
+            if event.callbacks:
+                try:
+                    event.callbacks.remove(check)
+                except ValueError:
+                    pass
             if isinstance(event, Condition):
                 event._remove_check_callbacks()
 
@@ -509,12 +519,16 @@ class Condition(Event):
 class AllOf(Condition):
     """Triggered when all *events* have been triggered."""
 
+    __slots__ = ()
+
     def __init__(self, env: Environment, events: Iterable[Event]) -> None:
         super().__init__(env, Condition.all_events, events)
 
 
 class AnyOf(Condition):
     """Triggered when any of *events* has been triggered."""
+
+    __slots__ = ()
 
     def __init__(self, env: Environment, events: Iterable[Event]) -> None:
         super().__init__(env, Condition.any_events, events)
@@ -525,24 +539,12 @@ class AnyOf(Condition):
 # ---------------------------------------------------------------------------
 
 
-class StopSimulation(Exception):
-    """Raised internally by the *until* callback to stop ``Environment.run()``."""
-
-    @classmethod
-    def callback(cls, event: Event) -> None:
-        if event.ok:
-            raise cls(event.value)
-        raise event._value
-
-
 class Environment:
     """Simulation clock and event scheduler.
 
     Events are stored as ``(time, priority, eid, event)`` tuples in a
     heap for O(log n) scheduling.
     """
-
-    __slots__ = ('_now', '_queue', '_eid', '_active_proc')
 
     def __init__(self, initial_time: SimTime = 0) -> None:
         self._now: SimTime = initial_time
@@ -611,12 +613,15 @@ class Environment:
         except IndexError:
             return Infinity
 
-    def step(self) -> None:
-        """Process the next event.
+    def step(self) -> Event:
+        """Process the next event and return it.
 
         Raises:
             EmptySchedule: If no events remain.
+            BaseException: The event's exception, if it failed and no
+                callback defused it.
         """
+        # Keep in sync with the loop in run().
         try:
             self._now, _, _, event = heappop(self._queue)
         except IndexError:
@@ -628,6 +633,7 @@ class Environment:
 
         if not event._ok and not event._defused:
             raise _copy_exception(event._value)
+        return event
 
     def run(self, until: SimTime | Event | None = None) -> Any:
         """Run the simulation.
@@ -639,35 +645,59 @@ class Environment:
 
         Returns:
             The *until* event's value, or None.
+
+        Raises:
+            ValueError: If *until* is a time not greater than ``now`` (or
+                NaN), or an event of another environment.
+            RuntimeError: If the schedule empties before *until* triggers.
+            BaseException: The *until* event's exception, if it failed, or
+                any undefused event failure encountered along the way.
         """
         if until is not None:
             if not isinstance(until, Event):
                 at: SimTime = until
-                if at <= self.now:
-                    raise ValueError(f'until ({at}) must be > current simulation time')
+                # ``not at > now`` also rejects NaN.
+                if not at > self._now:
+                    raise ValueError(
+                        f'until ({at!r}) must be > current simulation time'
+                    )
                 until = Event(self)
                 until._ok = True
                 until._value = None
-                self.schedule(until, URGENT, at - self.now)
+                self.schedule(until, URGENT, at - self._now)
+            elif until.env is not self:
+                raise ValueError(f'{until} belongs to a different environment')
             elif until.callbacks is None:
-                return until.value
+                # Already processed: report its outcome directly.
+                if until._ok:
+                    return until._value
+                raise _copy_exception(until._value)
 
-            assert until.callbacks is not None
-            until.callbacks.append(StopSimulation.callback)
-
-        try:
-            while True:
-                self.step()
-        except StopSimulation as exc:
-            return exc.args[0]
-        except EmptySchedule:
-            if until is not None:
-                assert not until.triggered
+        # step() inlined: the call costs ~10% here. The stop check runs after
+        # all callbacks, so none of the until event's callbacks are skipped.
+        queue = self._queue
+        while True:
+            try:
+                self._now, _, _, event = heappop(queue)
+            except IndexError:
+                if until is None:
+                    return None
                 raise RuntimeError(
                     f'No scheduled events left but "until" event was not '
                     f'triggered: {until}'
                 ) from None
-        return None
+
+            callbacks, event.callbacks = event.callbacks, None  # type: ignore[assignment]
+            for callback in callbacks:  # type: ignore[union-attr]
+                callback(event)
+
+            if not event._ok and not event._defused:
+                raise _copy_exception(event._value)
+
+            if event is until:
+                if event._ok:
+                    return event._value
+                raise _copy_exception(event._value)
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +714,7 @@ def _copy_exception(exc: BaseException) -> BaseException:
     try:
         copy = type(exc)(*exc.args)
     except Exception:
-        copy = exc  # Can't reconstruct; reuse original.
+        return exc  # Can't reconstruct; reuse the original as-is.
     copy.__cause__ = exc
     return copy
 
