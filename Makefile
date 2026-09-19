@@ -1,6 +1,6 @@
 # NetSim Development Makefile
 
-.PHONY: help venv clean-venv dev install check check-ci lint format test qt build clean check-dist publish-test publish info hooks check-python
+.PHONY: help venv clean-venv dev install check check-ci lint format test qt venv-ft check-ft build clean check-dist publish-test publish info hooks check-python
 
 .DEFAULT_GOAL := help
 
@@ -39,6 +39,8 @@ help:
 	@echo "  make format        - Auto-format with ruff"
 	@echo "  make test          - Run tests with coverage"
 	@echo "  make qt            - Quick tests (no coverage, no benchmarks)"
+	@echo "  make venv-ft       - Create a free-threaded (no GIL) venv in ./venv-ft"
+	@echo "  make check-ft      - Run check-ci with the free-threaded venv"
 	@echo ""
 	@echo "Build & Publish:"
 	@echo "  make build         - Build distribution packages"
@@ -120,6 +122,23 @@ qt:
 
 hooks:
 	@$(PRECOMMIT) run --all-files
+
+# --------------------------------------------------------------------------
+# Free-threaded (no GIL) Python
+# --------------------------------------------------------------------------
+venv-ft:
+	@if command -v uv >/dev/null 2>&1; then \
+		uv venv --python 3.14t venv-ft && uv pip install --python venv-ft/bin/python -e '.[dev]'; \
+	elif command -v python3.14t >/dev/null 2>&1; then \
+		python3.14t -m venv venv-ft && venv-ft/bin/python -m pip install -U pip && venv-ft/bin/python -m pip install -e '.[dev]'; \
+	else \
+		echo "Error: need uv or python3.14t to create a free-threaded venv"; exit 1; \
+	fi
+	@venv-ft/bin/python -c 'import sys; assert not sys._is_gil_enabled(), "GIL is enabled"; print("free-threaded venv ready:", sys.version.split()[0])'
+
+check-ft:
+	@[ -x venv-ft/bin/python ] || { echo "Run 'make venv-ft' first."; exit 1; }
+	@$(MAKE) check-ci PYTHON=$(PWD)/venv-ft/bin/python
 
 # --------------------------------------------------------------------------
 # Build & Publish

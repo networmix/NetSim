@@ -13,12 +13,20 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
     "Operating System :: OS Independent",
+    "Typing :: Typed",
 ]
 
 dependencies = []
@@ -41,8 +49,11 @@ dev = [
 include = ["netsim*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+"netsim" = ["py.typed"]
+
 [tool.pytest.ini_options]
-addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing --benchmark-disable"
+addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing --benchmark-disable --benchmark-disable-gc --benchmark-min-rounds=5 --benchmark-warmup=on"
 timeout = 10
 markers = [
     "slow: marks tests as slow",
@@ -52,6 +63,14 @@ markers = [
 [tool.coverage.run]
 source = ["netsim"]
 omit = ["*/tests/*", "*/test_*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+]
 
 [tool.ruff]
 line-length = 88
@@ -75,6 +94,7 @@ venv = "venv"
 exclude = [
     "tests/**",
     "**/venv/**",
+    "**/venv-ft/**",
     "build/**",
     "dist/**",
 ]

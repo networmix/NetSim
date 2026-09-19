@@ -6,6 +6,10 @@
   all tests with coverage (`make check-ci`).
 - `make qt` runs the tests without coverage or benchmarks;
   `pytest --benchmark-enable tests/test_benchmarks.py` reports timings.
+- `make venv-ft` then `make check-ft` runs the same checks on a free-threaded
+  Python; CI runs them on 3.14t. Keep hot paths free of shared mutable
+  objects and module-level sentinels: their reference counts serialize
+  threads without the GIL.
 
 Confirm suspected defects with source and a reproducer, then pin the fix with
 a test that fails on the old code. Design rules live in

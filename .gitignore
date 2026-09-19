@@ -17,6 +17,7 @@ build/
 # Virtual environments
 env/
 venv/
+venv-ft/
 
 # Testing / coverage
 .pytest_cache/

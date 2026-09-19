@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/networmix/NetSim/actions/workflows/python-test.yml/badge.svg?branch=main)](https://github.com/networmix/NetSim/actions/workflows/python-test.yml)
 
-Discrete-event simulation engine. Zero dependencies. Python 3.11+.
+Discrete-event simulation engine. Zero dependencies. Python 3.11+, including
+free-threaded builds.
 
 ## Install
 
@@ -99,6 +100,25 @@ def user(env, resource):
         yield env.timeout(1)  # hold the resource
 ```
 
+### Parallel simulations without the GIL
+
+An `Environment` is single-threaded and must not be shared between threads.
+Separate environments share nothing, so on a free-threaded Python build
+(`python3.14t`) independent simulations run in parallel threads:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+def replicate(seed):
+    env = netsim.Environment()
+    ...
+    env.run()
+    return env.now
+
+with ThreadPoolExecutor() as pool:
+    results = list(pool.map(replicate, range(8)))
+```
+
 ## Development
 
 ```bash
@@ -107,7 +127,14 @@ make check        # pre-commit + tests + lint
 make test         # tests with coverage
 make qt           # quick tests (no coverage)
 make lint         # ruff + pyright
+make venv-ft      # free-threaded (no GIL) venv, needs uv or python3.14t
+make check-ft     # lint + tests on the free-threaded venv
 ```
+
+## Requirements
+
+- Python 3.11+ (CI runs 3.11 to 3.14 and the free-threaded 3.14t build)
+- No runtime dependencies
 
 ## License
 
