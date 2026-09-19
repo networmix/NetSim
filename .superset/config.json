@@ -1,0 +1,4 @@
+{
+  "setup": ["bash .superset/workspace.sh setup"],
+  "run": ["bash .superset/workspace.sh check"]
+}

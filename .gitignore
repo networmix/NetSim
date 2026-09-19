@@ -28,3 +28,6 @@ htmlcov/
 *.jsonl
 *.png
 *.csv
+
+# Personal Superset lifecycle overrides
+.superset/config.local.json
