@@ -214,3 +214,48 @@ def test_numbered_neighbor_required_and_scoped_l3():
     a.configure(enabled=False)
     net.converge()
     assert not local_rows(a)
+
+
+def test_unknown_cover_returns_on_sid_withdrawal_and_yields_on_restore():
+    from netsim.model import forwarding as fw
+    from netsim.model import packets
+
+    net = Network()
+    a, b = net.add_device('a'), net.add_device('b')
+    ranges = srv6.SidRanges(gib=(1, 100), lib=(0xE001, 0xE00F), wlib=(0xFFFE, 0xFFFF))
+    for dev in (a, b):
+        dev.add_locator('loc', structure=srv6.F3216_GIB, ranges=ranges)
+    b.add_loopback('lo', ipv4=['10.0.0.2/32'])
+    link = net.add_p2p(a, 'p', b, 'p', unnumbered=True)
+    adjacency = a.add_local_sid(
+        srv6.END_X,
+        structure=srv6.F3216_LIB,
+        flavors=srv6.NEXT_CSID,
+        sid='5f00:0:e001::',
+        interface='p',
+    )
+    terminal = b.add_local_sid(
+        srv6.END_DT46, structure=srv6.F3216_TERMINAL, sid='5f00:0:e008::'
+    )
+    packet = packets.encapsulate(
+        packets.IPv4Packet(1, 0x0A000002, 17),
+        (adjacency.sid, terminal.sid),
+        behavior=srv6.H_ENCAPS_RED,
+        source=1,
+        hop_limit=64,
+        flow_label=0,
+        transit=False,
+    )
+    sim = Simulation(netsim.Environment(), net)
+    assert net.trace('a', packet).outcome == fw.DELIVER
+    assert a.fib(IPV6).lookup(adjacency.sid).action == fw.SRV6_LOCAL
+    sim.at(10, link.fail)
+    sim.at(20, link.restore)
+    sim.run_until(11)
+    assert not a.node.srv6_sids.sids[adjacency.sid].adjacency_up
+    assert a.fib(IPV6).lookup(adjacency.sid).action == fw.DROP_UNREACHABLE
+    assert net.trace('a', packet).reason == srv6.SID_UNKNOWN
+    sim.run_until(21)
+    assert a.node.srv6_sids.sids[adjacency.sid].adjacency_up
+    assert a.fib(IPV6).lookup(adjacency.sid).action == fw.SRV6_LOCAL
+    assert net.trace('a', packet).outcome == fw.DELIVER

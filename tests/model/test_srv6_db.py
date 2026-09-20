@@ -434,3 +434,306 @@ def test_policy_index_tracks_fork_batch_and_device_deletion():
     assert net.state.srv6_consumers == frozenset({'r'})
     net.remove_device('r')
     assert not net.state.srv6_consumers
+
+
+@pytest.mark.parametrize(
+    'ranges,structure,sid_text,cover_length',
+    [
+        (
+            srv6.SidRanges(gib=(1, 100), lib=(0xE001, 0xE00F), wlib=(0xFFFE, 0xFFFF)),
+            srv6.F3216_TERMINAL,
+            '5f00:0:e001::',
+            48,
+        ),
+        (srv6.SidRanges(), srv6.F3216_TERMINAL, '5f00:0:e800::', 35),
+        (srv6.SidRanges(), srv6.F3216_WLIB, '5f00:0:fffe:1::', 35),
+    ],
+    ids=['equal-prefix', 'cover-contains-sid', 'cover-contains-wide-sid'],
+)
+def test_active_sid_takes_precedence_over_unknown_cover(
+    ranges, structure, sid_text, cover_length
+):
+    from netsim.model import forwarding as fw
+    from netsim.model import packets
+
+    net = Network()
+    dev = f3216(net, ranges=ranges)
+    dev.add_loopback('lo', ipv4=['10.0.0.1/32'])
+    sid = dev.add_local_sid(srv6.END_DT46, structure=structure, sid=sid_text)
+    assert any(
+        prefix[1] == cover_length and srv6.contains(prefix, sid.sid)
+        for prefix in srv6.unknown_prefixes(dev.node.srv6_sids)
+    )
+    packet = packets.encapsulate(
+        packets.IPv4Packet(1, 0x0A000001, 17),
+        (sid.sid,),
+        behavior=srv6.H_ENCAPS_RED,
+        source=1,
+        hop_limit=64,
+        flow_label=0,
+        transit=False,
+    )
+    for _ in range(2):
+        net.converge()
+        entry = dev.fib(IPV6).lookup(sid.sid)
+        assert entry is not None and entry.action == fw.SRV6_LOCAL
+        assert entry.sid == sid
+        assert net.trace('r', packet).outcome == fw.DELIVER
+        assert net.validate() == []
+        active_prefix = IPv6Network((sid.sid, sid.length))
+        for row in dev.rib(IPV6).rows_of(SRV6_LOCAL):
+            assert dev.route_status(IPV6, row.key) == ('INSTALLED', None)
+            if row.nexthops[0].special == UNREACHABLE:
+                assert not IPv6Network(row.prefix).overlaps(active_prefix)
+        before = net.state
+        net.converge()
+        assert net.state is before
+        dev.remove_local_sid(sid.sid)
+        net.converge()
+        assert net.trace('r', packet).reason == srv6.SID_UNKNOWN
+        dev.add_local_sid(srv6.END_DT46, structure=structure, sid=sid.sid)
+
+
+@pytest.mark.parametrize(
+    'active,expected',
+    [
+        (
+            ('5f00:0:e001::/48',),
+            (
+                '5f00:0:e002::/47',
+                '5f00:0:e004::/46',
+                '5f00:0:e008::/45',
+                '5f00:0:fffe::/47',
+            ),
+        ),
+        (('5f00:0:e000::/44',), ('5f00:0:fffe::/47',)),
+        (
+            ('5f00:0:e001:8000::/49',),
+            (
+                '5f00:0:e001::/49',
+                '5f00:0:e002::/47',
+                '5f00:0:e004::/46',
+                '5f00:0:e008::/45',
+                '5f00:0:fffe::/47',
+            ),
+        ),
+        (('5f00::/32',), ()),
+        (
+            ('5f01::/32',),
+            (
+                '5f00:0:e001::/48',
+                '5f00:0:e002::/47',
+                '5f00:0:e004::/46',
+                '5f00:0:e008::/45',
+                '5f00:0:fffe::/47',
+            ),
+        ),
+    ],
+    ids=[
+        'equal',
+        'active-covers-range',
+        'active-covered-by-range',
+        'whole-block',
+        'disjoint',
+    ],
+)
+def test_unknown_cover_subtracts_exact_active_prefix_union(active, expected):
+    net = Network()
+    dev = f3216(
+        net,
+        ranges=srv6.SidRanges(
+            gib=(1, 100), lib=(0xE001, 0xE00F), wlib=(0xFFFE, 0xFFFF)
+        ),
+    )
+    exclusions = tuple(srv6.prefix6(prefix) for prefix in active)
+    cover = srv6.unknown_prefixes(dev.node.srv6_sids, exclusions)
+    assert cover == tuple(srv6.prefix6(prefix) for prefix in expected)
+    assert srv6.unknown_prefixes(dev.node.srv6_sids, exclusions * 2) == cover
+
+
+def test_unknown_cover_subtracts_overlapping_exclusions_across_blocks():
+    net = Network()
+    dev = f3216(net)
+    dev.add_locator('second', structure=F3216_GIB, block='5f01::/32')
+    active = tuple(
+        map(srv6.prefix6, ('5f00:0:e000::/35', '5f00:0:e001::/48', '5f01:0:e000::/36'))
+    )
+    assert srv6.unknown_prefixes(dev.node.srv6_sids, active) == (
+        srv6.prefix6('5f01:0:f000::/36'),
+    )
+    assert srv6.unknown_prefixes(
+        dev.node.srv6_sids, tuple(reversed(active))
+    ) == srv6.unknown_prefixes(dev.node.srv6_sids, active)
+
+
+def deletion_network(mode, dependent):
+    from netsim.model.packets import PacketTemplate
+
+    net = Network()
+    victim, peer = net.add_device('R1'), net.add_device('R2')
+    victim.add_loopback('lo', ipv4=['10.0.0.1/32'], ipv6=['2001:db8::1/128'])
+    peer.add_loopback('lo', ipv4=['10.0.0.2/32'], ipv6=['2001:db8::2/128'])
+    net.add_p2p(
+        victim, 'p', peer, 'p', ipv4=('10.1.0.1/30', '10.1.0.2/30'), unnumbered=True
+    )
+    source, dst = (
+        ('R1', '10.0.0.2')
+        if dependent == 'source'
+        else (
+            'R2',
+            {
+                'destination-v4': '10.0.0.1',
+                'destination-v6': '2001:db8::1',
+                'destination-interface': '10.1.0.1',
+                'destination-template': '10.0.0.2',
+            }[dependent],
+        )
+    )
+    kw = {}
+    if dependent == 'destination-template':
+        kw['template'] = PacketTemplate(
+            6, address('2001:db8::2'), address('2001:db8::1')
+        )
+    net.add_demand('dependent', source, dst, 100, mode=mode, **kw)
+    net.add_demand('survivor', 'R2', '10.0.0.2', 200, mode=mode)
+    net.add_source(oracle_igp)
+    net.converge()
+    return net, victim
+
+
+def assert_demand_conservation(net):
+    report = net.place()
+    assert set(report.demands) == set(net.state.demands)
+    for name, demand in net.state.demands.items():
+        result = report.demands[name]
+        assert result.delivered + sum(
+            rate for _, _, rate in result.drops
+        ) == pytest.approx(demand.rate)
+    assert report.delivered_total + sum(
+        report.dropped_by_reason.values()
+    ) == pytest.approx(sum(d.rate for d in net.state.demands.values()))
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+@pytest.mark.parametrize(
+    'dependent',
+    [
+        'source',
+        'destination-v4',
+        'destination-v6',
+        'destination-interface',
+        'destination-template',
+    ],
+)
+def test_device_deletion_rejects_dependent_demands_atomically(mode, dependent):
+    net, victim = deletion_network(mode, dependent)
+    assert net.placement.delivered_total == 300
+    before = net.state
+    deltas = []
+    net.on_delta.append(lambda *args: deltas.append(args))
+    with pytest.raises(ValueError, match='dependent demands.*dependent'):
+        net.remove_device('R1')
+    assert net.state is before and not deltas
+    assert victim.exists and victim['p'].node.link is not None
+    assert_demand_conservation(net)
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+@pytest.mark.parametrize(
+    'dependent',
+    [
+        'source',
+        'destination-v4',
+        'destination-v6',
+        'destination-interface',
+        'destination-template',
+    ],
+)
+def test_device_and_dependent_demands_can_be_removed_in_one_batch(mode, dependent):
+    net, victim = deletion_network(mode, dependent)
+    deltas = []
+    net.on_delta.append(lambda *args: deltas.append(args))
+    with net.batch():
+        net.remove_demand('dependent')
+        net.remove_device('R1')
+    assert len(deltas) == 1
+    assert not victim.exists and not net.state.links
+    assert set(net.state.demands) == {'survivor'}
+    net.converge()
+    assert net.placement.delivered_total == 200
+    assert_demand_conservation(net)
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+def test_rejected_device_deletion_rolls_back_prior_demand_removal(mode):
+    net, victim = deletion_network(mode, 'source')
+    net.add_demand('incoming', 'R2', '10.0.0.1', 50, mode=mode)
+    net.converge()
+    before = net.state
+    with pytest.raises(ValueError, match='dependent demands.*incoming'):
+        with net.batch():
+            net.remove_demand('dependent')
+            net.remove_device('R1')
+    assert net.state is before and victim.exists
+    assert_demand_conservation(net)
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+@pytest.mark.parametrize('ownership', ['disabled-host', 'local-sid', 'bsid'])
+def test_device_deletion_uses_configured_ownership_even_when_unreachable(
+    mode, ownership
+):
+    net, victim = deletion_network(mode, 'destination-v6')
+    net.remove_demand('dependent')
+    victim.add_locator('loc', structure=F3216_GIB)
+    if ownership == 'disabled-host':
+        victim['lo'].admin_down()
+        dst = '2001:db8::1'
+    elif ownership == 'local-sid':
+        sid = victim.add_local_sid(srv6.END_DT46, structure=srv6.F3216_TERMINAL)
+        dst = str(IPv6Address(sid.sid))
+    else:
+        policy = victim.policy_client().add(srv6.SrPolicy(STATIC, 10, 1))
+        dst = str(IPv6Address(policy.bsid))
+    net.add_demand('owned', 'R2', dst, 100, mode=mode)
+    net.converge()
+    before = net.state
+    with pytest.raises(ValueError, match='dependent demands.*owned'):
+        net.remove_device('R1')
+    assert net.state is before
+    assert_demand_conservation(net)
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+def test_deletion_does_not_claim_peer_subnet_or_overridden_destination(mode):
+    from netsim.model.packets import PacketTemplate
+
+    net, victim = deletion_network(mode, 'destination-v4')
+    net.remove_demand('dependent')
+    net.add_demand('peer-address', 'R2', '10.1.0.2', 100, mode=mode)
+    net.add_demand(
+        'template',
+        'R2',
+        '10.0.0.1',
+        50,
+        mode=mode,
+        template=PacketTemplate(6, address('2001:db8::2'), address('2001:db8::2')),
+    )
+    net.remove_device('R1')
+    assert not victim.exists
+    net.converge()
+    assert_demand_conservation(net)
+
+
+@pytest.mark.parametrize('mode', [1, 2], ids=['FLUID', 'HASH'])
+def test_device_deletion_checks_staged_demands_and_addresses(mode):
+    net, victim = deletion_network(mode, 'source')
+    before = net.state
+    with pytest.raises(ValueError, match='dependent demands.*new'):
+        with net.batch():
+            net.remove_demand('dependent')
+            victim['lo'].configure(ipv6=['2001:db8::99/128'])
+            net.add_demand('new', 'R2', '2001:db8::99', 100, mode=mode)
+            net.remove_device('R1')
+    assert net.state is before
+    assert_demand_conservation(net)

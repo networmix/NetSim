@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
 
 from netsim.model import derive, routing, srv6
-from netsim.model.addressing import LOCAL_ADMIN_BASE, mac_from_index
+from netsim.model.addressing import IPV4, IPV6, LOCAL_ADMIN_BASE, mac_from_index
 from netsim.model.contracts import (
     CONNECTED_PROFILE,
     IGP_PROFILE,
@@ -481,10 +481,57 @@ class Network:
         return self.device(name)
 
     def remove_device(self, name: str) -> None:
+        """Reject deletion while dependent demands remain in the staged tree.
+
+        A demand depends on its source device and on the owner of its effective
+        destination (the packet template overrides demand.dst). Ownership is
+        a configured IPv4/IPv6 interface or loopback host, local SID prefix,
+        or BSID, regardless of oper state; shared addresses still count.
+        Connected subnets and locator summaries alone do not imply ownership.
+
+        Remove dependent demands first, then the device, inside batch() to
+        publish both deletions atomically. Rejection changes neither topology
+        nor demands; an uncaught rejection rolls the whole batch back.
+        """
         owner = self.device(name)
 
         def apply(state: NetworkState) -> NetworkState:
             dev = owner._node_in(state)
+            addresses = {
+                (af, address)
+                for interface in dev.interfaces.values()
+                for af, configured in (
+                    (IPV4, interface.config.ipv4),
+                    (IPV6, interface.config.ipv6),
+                )
+                for address, _ in configured
+            }
+            sids = (
+                tuple((sid.sid, sid.length) for sid in dev.srv6_sids.sids.values())
+                if dev.srv6_sids
+                else ()
+            )
+            bsids = dev.srv6_policies.bsids if dev.srv6_policies else ()
+            dependent = []
+            for demand_id, demand in state.demands.sorted_items():
+                packet = demand.template if demand.template is not None else demand
+                if (
+                    demand.source == name
+                    or (packet.af, packet.dst) in addresses
+                    or (
+                        packet.af == IPV6
+                        and (
+                            packet.dst in bsids
+                            or any(srv6.contains(prefix, packet.dst) for prefix in sids)
+                        )
+                    )
+                ):
+                    dependent.append(demand_id)
+            if dependent:
+                raise ValueError(
+                    f'cannot remove device {name!r}: dependent demands {dependent!r}; '
+                    'remove them first (in the same batch for atomic deletion)'
+                )
             candidate = _remove_interfaces(
                 state, {(name, iface) for iface in dev.interfaces}
             )
