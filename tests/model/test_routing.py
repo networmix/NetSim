@@ -1,3 +1,7 @@
+from dataclasses import replace
+from hashlib import sha256
+from random import Random
+
 import pytest
 
 from netsim.model import forwarding as fw
@@ -13,6 +17,7 @@ from netsim.model.routing import (
     rib_apply,
     row_status,
 )
+from netsim.model.state import PMap, validate_immutable
 
 
 def P(text):
@@ -36,6 +41,86 @@ def static(
         metric=metric,
         distinguisher=distinguisher,
     )
+
+
+def routing_fingerprints(kind):
+    """Content digests across initial convergence, one failure and restoration.
+
+    Used by the A/B/A harness too; no versions, object addresses or hashes.
+    """
+    import netsim
+    from netsim.runtime import Simulation
+    from netsim.runtime.timeline import RouteEvent
+    from tests.model.clos import build_clos
+    from tests.model.test_network import build_diamond
+
+    if kind == 'diamond':
+        net, _ = build_diamond()
+        net.add_demand('d', 'R1', '10.0.0.4', 100e6)
+        lid = 'R1:eth1--R2:eth1'
+    else:
+        net = build_clos(8, 4)
+        lid = sorted(net.links)[0]
+    sim = Simulation(netsim.Environment(), net)
+    fibs, placements = [], []
+    for time, op in ((0, None), (1, net.links[lid].fail), (2, net.links[lid].restore)):
+        if op is not None:
+            sim.at(time, op)
+            sim.run_until(time + 0.5)
+        fibs.append(
+            tuple(
+                (name, int(af), fib.entries.items(), fib.groups.sorted_items())
+                for name, dev in net.state.devices.sorted_items()
+                for af, fib in dev.fibs.sorted_items()
+            )
+        )
+        p = net.placement
+        placements.append(
+            (
+                p.model,
+                p.edge_count,
+                tuple(p.offered),
+                tuple(p.carried),
+                tuple(p.dropped),
+                tuple(p.capacity),
+                p.edge_links.sorted_items(),
+                p.demands.sorted_items(),
+                p.classes.sorted_items(),
+                p.delivered_total,
+                p.dropped_by_reason.sorted_items(),
+            )
+        )
+    events = sim.timeline.select(kind=RouteEvent)
+    return tuple(
+        sha256(repr(value).encode()).hexdigest() for value in (fibs, placements, events)
+    )
+
+
+@pytest.mark.parametrize(
+    'kind, expected',
+    [
+        (
+            'diamond',
+            (
+                'f8472dab530cfa9108d7159e1d4b1e3f8da91df5fbe87bf4a8a81c744f3d71bb',
+                '6e77430a87aaf51ebe18e3d711f34321a74c7714c000195b27bc5f3165eb48b8',
+                '853afb7d4b4ce1fee1067197b8d141233eae1f46e81efbd4b6819c7e08910a58',
+            ),
+        ),
+        (
+            'clos',
+            (
+                'd561a9ad210cc36feb1492809a0fc48c505a492b504ea862400590f5d0b28baa',
+                '010e064a081b74ae0d27330c9016d488a0a50dc27254b79ae3e82328b8a496cb',
+                'a07606041a5da63b13b80debd5a18a381b9efccbf6aa6a39202844d38ca70220',
+            ),
+        ),
+    ],
+)
+def test_routing_matches_pre_index_fingerprints(kind, expected):
+    # Captured from c2d658e; includes FIB dependencies, groups/weights,
+    # placement arrays/demand results and the complete ordered RouteEvents.
+    assert routing_fingerprints(kind) == expected
 
 
 class _Ctx:
@@ -97,6 +182,153 @@ class TestNexthopAndRoute:
 
 
 class TestRibApply:
+    def test_indexed_reads_do_not_scan_or_sort_storage(self, monkeypatch):
+        rows = tuple(
+            Route((i, 32), IPV4, STATIC, 1, (Nexthop.blackhole(),)) for i in range(1000)
+        )
+        rib = rib_apply(RibState.empty(IPV4), sync=(STATIC, rows))
+
+        def no_scan(*args, **kwargs):
+            pytest.fail('indexed reads must not scan or sort RIB storage')
+
+        monkeypatch.setattr(PMap, 'values', no_scan)
+        monkeypatch.setattr(PMap, 'sorted_items', no_scan)
+        monkeypatch.setattr(rt, '_rank', no_scan)
+        assert rib.rows((500, 32)) == (rows[500],)
+        assert rib.candidates((500, 32)) is rib.rows((500, 32))
+        assert list(rib.best_groups((500, 32))) == [(rows[500],)]
+        assert rib.rows_of(STATIC) == rows
+        assert rib.rows_of(IGP) == ()
+        assert rib.rows((2000, 32)) == rib.rows((0, 24)) == ()
+
+    def test_rows_are_ranked_and_reranked_on_replacement(self):
+        a = static('10.0.0.4/32', [Nexthop.blackhole()], distance=20)
+        b = replace(a, distinguisher=('b',), distance=10, metric=5)
+        c = replace(b, source=IGP, metric=10)
+        d = replace(b, source=ClientId('static', 1))
+        rib = rib_apply(RibState.empty(IPV4), add=(a, c, d, b))
+        assert rib.rows(a.prefix) == (b, d, c, a)
+        promoted = replace(a, distance=10, metric=1)
+        updated = rib_apply(rib, add=(promoted,))
+        assert updated.rows(a.prefix) == (promoted, b, d, c)
+        demoted = replace(promoted, metric=20)
+        updated = rib_apply(updated, sync=(STATIC, (demoted, b)))
+        assert updated.rows(a.prefix) == (b, d, c, demoted)
+        assert rib.rows(a.prefix) == (b, d, c, a)
+        assert updated.rows_of(STATIC) == (demoted, b)
+
+    @pytest.mark.parametrize('af, bits', [(IPV4, 32), (IPV6, 128)])
+    def test_indexes_are_atomic_and_keep_other_clients(self, af, bits):
+        a = Route((0, bits), af, STATIC, 1, (Nexthop.blackhole(),))
+        b = replace(a, distinguisher=('b',))
+        c = replace(a, source=IGP, distance=110)
+        covering = replace(a, prefix=(0, 0))
+        rib = rib_apply(RibState.empty(af), add=(a, b, c, covering))
+        updated = rib_apply(rib, sync=(STATIC, (covering,)))
+        assert updated.rows(a.prefix) == (c,)
+        assert updated.rows_of(STATIC) == (covering,)
+        assert updated.rows_of(IGP) is rib.rows_of(IGP)
+        assert updated.prefixes.lookup(0) == (0, bits, (c,))
+        assert len(updated) == 2 and len(updated.prefixes) == 2
+        assert updated.prefixes._tables[0] is rib.prefixes._tables[0]
+        assert updated.shards[0] is rib.shards[0]
+        assert updated.rows(covering.prefix) is rib.rows(covering.prefix)
+        removed = rib_apply(updated, delete=(c.key,))
+        assert removed.prefixes.lookup(0) == (0, 0, (covering,))
+        assert bits not in removed.shards and removed.rows_of(IGP) == ()
+        assert IGP not in removed.clients
+        assert rib.rows(a.prefix) == (a, b, c) and len(rib) == 4
+        validate_immutable((rib.shards, rib.clients))
+        validate_immutable((updated.shards, updated.clients))
+        validate_immutable((removed.shards, removed.clients))
+
+    def test_batch_order_duplicates_and_noop_identity(self):
+        a = static('10.0.0.4/32', [Nexthop.blackhole()])
+        b = replace(a, metric=20)
+        rib = rib_apply(RibState.empty(IPV4), add=(a,))
+        assert rib_apply(rib, sync=(STATIC, (replace(a),))) is rib
+        updated = rib_apply(rib, sync=(STATIC, (b,)), delete=(a.key,), add=(a, b))
+        assert updated.rows(a.prefix) == updated.rows_of(STATIC) == (b,)
+        assert len(updated) == 1 and updated.shards[32][a.key] is b
+        with pytest.raises(ValueError, match='sync rows'):
+            rib_apply(updated, sync=(STATIC, (a, replace(b, source=IGP))))
+        assert updated.rows(a.prefix) == updated.rows_of(STATIC) == (b,)
+        assert rib.rows(a.prefix) == (a,)
+
+    def test_mixed_batches_match_flat_reference(self):
+        rng = Random(17)
+        clients = (STATIC, IGP, ClientId('igp', 1))
+        pool = tuple(
+            Route(
+                (net, plen),
+                IPV4,
+                client,
+                10,
+                (Nexthop.blackhole(),),
+                distinguisher=(d,),
+            )
+            for net, plen in ((0, 0), (0, 24), (256, 24), (1, 32), (2, 32))
+            for client in clients
+            for d in range(3)
+        )
+        rib = RibState.empty(IPV4)
+        expected = {}
+        snapshots = []
+        for _ in range(80):
+            client = rng.choice(clients)
+            synced = tuple(
+                replace(r, distance=rng.randrange(3), metric=rng.randrange(3))
+                for r in rng.sample(pool, 12)
+                if r.source == client
+            )
+            deleted = tuple(r.key for r in rng.sample(pool, 6))
+            added = tuple(
+                replace(r, distance=rng.randrange(3), metric=rng.randrange(3))
+                for r in rng.sample(pool, 10)
+            )
+            expected = {k: r for k, r in expected.items() if r.source != client}
+            expected.update((r.key, r) for r in synced)
+            for k in deleted:
+                expected.pop(k, None)
+            expected.update((r.key, r) for r in added)
+            rib = rib_apply(rib, sync=(client, synced), delete=deleted, add=added)
+            snapshots.append((rib, expected.copy()))
+
+        # Check every retained snapshot after all later mutations.
+        for rib, expected in snapshots:
+            assert len(rib) == len(expected)
+            assert {k: r for s in rib.shards.values() for k, r in s.items()} == expected
+            assert rib.all_prefixes() == sorted({r.prefix for r in expected.values()})
+            for prefix in {r.prefix for r in pool}:
+                ranked = tuple(
+                    sorted(
+                        (r for r in expected.values() if r.prefix == prefix),
+                        key=lambda r: (
+                            r.distance,
+                            r.metric,
+                            r.source.name,
+                            r.source.instance,
+                            r.distinguisher,
+                        ),
+                    )
+                )
+                assert rib.rows(prefix) == ranked
+                assert (prefix in rib.prefixes) == bool(ranked)
+                assert tuple(r for g in rib.best_groups(prefix) for r in g) == ranked
+                assert all(
+                    rib.shards[r.prefix[1]][r.key] is r for r in rib.rows(prefix)
+                )
+            for client in clients:
+                rows = tuple(
+                    expected[k]
+                    for k in sorted(expected)
+                    if expected[k].source == client
+                )
+                assert rib.rows_of(client) == rows
+                assert all(
+                    rib.shards[r.prefix[1]][r.key] is r for r in rib.rows_of(client)
+                )
+
     def test_add_delete_sync_and_identity(self):
         rib = RibState.empty(IPV4)
         r1 = static('10.0.0.4/32', [Nexthop.via('e1')])
@@ -104,7 +336,7 @@ class TestRibApply:
         assert (
             len(rib1) == 1
             and rib1.version == 1
-            and rib1.prefixes.get(*P('10.0.0.4/32')) == 1
+            and rib1.prefixes.get(*P('10.0.0.4/32')) == (r1,)
         )
         assert rib_apply(rib1, add=(r1,)) is rib1  # identical row: no-op
         assert (
@@ -112,9 +344,9 @@ class TestRibApply:
         )  # missing key: no-op
         r2 = static('10.0.0.4/32', [Nexthop.via('e2')], distinguisher=('b',))
         rib2 = rib_apply(rib1, add=(r2,))
-        assert len(rib2) == 2 and rib2.prefixes.get(*P('10.0.0.4/32')) == 2
+        assert len(rib2) == 2 and rib2.prefixes.get(*P('10.0.0.4/32')) == (r1, r2)
         rib3 = rib_apply(rib2, delete=(r1.key,))
-        assert len(rib3) == 1 and rib3.prefixes.get(*P('10.0.0.4/32')) == 1
+        assert len(rib3) == 1 and rib3.prefixes.get(*P('10.0.0.4/32')) == (r2,)
         rib4 = rib_apply(rib3, delete=(r2.key,))
         assert (
             len(rib4) == 0
