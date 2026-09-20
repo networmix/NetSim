@@ -35,10 +35,14 @@ from netsim.model.packets import (
     IPV4_HEADER,
     IPV6_HEADER,
     ORIGINATED,
+    SRH,
     SRH_BASE,
     SRH_ENTRY,
+    TRANSIT,
     EthernetFrame,
     IPv4Packet,
+    IPv6Packet,
+    L4Header,
     PacketTemplate,
     frame_bytes,
     ip_bytes,
@@ -78,9 +82,13 @@ class Demand:
     steer: PolicyRef | None = None
 
     def __post_init__(self) -> None:
-        if self.rate < 0 or self.payload_size <= 0 or self.flows < 1:
+        if (
+            self.rate < 0
+            or (self.template is None and self.payload_size <= 0)
+            or self.flows < 1
+        ):
             raise ValueError('demand needs rate >= 0, payload_size > 0, flows >= 1')
-        if self.template is not None and self.template.payload_size <= 0:
+        if self.template is not None and payload_bytes(self.template) <= 0:
             raise ValueError('template needs payload_size > 0')
 
     @property
@@ -88,18 +96,37 @@ class Demand:
         base = (self.af, self.dst, self.dscp, self.payload_size)
         if self.template is None and self.steer is None:
             return base  # Preserve Gate A cache keys exactly.
-        template = (
-            tuple(
-                getattr(self.template, f.name)
-                for f in dataclasses.fields(self.template)
-            )
-            if self.template is not None
-            else ()
-        )
+        template = _ordered_value(self.template) if self.template is not None else ()
         steer = (
             (self.steer.color, self.steer.endpoint) if self.steer is not None else ()
         )
         return (*base, template, steer)
+
+
+def payload_bytes(template: PacketTemplate) -> int:
+    """One authoritative rate denominator: payload of the innermost IP header."""
+    while template.inner is not None:
+        template = template.inner
+    return template.payload_size
+
+
+def _ordered_value(value: Any) -> tuple:
+    """Explicit tags keep optional headers/records totally ordered, deterministically."""
+    if value is None:
+        return (0,)
+    if isinstance(value, int):
+        return (1, value)
+    if isinstance(value, tuple):
+        return (2, tuple(_ordered_value(item) for item in value))
+    if isinstance(value, (PacketTemplate, SRH)):
+        return (
+            3 if isinstance(value, PacketTemplate) else 4,
+            tuple(
+                _ordered_value(getattr(value, f.name))
+                for f in dataclasses.fields(value)
+            ),
+        )
+    raise TypeError(f'unsupported packet-template field: {type(value).__name__}')
 
 
 def make_demand(id: str, source: str, dst: str, rate: float, **kw: Any) -> Demand:
@@ -117,6 +144,9 @@ class SourceResult:
     delivered: Fraction
     drops: tuple[tuple[str, str, Fraction], ...]
     transmissions: tuple[_Transmission, ...] = field(default=(), repr=False)
+    policy_outcomes: tuple[tuple[str, int, int, str, str, Fraction], ...] = field(
+        default=(), repr=False
+    )
     """Internal accounting metadata; omitted from the stable Gate A repr."""
 
 
@@ -137,11 +167,23 @@ class ClassResult:
     """Exact per-source results, filled only when the class has several
     sources and loses traffic (otherwise every source is fully delivered)."""
     transmissions: tuple[_Transmission, ...] = field(default=(), repr=False)
+    policy_outcomes: tuple[tuple[str, int, int, str, str, Fraction], ...] = field(
+        default=(), repr=False
+    )
     """Each leg's attempted/carried payload fraction and transmitted frame bytes.
     Packet rate on a leg is ``fraction * payload_rate / (8 * payload_size)``.
     Repeated uses of a physical edge remain separate transmissions."""
     cacheable: bool = field(default=True, repr=False)
     """False for injected steps whose external inputs have no dependency token."""
+
+
+@record
+class PolicyDelivery:
+    device: str
+    color: int
+    endpoint: int
+    delivered: float
+    drops: tuple[tuple[str, str, float], ...] = ()
 
 
 @record
@@ -154,6 +196,7 @@ class DemandResult:
     """``(edge_id, payload bit/s attempted)`` in FULL detail; empty when the
     demand shares a forwarding class with other sources, because the class
     walk does not attribute edges per source."""
+    policies: tuple[PolicyDelivery, ...] = field(default=(), repr=False)
 
 
 @record
@@ -257,6 +300,8 @@ class _PacketState(NamedTuple):
     active_da: int = 0
     continuation: tuple[int, ...] = ()
     stage: int = ORIGINATED
+    policies: tuple[tuple[str, int, int], ...] = ()
+    wire: tuple = ()
 
     def encap(
         self, active_da: int, srh_entries: int = 0, continuation: tuple[int, ...] = ()
@@ -267,15 +312,27 @@ class _PacketState(NamedTuple):
         if srh_entries < 0:
             raise ValueError('SRH entry count must be non-negative')
         return _PacketState(
-            self.inner_af, True, srh_entries, active_da, continuation, AFTER_ENCAP
+            self.inner_af,
+            True,
+            srh_entries,
+            active_da,
+            continuation,
+            AFTER_ENCAP,
+            self.policies,
         )
 
     def decap(self) -> _PacketState:
         """Pop the outer stack and expose the inner steering context."""
-        return _PacketState(self.inner_af, stage=AFTER_DECAP) if self.outer else self
+        return (
+            _PacketState(self.inner_af, stage=AFTER_DECAP, policies=self.policies)
+            if self.outer
+            else self
+        )
 
     def frame_bytes(self, payload_size: int) -> int:
         # RFC 8200 section 3 and RFC 8754 section 2: outer 40 + SRH 8 + 16*n.
+        if self.wire:
+            return frame_bytes(_packet_from_token(self.wire))
         size = _frame_bytes(self.inner_af, payload_size)
         if self.outer:
             size += IPV6_HEADER
@@ -430,6 +487,170 @@ def _egress_edges(
     return fw.TRANSMIT, entry, edges, drops
 
 
+class _Observed(NamedTuple):
+    entry: Any
+    terminals: tuple[tuple[str, Fraction, tuple[tuple[str, int, int], ...]], ...]
+
+
+class _Branch(Exception):
+    def __init__(self, weights: tuple[int, ...]) -> None:
+        self.weights = weights
+
+
+def _forward_edges(
+    state: NetworkState,
+    device: str,
+    packet_state: _PacketState,
+    af: int,
+    dst: int,
+    payload_size: int,
+    *,
+    template: PacketTemplate | None = None,
+    steer: PolicyRef | None = None,
+    dscp: int = 0,
+) -> _Decision:
+    """Enumerate the interpreter's weighted decisions, preserving packet state.
+
+    The packet interpreter remains the only implementation of local actions.
+    Selection is pure: each branch replays a finite prefix of choices. TTL is
+    intentionally absent from FLUID identity; the walk cuts cycles by SCC.
+    """
+    from netsim.model.network import _View
+
+    view = _View(state, device)
+    fib = view.fib(6 if packet_state.outer else af)
+    entry = (
+        fib.lookup(packet_state.active_da if packet_state.outer else dst)
+        if fib
+        else None
+    )
+    group = fib.group(entry) if fib and entry else None
+    sr_fib = view.fib(6)
+    if not (
+        packet_state.wire
+        or packet_state.outer
+        or steer is not None
+        or sr_fib
+        and sr_fib.steering
+        or entry
+        and (entry.action == fw.SRV6_LOCAL or isinstance(entry.program, PolicyRef))
+        or group
+        and any(a.encap is not None for a in group.adjacencies)
+    ):
+        decision = _egress_edges(
+            state,
+            device,
+            packet_state,
+            af,
+            dst,
+            payload_size,
+            template=template,
+            dscp=dscp,
+        )
+        if packet_state.policies:
+            action, entry, edges, losses = decision
+            terms = (
+                ((fw.DELIVER, Fraction(1), packet_state.policies),)
+                if action == fw.DELIVER
+                else tuple(
+                    (reason, fraction, packet_state.policies)
+                    for reason, fraction in losses
+                )
+            )
+            return action, _Observed(entry, terms), edges, losses
+        return decision
+    inner = (
+        template
+        or PacketTemplate(
+            af,
+            _source_address(state, device, af),
+            dst,
+            payload_size=payload_size,
+            dscp=dscp,
+        )
+    ).to_packet()
+    packet = inner
+    if packet_state.wire:
+        packet = _packet_from_token(packet_state.wire)
+    elif packet_state.outer:
+        srh = None
+        if packet_state.srh_entries:
+            sl, le, nh, flags, tag, *entries = packet_state.continuation
+            srh = SRH(tuple(entries), sl, le, flags, tag, nh)
+        packet = IPv6Packet(
+            0,
+            packet_state.active_da,
+            43 if srh else 4 if af == 4 else 41,
+            payload=inner,
+            srh=srh,
+            traffic_class=dscp << 2,
+            hop_limit=255,
+        )
+    branches: list[tuple[tuple[int, ...], Fraction]] = [((), Fraction(1))]
+    terminals = []
+    edges: list[_Edge] = []
+    drops: list[tuple[str, Fraction]] = []
+    while branches:
+        choices, share = branches.pop()
+        cursor = 0
+
+        def select(_domain, _key, weights, choices=choices):
+            nonlocal cursor
+            if len(weights) == 1:
+                return 0
+            if cursor == len(choices):
+                raise _Branch(weights)
+            choice = choices[cursor]
+            cursor += 1
+            return choice
+
+        observed: list[tuple[int, int]] = []
+        try:
+            result = fw.forward_ip(
+                view,
+                packet,
+                None,
+                packet_state.stage,
+                policy=steer if packet_state.stage == ORIGINATED else None,
+                select=select,
+                fluid=True,
+                policies=observed,
+            )
+        except _Branch as branch:
+            total = sum(branch.weights)
+            for i in reversed(range(len(branch.weights))):
+                branches.append(
+                    (choices + (i,), share * Fraction(branch.weights[i], total))
+                )
+            continue
+        history = tuple(
+            sorted(set(packet_state.policies) | {(device, c, e) for c, e in observed})
+        )
+        if result.edge_id is None:
+            reason = (
+                fw.DELIVER
+                if result.outcome == fw.DELIVER
+                else result.reason or fw.NO_ROUTE
+            )
+            drops.append((reason, share))
+            terminals.append((reason, share, history))
+            continue
+        assert result.packet is not None and result.peer is not None
+        output = result.packet
+        successor = _state_from_packet(output, TRANSIT, history)
+        edges.append(
+            _Edge(
+                result.edge_id,
+                result.peer[0],
+                share,
+                result.reason if result.outcome == fw.DROP else None,
+                frame_bytes(output),
+                successor,
+            )
+        )
+    return fw.TRANSMIT, _Observed(entry, tuple(terminals)), edges, drops
+
+
 def _bounded_fraction(value: float) -> Fraction:
     """The exact fraction of a non-negative float (floats are dyadic
     rationals, so this is always representable). Nothing is rounded to a
@@ -535,10 +756,15 @@ def walk_class(
     the immutable snapshot, including complete continuation in every vertex.
     """
     if template is not None:
-        af, dst, payload_size = template.af, template.dst, template.payload_size
+        af, dst, payload_size = template.af, template.dst, payload_bytes(template)
         dscp = template.dscp
-    initial = _PacketState(af)
-    expand = _egress_edges if step is None else step
+    initial = (
+        _state_from_packet(template.to_packet(), ORIGINATED)
+        if template is not None
+        and (template.inner is not None or template.srh is not None)
+        else _PacketState(af)
+    )
+    expand = _forward_edges if step is None else step
     decisions: dict[_Vertex, _Decision] = {}
     succ: dict[_Vertex, list[_Vertex]] = {}
     order: list[_Vertex] = []
@@ -581,6 +807,14 @@ def walk_class(
     carried: dict[int, Fraction] = defaultdict(Fraction)
     transmissions: list[_Transmission] = []
     zero = Fraction(0)
+    policy_outcomes: dict[tuple[str, int, int, str, str], Fraction] = defaultdict(
+        Fraction
+    )
+
+    def observe(history, reason, where, fraction):
+        for device, color, endpoint in history:
+            policy_outcomes[(device, color, endpoint, reason, where)] += fraction
+
     delivered = zero
     drops: dict[tuple[str, str], Fraction] = defaultdict(Fraction)
     # Tarjan yields components in reverse topological order: process from the last.
@@ -590,11 +824,17 @@ def walk_class(
             if q == 0:
                 continue
             action, _entry, egress, node_drops = decisions[v]
+            if isinstance(_entry, _Observed):
+                for reason, fraction, history in _entry.terminals:
+                    observe(history, reason, v[0], q * fraction)
             if action == fw.DELIVER:
                 delivered += q
                 continue
             for reason, f in node_drops:
-                drops[(reason, v[0])] += q * f
+                if reason == fw.DELIVER:
+                    delivered += q * f
+                else:
+                    drops[(reason, v[0])] += q * f
             if action == fw.DROP:
                 continue
             for e in egress:
@@ -606,6 +846,9 @@ def walk_class(
                     reason = fw.LOOP
                 if reason is not None:
                     drops[(reason, _edge_loc(e.edge_id))] += share
+                    observe(
+                        e.packet_state.policies, reason, _edge_loc(e.edge_id), share
+                    )
                     transmissions.append(
                         _Transmission(e.edge_id, e.frame_bytes, share, zero)
                     )
@@ -626,6 +869,12 @@ def walk_class(
                         drops[(fw.CONGESTION, _edge_loc(e.edge_id))] += (
                             share - carried_share
                         )
+                        observe(
+                            e.packet_state.policies,
+                            fw.CONGESTION,
+                            _edge_loc(e.edge_id),
+                            share - carried_share,
+                        )
                         residual[e.edge_id] = 0.0
                     else:
                         carried_share = share
@@ -644,6 +893,9 @@ def walk_class(
         tuple(sorted((r, w, f) for (r, w), f in drops.items())),
         tuple(sorted({d for d, _packet_state in order})),
         tuple(sorted(sources.items())),
+        policy_outcomes=tuple(
+            (*key, value) for key, value in sorted(policy_outcomes.items())
+        ),
         transmissions=tuple(transmissions),
         cacheable=step is None,
     )
@@ -708,6 +960,7 @@ def walk_hash(
     residual: list[float] | None = None,
     *,
     wire: tuple[dict[int, float], dict[int, float]] | None = None,
+    policy_outcomes: dict[tuple[str, int, int, str, str], float] | None = None,
 ) -> tuple[dict[int, float], dict[int, float], float, dict[tuple[str, str], float]]:
     """Per microflow forward-step execution; returns edge offered/carried
     payload rates, delivered payload rate and drops. With ``residual``
@@ -720,6 +973,7 @@ def walk_hash(
         dscp=demand.dscp,
         payload_size=demand.payload_size,
     )
+    payload_size = payload_bytes(template)
     per_flow = demand.rate / demand.flows
     offered: dict[int, float] = defaultdict(float)
     carried: dict[int, float] = defaultdict(float)
@@ -736,24 +990,38 @@ def walk_hash(
         reason: str | None = fw.LOOP
         where = current
         rate = per_flow  # payload bit/s still flowing on this microflow
+        history: set[tuple[str, int, int]] = set()
         for _ in range(max_hops):
             view = views(current)
+            observed: list[tuple[int, int]] = []
             if frame is None:
                 res = (
-                    fw.StepResult(fw.DROP, reason=fw.SRV6_UNSUPPORTED)
-                    if demand.steer is not None
+                    fw.forward_ip(
+                        view,
+                        packet,
+                        None,
+                        ORIGINATED,
+                        policy=demand.steer,
+                        policies=observed,
+                    )
+                    if policy_outcomes is not None or demand.steer is not None
                     else fw.forward_ip(view, packet, None, ORIGINATED)
                 )
             else:
                 assert ingress is not None
-                res = fw.receive_frame(view, ingress, frame)
+                res = (
+                    fw.receive_frame(view, ingress, frame, policies=observed)
+                    if policy_outcomes is not None
+                    else fw.receive_frame(view, ingress, frame)
+                )
+            history.update((current, c, e) for c, e in observed)
             where = current
             wire_per_payload = 0.0
             frame_len = 0
             if res.edge_id is not None:
                 assert res.packet is not None
                 frame_len = frame_bytes(res.packet)
-                wire_per_payload = frame_len / template.payload_size
+                wire_per_payload = frame_len / payload_size
                 offered[res.edge_id] += rate
                 if wire is not None:
                     wire_offered[(res.edge_id, frame_len)] += rate
@@ -773,6 +1041,12 @@ def walk_hash(
                 if attempted > wire_cap:
                     fits = max(wire_cap, 0.0) / wire_per_payload
                     drops[(fw.CONGESTION, _edge_loc(res.edge_id))] += rate - fits
+                    if policy_outcomes is not None:
+                        for dev, c, e in history:
+                            k = (dev, c, e, fw.CONGESTION, _edge_loc(res.edge_id))
+                            policy_outcomes[k] = (
+                                policy_outcomes.get(k, 0.0) + rate - fits
+                            )
                     residual[res.edge_id] = 0.0
                     rate = fits
                 else:
@@ -786,6 +1060,16 @@ def walk_hash(
             )
             frame = EthernetFrame(res.mac_dst or 0, res.mac_src or 0, ethertype, packet)
             current, ingress = res.peer
+        if policy_outcomes is not None:
+            for dev, c, e in history:
+                k = (
+                    dev,
+                    c,
+                    e,
+                    fw.DELIVER if outcome == fw.DELIVER else reason or fw.LOOP,
+                    where,
+                )
+                policy_outcomes[k] = policy_outcomes.get(k, 0.0) + rate
         if outcome == fw.DELIVER:
             delivered += rate
         else:
@@ -796,7 +1080,7 @@ def walk_hash(
         for rates, output in zip((wire_offered, wire_carried), wire, strict=True):
             for (edge, size), payload_rate in sorted(rates.items()):
                 output[edge] = output.get(edge, 0.0) + payload_rate * (
-                    size / template.payload_size
+                    size / payload_size
                 )
     return offered, carried, delivered, drops
 
@@ -890,6 +1174,7 @@ def derive_placement(
         attributed: bool = True,
         *,
         wire: tuple[dict[int, float], dict[int, float]],
+        policy_outcomes: tuple = (),
     ) -> None:
         nonlocal delivered_total
         for e, r in wire[0].items():
@@ -907,6 +1192,7 @@ def derive_placement(
             delivered,
             tuple(sorted((reason, where, r) for (reason, where), r in drops.items())),
             tuple(sorted(edges.items())) if detail and attributed else (),
+            _policy_deliveries(policy_outcomes),
         )
 
     residual = list(caps) if model == LOSSY else None
@@ -959,7 +1245,11 @@ def derive_placement(
             # Edge loads are linear, so the class walk gives them exactly.
             # Per-demand delivery is exact only per source: a class with
             # several sources that loses traffic is re-walked per source.
-            if len(sources) > 1 and walk.drops and not walk.per_source:
+            if (
+                len(sources) > 1
+                and (walk.drops or walk.policy_outcomes)
+                and not walk.per_source
+            ):
                 walk = dataclasses.replace(
                     walk,
                     per_source=tuple(
@@ -975,7 +1265,9 @@ def derive_placement(
             per_source = dict(walk.per_source)
             single = len(sources) == 1
             for d in members:
-                payload_size = d.template.payload_size if d.template else d.payload_size
+                payload_size = (
+                    payload_bytes(d.template) if d.template else d.payload_size
+                )
                 sr = per_source.get(d.source)
                 if sr is not None:
                     account(
@@ -985,6 +1277,7 @@ def derive_placement(
                         float(sr.delivered) * d.rate,
                         {(r, w): float(fr) * d.rate for r, w, fr in sr.drops},
                         wire=_wire_rates(sr, payload_size, d.rate),
+                        policy_outcomes=_scaled_outcomes(sr, d.rate),
                     )
                     continue
                 f = d.rate / total
@@ -996,18 +1289,50 @@ def derive_placement(
                     {(r, w): float(fr) * total * f for r, w, fr in walk.drops},
                     attributed=single,
                     wire=_wire_rates(walk, payload_size, total, f),
+                    policy_outcomes=_scaled_outcomes(walk, d.rate),
                 )
         for d in demands:
             if d.mode == HASH:
                 wire = ({}, {})
-                o, c, dl, dr = walk_hash(state, d, views, wire=wire)
-                account(d, o, c, dl, dr, wire=wire)
+                outcomes = {} if state.srv6_consumers or d.steer is not None else None
+                o, c, dl, dr = walk_hash(
+                    state, d, views, wire=wire, policy_outcomes=outcomes
+                )
+                account(
+                    d,
+                    o,
+                    c,
+                    dl,
+                    dr,
+                    wire=wire,
+                    policy_outcomes=tuple(
+                        (*k, v) for k, v in sorted((outcomes or {}).items())
+                    ),
+                )
     else:
         for d in demands:
             if d.mode == HASH:
                 wire = ({}, {})
-                o, c, dl, dr = walk_hash(state, d, views, residual=residual, wire=wire)
-                account(d, o, c, dl, dr, wire=wire)
+                outcomes = {} if state.srv6_consumers or d.steer is not None else None
+                o, c, dl, dr = walk_hash(
+                    state,
+                    d,
+                    views,
+                    residual=residual,
+                    wire=wire,
+                    policy_outcomes=outcomes,
+                )
+                account(
+                    d,
+                    o,
+                    c,
+                    dl,
+                    dr,
+                    wire=wire,
+                    policy_outcomes=tuple(
+                        (*k, v) for k, v in sorted((outcomes or {}).items())
+                    ),
+                )
                 continue
             walk = walk_class(
                 state,
@@ -1028,9 +1353,10 @@ def derive_placement(
                 {e: float(fr) * d.rate for e, fr in walk.carried},
                 float(walk.delivered) * d.rate,
                 {(r, w): float(fr) * d.rate for r, w, fr in walk.drops},
+                policy_outcomes=_scaled_outcomes(walk, d.rate),
                 wire=_wire_rates(
                     walk,
-                    d.template.payload_size if d.template else d.payload_size,
+                    payload_bytes(d.template) if d.template else d.payload_size,
                     d.rate,
                 ),
             )
@@ -1094,7 +1420,14 @@ def _source_result(
         dscp=demand.dscp,
         step=step,
     )
-    return SourceResult(w.edges, w.carried, w.delivered, w.drops, w.transmissions)
+    return SourceResult(
+        w.edges,
+        w.carried,
+        w.delivered,
+        w.drops,
+        policy_outcomes=w.policy_outcomes,
+        transmissions=w.transmissions,
+    )
 
 
 def _deps_valid(
@@ -1150,3 +1483,130 @@ __all__ = [
     'edge_of_location',
     'BalancerKind',
 ]
+
+
+def _policy_deliveries(outcomes: tuple) -> tuple[PolicyDelivery, ...]:
+    grouped: dict[tuple[str, int, int], list[tuple[str, str, float]]] = defaultdict(
+        list
+    )
+    for device, color, endpoint, reason, where, rate in outcomes:
+        grouped[(device, color, endpoint)].append((reason, where, float(rate)))
+    return tuple(
+        PolicyDelivery(
+            *key,
+            sum(rate for reason, _, rate in values if reason == fw.DELIVER),
+            tuple(
+                (reason, where, rate)
+                for reason, where, rate in values
+                if reason != fw.DELIVER
+            ),
+        )
+        for key, values in sorted(grouped.items())
+    )
+
+
+def _scaled_outcomes(walk: ClassResult | SourceResult, rate: float) -> tuple:
+    return tuple(
+        (d, c, e, r, w, float(f) * rate) for d, c, e, r, w, f in walk.policy_outcomes
+    )
+
+
+def _packet_token(packet: Any) -> tuple:
+    """Full FLUID header continuation, omitting only TTL/hop limit."""
+    payload = packet.payload
+    tail = (
+        (1, payload.sport, payload.dport)
+        if isinstance(payload, L4Header)
+        else (2, _packet_token(payload))
+        if isinstance(payload, (IPv4Packet, IPv6Packet))
+        else (0,)
+    )
+    if isinstance(packet, IPv4Packet):
+        return (
+            4,
+            packet.src,
+            packet.dst,
+            packet.protocol,
+            packet.dscp,
+            packet.ecn,
+            packet.payload_size,
+            tail,
+        )
+    srh = packet.srh
+    header = (
+        (
+            srh.entries,
+            srh.segments_left,
+            srh.last_entry,
+            srh.flags,
+            srh.tag,
+            srh.next_header,
+        )
+        if srh
+        else ()
+    )
+    return (
+        6,
+        packet.src,
+        packet.dst,
+        packet.next_header,
+        packet.traffic_class,
+        packet.flow_label,
+        packet.payload_size,
+        header,
+        tail,
+    )
+
+
+def _packet_from_token(token: tuple):
+    tail = token[-1]
+    payload = (
+        L4Header(tail[1], tail[2])
+        if tail[0] == 1
+        else _packet_from_token(tail[1])
+        if tail[0] == 2
+        else None
+    )
+    if token[0] == 4:
+        return IPv4Packet(
+            token[1],
+            token[2],
+            token[3],
+            ttl=255,
+            dscp=token[4],
+            ecn=token[5],
+            payload_size=token[6],
+            payload=payload,
+        )
+    return IPv6Packet(
+        token[1],
+        token[2],
+        token[3],
+        hop_limit=255,
+        traffic_class=token[4],
+        flow_label=token[5],
+        payload_size=token[6],
+        srh=SRH(*token[7]) if token[7] else None,
+        payload=payload,
+    )
+
+
+def _state_from_packet(
+    packet: Any, stage: int, policies: tuple[tuple[str, int, int], ...] = ()
+) -> _PacketState:
+    inner = packet
+    while isinstance(inner.payload, (IPv4Packet, IPv6Packet)):
+        inner = inner.payload
+    af = 4 if isinstance(inner, IPv4Packet) else 6
+    outer = inner is not packet
+    srh = packet.srh if isinstance(packet, IPv6Packet) else None
+    return _PacketState(
+        af,
+        outer,
+        len(srh.entries) if srh else 0,
+        packet.dst,
+        (),
+        stage,
+        policies,
+        _packet_token(packet),
+    )

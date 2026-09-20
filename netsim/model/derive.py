@@ -730,12 +730,18 @@ def derive_fib(
 ) -> NetworkState:
     if targets is None:
         targets = [(d, af) for d, _ in state.devices.sorted_items() for af in AFS]
+    targets = tuple(sorted(targets))
+    # Validate against one input snapshot before installing any device's FIB.
+    validated = {
+        d: srv6.derive_policy_states(state, d)
+        for d in sorted({d for d, _ in targets})
+        if d in state.devices and state.devices[d].srv6_policies is not None
+    }
     devices = state.devices.builder()
     for device, af in targets:
         dev = devices.get(device)
         if dev is None:
             continue
-        ctx = DeviceContext(_with_device(state, device, dev), device)
         policy = dev.config.resolution_policy or ResolutionPolicy()
         old = dev.fibs.get(af)
         epoch = dev.resolver_input_epoch.get(af, 0)
@@ -746,6 +752,9 @@ def derive_fib(
             and prev_outcome.processed_epoch == epoch
         ):
             continue  # inputs unchanged since the last resolution: nothing to do
+        if device in validated:
+            dev = dataclasses.replace(dev, srv6_policies=validated[device])
+        ctx = DeviceContext(_with_device(state, device, dev), device)
         version = (old.version + 1) if old is not None else 1
         fib, outcome = resolve_fib(ctx.rib(af), ctx, policy, version, epoch, old)
         new_dev = dev
@@ -755,7 +764,41 @@ def derive_fib(
             new_dev = dataclasses.replace(
                 new_dev, resolver_outcomes=new_dev.resolver_outcomes.set(af, outcome)
             )
-        if new_dev is not dev:
+        if new_dev.srv6_policies is not None:
+            table = new_dev.srv6_policies
+            installed = new_dev.fibs.get(IPV6)
+            table = dataclasses.replace(
+                table,
+                states=PMap(
+                    (
+                        key,
+                        canon(
+                            table.states[key],
+                            dataclasses.replace(
+                                value,
+                                programming='INSTALLED'
+                                if all(
+                                    new_dev.resolver_outcomes.get(family) is not None
+                                    and new_dev.resolver_outcomes[
+                                        family
+                                    ].processed_epoch
+                                    == new_dev.resolver_input_epoch.get(family, 0)
+                                    for family in AFS
+                                )
+                                else 'PENDING',
+                                programmed_version=installed.version
+                                if installed
+                                else 0,
+                            ),
+                        ),
+                    )
+                    for key, value in table.states.sorted_items()
+                ),
+            )
+            new_dev = dataclasses.replace(
+                new_dev, srv6_policies=canon(dev.srv6_policies, table)
+            )
+        if new_dev != devices[device]:
             devices.set(device, new_dev)
     new_devices = devices.build()
     return (
@@ -822,7 +865,28 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
         if epochs is not dev.resolver_input_epoch:
             devices.set(name, dataclasses.replace(dev, resolver_input_epoch=epochs))
     built = devices.build()
-    return new if built is new.devices else dataclasses.replace(new, devices=built)
+    result = new if built is new.devices else dataclasses.replace(new, devices=built)
+    # Validation is observable immediately; the FIB kind alone programs actions.
+    updates = result.devices.builder()
+    for name in sorted(consumers):
+        dev = result.devices[name]
+        pending = any(
+            dev.resolver_outcomes.get(af) is None
+            or dev.resolver_outcomes[af].processed_epoch
+            != dev.resolver_input_epoch.get(af, 0)
+            for af in AFS
+        )
+        if not pending:
+            continue
+        table = srv6.derive_policy_states(result, name)
+        if table is not dev.srv6_policies:
+            updates.set(name, dataclasses.replace(dev, srv6_policies=table))
+    built = updates.build()
+    return (
+        result
+        if built is result.devices
+        else dataclasses.replace(result, devices=built)
+    )
 
 
 # ---------------------------------------------------------------------------

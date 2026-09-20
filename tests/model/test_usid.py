@@ -579,7 +579,6 @@ def install_policy_path(net, sids, *, symbolic=False, destination=4):
     return policy
 
 
-@pytest.mark.skip(reason='needs G5 policies')
 @pytest.mark.parametrize('path', ['strict-literal', 'strict-symbolic', 'loose'])
 def test_policy_counterpart_compresses_and_delivers_the_configured_path(path):
     net, _ = diamond()
@@ -631,7 +630,6 @@ def form_path(net, form):
     return sids, expected, path
 
 
-@pytest.mark.skip(reason='needs G5 policies')
 @pytest.mark.parametrize('form', ['bare', 'composite', 'wlib', 'two-blocks'])
 def test_policy_counterpart_preserves_forms_widths_and_blocks(form):
     net, _ = diamond(numbered=True)

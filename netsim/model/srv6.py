@@ -299,7 +299,14 @@ class PolicyState:
     reasons: tuple[tuple[int, int, str], ...] = ()
     """Rejections ``(path index, list index, reason)`` from any validation layer."""
     programmed_version: int = 0
-    """FIB version that carries this state (PENDING until the FIB run)."""
+    """Last installed IPv6 FIB version, retained while programming is PENDING."""
+    strict_valid: tuple[tuple[int, int], ...] = ()
+    """Lists that pass the strict profile, independently of profile enablement."""
+    first_valid: tuple[tuple[int, int], ...] = ()
+    programming: str = 'PENDING'
+    dependencies: tuple[tuple[str, str, str, str], ...] = ()
+    """(device, query kind, query, result), including negative queries."""
+    active_candidate: tuple[int, tuple[int, int], int] | None = None
 
 
 @record
@@ -1277,3 +1284,417 @@ def policy_inputs(table: Srv6Policies | None) -> tuple[Any, ...]:
         if table
         else ()
     )
+
+
+@record
+class PolicyProgram:
+    """Installed policy action; never read live validation on a packet path."""
+
+    lists: tuple[tuple[Srv6Encap, int], ...] = ()
+    fallback: int = FALLBACK_DROP
+    candidate: tuple[int, tuple[int, int], int] | None = None
+
+
+def policy_programs(table: Srv6Policies | None) -> PMap[tuple[int, int], PolicyProgram]:
+    if table is None:
+        return PMap()
+    programs = []
+    for key, policy in table.policies.sorted_items():
+        state = table.states.get(key) or PolicyState()
+        lists = tuple(
+            (
+                Srv6Encap(entries, policy=key),
+                policy.candidate_paths[pi].segment_lists[li].weight,
+            )
+            for pi, li, entries in sorted(
+                state.valid_lists,
+                key=lambda item: (
+                    -policy.candidate_paths[item[0]].segment_lists[item[1]].weight,
+                    policy.candidate_paths[item[0]].segment_lists[item[1]].name or '',
+                    item[1],
+                ),
+            )
+        )
+        programs.append(
+            (key, PolicyProgram(lists, policy.fallback, state.active_candidate))
+        )
+    return PMap(programs)
+
+
+class _PolicyValidator:
+    """One immutable snapshot for all queries; caches are invocation-local."""
+
+    def __init__(self, state: NetworkState, head: str) -> None:
+        self.state = state
+        self.head = head
+        self.deps: set[tuple[str, str, str, str]] = set()
+        self.queries: dict[tuple[str, int], Any] = {}
+
+    def query(self, device: str, kind: str, key: Any, result: Any) -> None:
+        self.deps.add((device, kind, str(key), str(result)))
+
+    def symbolic(self, segment: AdjSeg | NodeSeg | TermSeg) -> LocalSid | None:
+        dev = self.state.devices.get(segment.device)
+        sids = dev.srv6_sids.sids if dev and dev.srv6_sids else PMap()
+        matches = [
+            sid
+            for sid in sids.values()
+            if (
+                isinstance(segment, AdjSeg)
+                and sid.behavior == END_X
+                and sid.interface == segment.interface
+                or isinstance(segment, NodeSeg)
+                and sid.behavior == END
+                or isinstance(segment, TermSeg)
+                and sid.behavior == segment.behavior
+            )
+        ]
+        sid = min(matches, key=lambda s: s.sid) if matches else None
+        self.query(segment.device, 'symbolic', segment, sid.sid if sid else 'MISSING')
+        return sid
+
+    def literal(self, address: int, current: str) -> tuple[str, LocalSid] | None:
+        matches = []
+        for name, dev in self.state.devices.sorted_items():
+            if dev.srv6_sids:
+                for sid in dev.srv6_sids.sids.values():
+                    if contains((sid.sid, sid.length), address):
+                        matches.append((name, sid))
+        matches.sort(
+            key=lambda pair: (-pair[1].length, pair[0] != current, pair[0], pair[1].sid)
+        )
+        result = matches[0] if matches else None
+        self.query(current, 'sid', address, result[0] if result else 'MISSING')
+        return result
+
+    def peer(self, device: str, interface: str) -> str | None:
+        from netsim.model.derive import bundle_members, peer_bundle_key, peer_endpoint
+        from netsim.model.interfaces import PortChannelNode
+
+        dev = self.state.devices[device]
+        node = dev.interfaces.get(interface)
+        if isinstance(node, PortChannelNode):
+            peers = {
+                p[0]
+                for member in bundle_members(dev, interface)
+                if (p := peer_bundle_key(self.state, device, member.name)) is not None
+            }
+            result = next(iter(peers)) if len(peers) == 1 else None
+        else:
+            endpoint = peer_endpoint(self.state, device, interface)
+            result = endpoint[0] if endpoint else None
+        self.query(device, 'adjacency', interface, result or 'MISSING')
+        return result
+
+    def forwarding(self, device: str, address: int):
+        from netsim.model.derive import DeviceContext
+        from netsim.model.routing import ResolutionPolicy, resolve_underlay_query
+
+        key = device, address
+        if key not in self.queries:
+            ctx = DeviceContext(self.state, device)
+            self.queries[key] = resolve_underlay_query(
+                ctx, ctx.dev.config.resolution_policy or ResolutionPolicy(), address
+            )
+        entry, legs, deps = self.queries[key]
+        self.query(device, 'rib', address, entry.prefix if entry else 'MISSING')
+        for af, addr in deps.lookups:
+            self.query(device, 'recursive', (af, addr), 'QUERIED')
+        for prefix in deps.prefixes:
+            self.query(device, 'prefix', prefix, 'QUERIED')
+        for interface in deps.interfaces:
+            self.query(device, 'interface', interface, 'QUERIED')
+        return entry, legs
+
+    def reaches(self, current: str, owner: str, address: int) -> str | None:
+        from netsim.model import forwarding as fw
+
+        # Iterative DFS detects loops without a Python recursion-depth limit.
+        pending = [(current, frozenset())]
+        good = False
+        failures: set[str] = set()
+        while pending:
+            node, visited = pending.pop()
+            self.query(node, 'reach', address, owner)
+            if node == owner:
+                good = True
+                continue
+            if node in visited:
+                failures.add('LOOP_DETECTED')
+                self.query(node, 'rib', address, 'LOOP_DETECTED')
+                continue
+            entry, legs = self.forwarding(node, address)
+            if entry is None or entry.action != fw.FORWARD or not legs:
+                failures.add(PATH_UNREACHABLE)
+                self.query(
+                    node, 'failure', address, entry.action if entry else 'NO_ROUTE'
+                )
+                continue
+            for leg in reversed(legs):
+                peer = self.peer(node, leg.interface)
+                if peer is None or leg.encap is not None:
+                    failures.add(PATH_UNREACHABLE)
+                else:
+                    pending.append((peer, visited | {node}))
+        if good and failures:
+            return PARTIAL_ECMP
+        return min(failures) if failures else None
+
+    def strict(self, segments: tuple[Any, ...], policy: SrPolicy) -> str | None:
+        current = self.head
+        for i, segment in enumerate(segments):
+            symbolic = isinstance(segment, (AdjSeg, NodeSeg, TermSeg))
+            address = (
+                segment.address
+                if isinstance(segment, LiteralSid)
+                else segment
+                if isinstance(segment, int)
+                else 0
+            )
+            if symbolic:
+                sid = self.symbolic(segment)
+                owner = segment.device
+            else:
+                found = self.literal(address, current)
+                owner, sid = found if found else ('', None)
+            if sid is None:
+                return PATH_UNREACHABLE
+            if symbolic:
+                address = sid.sid
+            self.query(owner, 'sid-oper', sid.sid, sid.adjacency_up)
+            last = i == len(segments) - 1
+            if sid.behavior == END_DT46 and not last:
+                return TERMINAL_NOT_LAST
+            if last:
+                if sid.behavior != END_DT46 and not sid.flavors & USD:
+                    return ENDPOINT_NO_DECAP
+                dev = self.state.devices[owner]
+                endpoint_owned = any(
+                    policy.endpoint == a
+                    for node in dev.interfaces.values()
+                    for a, _ in node.config.ipv6
+                )
+                endpoint_owned |= bool(
+                    dev.srv6_sids
+                    and any(
+                        contains(loc.prefix, policy.endpoint)
+                        for loc in dev.srv6_sids.locators.values()
+                    )
+                )
+                self.query(owner, 'endpoint', policy.endpoint, endpoint_owned)
+                if not endpoint_owned:
+                    return ENDPOINT_MISMATCH
+            # RFC 9800 sections 5.1-5.2: LIB scope is the executing node.
+            bare = is_csid(sid.structure) and sid.structure.lnl == 0
+            if bare:
+                if current != owner:
+                    self.query(current, 'local-scope', sid.sid, f'WRONG_OWNER:{owner}')
+                    return PATH_UNREACHABLE
+            else:
+                reason = self.reaches(current, owner, address)
+                if reason:
+                    return reason
+                current = owner
+            if sid.behavior == END_X:
+                if not sid.adjacency_up or sid.interface is None:
+                    return PATH_UNREACHABLE
+                peer = self.peer(owner, sid.interface)
+                if peer is None:
+                    return PATH_UNREACHABLE
+                current = peer
+        return None
+
+
+def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | None:
+    """RFC 9256 section 5.1 layers, then NetSim's stronger end-to-end profile.
+
+    Literal metadata is used only for compression, never inferred from the DB.
+    Strict results are exposed even when validation is disabled for trap studies.
+    """
+    from netsim.model.derive import DeviceContext
+    from netsim.model.routing import ResolutionPolicy, resolve_first_entry
+    from netsim.model.srv6_compress import compress
+
+    dev = state.devices[device]
+    table = dev.srv6_policies
+    if table is None:
+        return None
+    settings = dev.config.resolution_policy or ResolutionPolicy()
+    states = table.states.builder()
+    for key in table.states:
+        if key not in table.policies:
+            states.remove(key)
+    for key, policy in table.policies.sorted_items():
+        validator = _PolicyValidator(state, device)
+        basic, first, strict, reasons, valid = [], [], [], [], []
+        for pi, path in enumerate(policy.candidate_paths):
+            for li, segment_list in enumerate(path.segment_lists):
+                reason = (
+                    EMPTY_LIST
+                    if not segment_list.segments
+                    else ZERO_WEIGHT
+                    if segment_list.weight <= 0
+                    else None
+                )
+                encoded = []
+                for segment in segment_list.segments:
+                    if isinstance(segment, (AdjSeg, NodeSeg, TermSeg)):
+                        sid = validator.symbolic(segment)
+                        if sid is None:
+                            reason = reason or SYMBOLIC_UNRESOLVABLE
+                        else:
+                            encoded.append((sid.sid, sid.structure, sid.flavors))
+                    elif isinstance(segment, LiteralSid):
+                        encoded.append(
+                            (segment.address, segment.structure, segment.flavors or 0)
+                        )
+                    elif isinstance(segment, int) and 0 <= segment < 1 << 128:
+                        encoded.append((segment, None, 0))
+                    else:
+                        reason = reason or 'SR_MPLS_MIX'
+                if reason:
+                    reasons.append((pi, li, reason))
+                    continue
+                basic.append((pi, li))
+                wire = compress(encoded)
+                reachable, deps = resolve_first_entry(
+                    DeviceContext(state, device), settings, Srv6Encap(wire)
+                )
+                for af, address in deps.lookups:
+                    validator.query(device, 'first-lookup', (af, address), reachable)
+                for prefix in deps.prefixes:
+                    validator.query(device, 'prefix', prefix, 'QUERIED')
+                for interface in deps.interfaces:
+                    validator.query(device, 'interface', interface, 'QUERIED')
+                if reachable:
+                    first.append((pi, li))
+                else:
+                    reasons.append((pi, li, FIRST_SID_UNRESOLVABLE))
+                strict_reason = validator.strict(segment_list.segments, policy)
+                if strict_reason:
+                    reasons.append((pi, li, strict_reason))
+                else:
+                    strict.append((pi, li))
+                if reachable and (
+                    strict_reason is None or not settings.validate_all_sids
+                ):
+                    valid.append((pi, li, wire))
+        for pi, li, reason in reasons:
+            validator.query(device, 'list-failure', (pi, li), reason)
+        old = table.states.get(key)
+        fib = dev.fibs.get(6)
+        installed = fib.policy_programs.get(key) if fib is not None else None
+        installed_candidate = installed.candidate if installed is not None else None
+        candidates = {pi for pi, _, _ in valid}
+
+        # RFC 9256 section 2.9: stable tie-breaks, history only when requested.
+        def rank(
+            pi: int, policy=policy, installed_candidate=installed_candidate
+        ) -> tuple:
+            p = policy.candidate_paths[pi]
+            return (
+                -p.preference,
+                -p.protocol_origin,
+                -(
+                    settings.prefer_installed
+                    and installed_candidate
+                    == (p.protocol_origin, p.originator, p.discriminator)
+                ),
+                p.originator,
+                -p.discriminator,
+                pi,
+            )
+
+        active = min(candidates, key=rank) if candidates else None
+        new = PolicyState(
+            active,
+            tuple(v for v in valid if v[0] == active),
+            POLICY_UP if active is not None else POLICY_DOWN,
+            tuple(basic),
+            tuple(reasons),
+            old.programmed_version if old else 0,
+            tuple(strict),
+            tuple(first),
+            'PENDING',
+            tuple(sorted(validator.deps)),
+            (
+                policy.candidate_paths[active].protocol_origin,
+                policy.candidate_paths[active].originator,
+                policy.candidate_paths[active].discriminator,
+            )
+            if active is not None
+            else None,
+        )
+        states.set(key, canon(old, new))
+    return canon(table, replace(table, states=states.build()))
+
+
+def policy_status(
+    state: NetworkState, *, capacity_unit: float = 1.0
+) -> list[dict[str, Any]]:
+    """Detached Study/export rows: validity, programming, and measured delivery.
+
+    Delivery is per demand that actually encountered this policy in placement,
+    including at transit/decapsulating nodes. No demand means no observation,
+    never an inferred successful delivery. Rates use the caller's capacity unit.
+    """
+    rows = []
+    report = state.placement
+    for device, dev in state.devices.sorted_items():
+        table = dev.srv6_policies
+        if table is None:
+            continue
+        for key, policy in table.policies.sorted_items():
+            result = table.states.get(key) or PolicyState()
+            delivery = []
+            if report is not None:
+                for name, demand in report.demands.sorted_items():
+                    for observation in demand.policies:
+                        if (
+                            observation.device,
+                            observation.color,
+                            observation.endpoint,
+                        ) == (device, *key):
+                            delivery.append(
+                                {
+                                    'demand': name,
+                                    'delivered': observation.delivered / capacity_unit,
+                                    'drops': [
+                                        [r, w, rate / capacity_unit]
+                                        for r, w, rate in observation.drops
+                                    ],
+                                }
+                            )
+            rows.append(
+                {
+                    'device': device,
+                    'color': policy.color,
+                    'endpoint': str(IPv6Address(policy.endpoint)),
+                    'name': policy.name,
+                    'status': result.status if key in table.states else 'UNCOMPUTED',
+                    'basic_valid': bool(result.basic_valid)
+                    if key in table.states
+                    else None,
+                    'basic_valid_lists': [list(k) for k in result.basic_valid],
+                    'first_valid': bool(result.first_valid)
+                    if key in table.states
+                    else None,
+                    'first_valid_lists': [list(k) for k in result.first_valid],
+                    'strict_valid': bool(result.strict_valid)
+                    if key in table.states
+                    else None,
+                    'strict_valid_lists': [list(k) for k in result.strict_valid],
+                    'active_path': result.active_path,
+                    'programming': result.programming,
+                    'programmed_version': result.programmed_version
+                    if key in table.states
+                    else None,
+                    'reasons': [list(r) for r in result.reasons],
+                    'observed_delivery': delivery,
+                    'delivered': sum(d['delivered'] for d in delivery)
+                    if delivery
+                    else None,
+                    'delivery_scope': 'placement',
+                }
+            )
+    return rows

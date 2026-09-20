@@ -44,12 +44,11 @@ def test_explicit_path_policy_and_steering():
     assert net.validate() == []
 
 
-@pytest.mark.skip(reason='needs G5 policy derivation')
 def test_explicit_policy_delivery_and_failure_drop():
     net, _, _ = from_scenario(scenario(), srv6=True, capacity_unit=1e6)
     net.converge()
     assert net.placement.delivered_total == pytest.approx(100e6)
-    net['R2'].disable()
+    net['R2'].configure(enabled=False)
     net.converge()
     assert net.placement.delivered_total == 0
     assert dict(net.placement.dropped_by_reason.items()) == {'POLICY_DOWN': 100e6}
@@ -227,7 +226,6 @@ def test_real_netgraph_core_pin_matches_translated_interfaces():
     assert core_pinned(graph, td, {'C|D|0'}).summary.total_placed == 0
 
 
-@pytest.mark.skip(reason='needs G5 policy derivation')
 def test_real_netgraph_core_drop_equals_policy_delivery():
     graph, td = real_pinned()
     net, _, _ = from_scenario(

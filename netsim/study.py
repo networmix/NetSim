@@ -20,6 +20,7 @@ from typing import Any
 from netsim.core import Environment
 from netsim.model.addressing import to_address
 from netsim.model.network import Network
+from netsim.model.srv6 import policy_status
 from netsim.model.state import StateDelta
 from netsim.runtime.failures import (
     Draws,
@@ -114,53 +115,8 @@ class StudyResult:
 
 
 def _policy_rows(network: Network, capacity_unit: float) -> list[dict[str, Any]]:
-    """Export the committed state without deriving or upgrading validity.
-
-    valid_lists contains only the active path's strict-valid lists in the
-    shared contract; it is not a full inventory of all standby paths.
-    Delivery attribution covers explicit Demand.steer overrides only.
-    """
-    observed: dict[tuple[str, int, int], float] = {}
-    if network.placement is not None:
-        for did, demand in network.state.demands.sorted_items():
-            if demand.steer is not None and did in network.placement.demands:
-                key = (demand.source, demand.steer.color, demand.steer.endpoint)
-                observed[key] = (
-                    observed.get(key, 0.0)
-                    + network.placement.demands[did].delivered / capacity_unit
-                )
-    rows = []
-    for device, dev in network.state.devices.sorted_items():
-        table = dev.srv6_policies
-        if table is None:
-            continue
-        for key, policy in table.policies.sorted_items():
-            state = table.states.get(key)
-            rows.append(
-                {
-                    'device': device,
-                    'color': policy.color,
-                    'endpoint': str(IPv6Address(policy.endpoint)),
-                    'name': policy.name,
-                    'status': state.status if state else 'UNCOMPUTED',
-                    'basic_valid': bool(state.basic_valid) if state else None,
-                    'strict_valid': bool(state.valid_lists) if state else None,
-                    'basic_valid_lists': [list(pair) for pair in state.basic_valid]
-                    if state
-                    else [],
-                    'strict_valid_lists': [[pi, li] for pi, li, _ in state.valid_lists]
-                    if state
-                    else [],
-                    'active_path': state.active_path if state else None,
-                    'programmed_version': state.programmed_version if state else None,
-                    'reasons': [list(reason) for reason in state.reasons]
-                    if state
-                    else [],
-                    'delivered': observed.get((device, *key)),
-                    'delivery_scope': 'Demand.steer',
-                }
-            )
-    return rows
+    """Committed validation/programming and measured placement, all steering forms."""
+    return policy_status(network.state, capacity_unit=capacity_unit)
 
 
 def _shortfall(offered: float, delivered: float) -> float:

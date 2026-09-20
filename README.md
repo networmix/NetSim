@@ -231,14 +231,12 @@ SIDs (`block:function::/48`) and composite SIDs
 (`block:node:function::/64`) keep their literal addresses and structures.
 They have different scopes and are never converted into one another.
 
-This branch has the SR database, compression and placement contracts;
-**SR forwarding and policy derivation still require G3/G5 integration**.
-The following diamond example is runnable now: it configures both policy
-candidates, steering, and a timed bundle failure/repair, and prints the
-local adjacency state. Policy state is `UNCOMPUTED` until a producer
-installs it; ordinary placement on this intermediate branch is not proof
-that SR steering executed. Delivery/failover integration tests are explicitly
-skipped with `needs G5 policy derivation`.
+SR policy derivation, forwarding and FLUID/HASH placement are integrated.
+The following diamond example configures two candidates, steering, and a
+bundle failure/repair, then prints adjacency state and selected path.
+Policy validity is derived from current inputs; installed FIB programs stay
+in use until `fib_delay` elapses. Placement records their actual delivery
+and losses, including losses during that programming interval.
 
 ```python
 import netsim
@@ -300,7 +298,7 @@ for time in (0, 10, 20):
           state.active_path if state else None)
 ```
 
-With G3/G5 integrated, candidate index 0 (preference 200) carries the demand;
+Candidate index 0 (preference 200) carries the demand;
 at t=10 the bundle falls below `min_links=2` and candidate index 1 takes over;
 at t=20 candidate 0 returns. Removing the backup gives `POLICY_DOWN` while
 Po1 is down because fallback is DROP. Policy validity, programmed version,
@@ -382,12 +380,13 @@ for other demand options; explicit paths translated with SR still validate.
 
 Study results expose each failure snapshot's `data.netsim.policies` and a
 step-level `data.netsim.policy_iterations` list in `to_ngraph()`. Each policy
-reports basic validity, strict validity of the active lists, selected path
-index, programmed version and observed delivered rate. Missing derived state
-is `UNCOMPUTED` with null validity/version. Delivery is attributed only to
-explicit `Demand.steer` overrides, summed in the study's capacity unit; it is
-null without a placement observation, and does not infer validity. Recovery
-metrics do not overwrite the failure snapshot's policy state.
+reports basic validity, headend first-entry resolution, strict validity,
+selected path, programming status (`PENDING` or `INSTALLED`), programmed
+version, and observed delivery. Missing derived state is `UNCOMPUTED` with
+null validity/version. Delivery covers every steering form actually encountered
+by placement, including policies on transit and decapsulating nodes. Rates use
+the study's capacity unit; delivery is null without an observation and never
+infers validity. Recovery metrics do not overwrite the failure snapshot.
 
 `StudyResult.rows()` adds `policy_` columns to existing flow rows;
 `to_csv(path)` writes them. Existing columns remain `failure_id`,
@@ -396,9 +395,12 @@ metrics do not overwrite the failure snapshot's policy state.
 `policy_color`, `policy_endpoint`, `policy_name`, `policy_status`,
 `policy_basic_valid`, `policy_strict_valid`, `policy_basic_valid_lists`,
 `policy_strict_valid_lists`, `policy_active_path`, `policy_programmed_version`,
-`policy_reasons`, `policy_delivered`, and `policy_delivery_scope`.
-`strict_valid_lists` contains only active-path `(candidate, list)` indices,
-not all standby lists. Destination labels, original NetGraph priorities,
+`policy_reasons`, `policy_delivered`, and `policy_delivery_scope`. The policy
+rows also expose `first_valid`, `first_valid_lists`, `programming`, and
+`observed_delivery` (per-demand delivery and drops); their `policy_` columns
+follow the same naming convention. `strict_valid_lists` contains all passing
+`(candidate, list)` indices, including standby paths, independently of whether
+the strict profile is enabled. Destination labels, original NetGraph priorities,
 and imported capacity units are retained.
 
 With `Study(..., keep={"timeline": True})`, `rows(events=True)` and
@@ -406,7 +408,8 @@ With `Study(..., keep={"timeline": True})`, `rows(events=True)` and
 Common event columns are `failure_id`, `occurrence_count`, `event`, `seq`,
 `idx`, `time`, `round`, `origin`, `device`, `action`, and `owner`.
 Policy events add `color`, `endpoint`, `name`, `active_path`, `status`,
-`reasons`, `programmed_version`; SID events add `sid`, `behavior`, `flavors`,
+`reasons`, `programmed_version`, `basic_valid`, `first_valid`, `strict_valid`,
+`programming`; SID events add `sid`, `behavior`, `flavors`,
 `interface`, `adjacency_up`. CSV columns are sorted, structured cells are
 JSON, and null scalars are blank. Event retention limits still apply;
 these exports do not synthesize evicted events.

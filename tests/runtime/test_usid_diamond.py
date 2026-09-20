@@ -75,14 +75,7 @@ def test_sid_forms_reach_the_intended_edges_in_probes_hash_placement_and_send(
     'mode',
     [
         flows.HASH,
-        pytest.param(
-            flows.FLUID,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason='netsim/model/flows.py:381 _egress_edges ignores adj.encap; '
-                'FLUID charges plain-IP frame sizes along the SR path (G5 owns flows)',
-            ),
-        ),
+        flows.FLUID,
     ],
     ids=['hash', 'fluid'],
 )
@@ -108,14 +101,7 @@ def test_per_edge_wire_loads_follow_actual_encoding_and_decap(compressed, mode):
     'mode',
     [
         flows.HASH,
-        pytest.param(
-            flows.FLUID,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason='netsim/model/flows.py:355 _egress_edges computes MTU from the inner '
-                'packet only, omitting adj.encap headers and wire load (G5 owns flows)',
-            ),
-        ),
+        flows.FLUID,
     ],
     ids=['hash', 'fluid'],
 )
@@ -246,7 +232,6 @@ def test_delayed_carrier_and_fib_expose_stale_program_before_sid_withdrawal():
     assert settled.trace('R1', packet) == net.trace('R1', packet)
 
 
-@pytest.mark.skip(reason='needs G5 policies')
 @pytest.mark.parametrize('mode', [flows.HASH, flows.FLUID], ids=['hash', 'fluid'])
 def test_policy_counterpart_timed_delivery_and_placement(mode):
     net, links = diamond(delay=0.25)

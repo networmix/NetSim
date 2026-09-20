@@ -317,12 +317,12 @@ def test_template_controls_actual_destination_family_and_payload(mode):
 
 
 @pytest.mark.parametrize('mode', [flows.FLUID, flows.HASH])
-def test_steering_never_silently_falls_through_before_sr_integration(mode):
+def test_missing_policy_steering_never_silently_falls_through(mode):
     net, edges = _chain()
     net.add_demand('d', 'R1', '10.0.0.4', 100e6, mode=mode, steer=PolicyRef(1, 2))
     report = net.place()
     assert report.delivered_total == 0
-    assert dict(report.dropped_by_reason) == {fw.SRV6_UNSUPPORTED: 100e6}
+    assert dict(report.dropped_by_reason) == {fw.POLICY_DOWN: 100e6}
     assert report.offered[edges[0]] == 0
 
 

@@ -20,6 +20,7 @@ from netsim.model.addressing import IPV4, IPV6, mask_for
 from netsim.model.contracts import ClientId
 from netsim.model.forwarding import (
     CROSS_CONNECT,
+    DECAP_LOOKUP,
     DROP_ACTIONS,
     DROP_BLACKHOLE,
     DROP_PROHIBIT,
@@ -38,7 +39,13 @@ from netsim.model.forwarding import (
 )
 from netsim.model.lpm import FrozenPrefixTable, PrefixTable
 from netsim.model.packets import IPv4Packet, IPv6Packet, encapsulate
-from netsim.model.srv6 import LocalSid, Srv6Encap
+from netsim.model.srv6 import (
+    FALLBACK_DROP,
+    LocalSid,
+    PolicyRef,
+    Srv6Encap,
+    policy_programs,
+)
 from netsim.model.state import PMap, PMapBuilder, empty_pmap, record
 
 # Special next-hops (RFC 8349 special-next-hop plus SRv6 local behaviours).
@@ -338,6 +345,7 @@ class ResolutionPolicy:
     lpm_fallthrough: bool = True
     resolve_via_drop: bool = False
     validate_all_sids: bool = True
+    prefer_installed: bool = False
 
 
 class ResolutionContext(Protocol):
@@ -397,6 +405,10 @@ class _Resolver:
     def __init__(self, ctx: ResolutionContext, policy: ResolutionPolicy) -> None:
         self.ctx = ctx
         self.policy = policy
+        dev = getattr(ctx, 'dev', None)
+        table = getattr(dev, 'srv6_policies', None)
+        self.programs = policy_programs(table)
+        self.bsids = table.bsids if table else PMap()
         self.memo: dict[
             tuple[int, Prefix], tuple[FibEntry | None, tuple[_Leg, ...]]
         ] = {}
@@ -478,6 +490,28 @@ class _Resolver:
                 sid = next(iter(sids))
             entry = FibEntry(prefix, action, None, contributing, self._deps(), sid=sid)
             return entry, (), None
+        # A down DROP policy is a programmed discard, not an unresolved route
+        # that falls through to a lower-ranked IGP row (RFC 9256 section 8.2).
+        for nh in nexthops:
+            key = self._policy_key(nh)
+            if key is not None:
+                program = self.programs.get(key)
+                if (
+                    program is None
+                    or not program.lists
+                    and program.fallback == FALLBACK_DROP
+                ):
+                    return (
+                        FibEntry(
+                            prefix,
+                            DROP_UNREACHABLE,
+                            contributing=contributing,
+                            depends_on=self._deps(),
+                            program=PolicyRef(*key),
+                        ),
+                        (),
+                        None,
+                    )
         legs: list[_Leg] = []
         unresolved = 0
         total_weight = sum(nh.weight for nh in nexthops)
@@ -502,8 +536,37 @@ class _Resolver:
         legs_t = _merge(legs)
         return FibEntry(prefix, FORWARD, None, contributing, self._deps()), legs_t, None
 
+    def _policy_key(self, nh: Nexthop) -> tuple[int, int] | None:
+        if isinstance(nh.policy, PolicyRef):
+            return nh.policy.color, nh.policy.endpoint
+        return (
+            self.bsids.get(nh.address)
+            if nh.af == IPV6 and nh.address is not None
+            else None
+        )
+
     def _resolve_nexthop(self, af: int, nh: Nexthop) -> tuple[_Leg, ...]:
         ctx = self.ctx
+        key = self._policy_key(nh)
+        if key is not None:
+            program = self.programs.get(key)
+            if program is None or not program.lists:
+                return ()  # IGP fallback excludes this policy-bearing next hop.
+            total = sum(weight for _, weight in program.lists)
+            result = []
+            for encap, weight in program.lists:
+                for leg in self._resolve_nexthop(af, Nexthop(srv6=encap)):
+                    result.append(
+                        _Leg(
+                            leg.interface,
+                            leg.nexthop,
+                            leg.mac,
+                            leg.share * Fraction(weight, total),
+                            encap,
+                            leg.af,
+                        )
+                    )
+            return tuple(result)
         if isinstance(nh.srv6, Srv6Encap):
             try:
                 packet = encapsulate(
@@ -586,7 +649,12 @@ class _Resolver:
                     )
                 if result.action == RELOOKUP and isinstance(result.packet, IPv6Packet):
                     return self._resolve_outer(result.packet, visited)
-                # A terminal first entry has no outer egress to compile.
+                if result.action == DECAP_LOOKUP and not self.stack:
+                    # Layer-2 policy validation permits a headend terminal: an
+                    # ingress policy exposes an independent inner lookup. During
+                    # route compilation that lookup re-enters the triggering
+                    # prefix, so it cannot supply an outer egress (gray stack).
+                    return (_Leg('', None, None, Fraction(1)),)
                 return ()
             if entry.action != FORWARD:
                 return ()
@@ -595,6 +663,7 @@ class _Resolver:
             # forwarding does, including an unnumbered interface-only peer.
             # Substituting the remote SID as an on-link neighbor loses that leg.
             return legs
+
         return ()
 
     def _substitute(
@@ -674,6 +743,9 @@ def _nh_sort_key(nh: Nexthop) -> tuple:
         nh.address if nh.address is not None else -1,
         nh.weight,
         _encap_sort_key(nh.srv6),
+        (nh.policy.color, nh.policy.endpoint)
+        if isinstance(nh.policy, PolicyRef)
+        else (),
     )
 
 
@@ -806,11 +878,22 @@ def resolve_fib(
             if prev == entry:
                 entry = prev
         table.insert(prefix[0], prefix[1], entry)
-    fib = Fib(rib.af, version, table.freeze(), PMap(groups))
+    dev = getattr(ctx, 'dev', None)
+    policies = getattr(dev, 'srv6_policies', None)
+    fib = Fib(
+        rib.af,
+        version,
+        table.freeze(),
+        PMap(groups),
+        policy_programs(policies),
+        policies.steering if policies else (),
+    )
     if (
         old is not None
         and old.entries.items() == fib.entries.items()
         and old.groups == fib.groups
+        and old.policy_programs == fib.policy_programs
+        and old.steering == fib.steering
     ):
         fib = old
     outcome = ResolverOutcome(
@@ -833,3 +916,33 @@ def row_status(
     if o is None:
         return 'NOT_INSTALLED', SHADOWED
     return ('INSTALLED' if o.status == INSTALLED else 'NOT_INSTALLED'), o.reason
+
+
+def resolve_first_entry(
+    ctx: ResolutionContext, policy: ResolutionPolicy, encap: Srv6Encap
+) -> tuple[bool, DependsOn]:
+    """Layer 2 uses the same first-entry local dispatch as FIB compilation."""
+    resolver = _Resolver(ctx, policy)
+    frame = _Frame()
+    resolver.frames.append(frame)
+    legs = resolver._resolve_nexthop(IPV6, Nexthop(srv6=encap))
+    return bool(legs), frame.freeze()
+
+
+def resolve_underlay_query(
+    ctx: ResolutionContext, policy: ResolutionPolicy, address: int
+) -> tuple[FibEntry | None, tuple[Adjacency, ...], DependsOn]:
+    """RIB-derived forwarding at a transit node, retaining failed recursion.
+
+    Unlike recursive next-hop resolution, this is the ordinary forwarding LPM
+    (including /0), exactly as lookup in the resulting installed FIB would be.
+    """
+    resolver = _Resolver(ctx, policy)
+    frame = _Frame()
+    resolver.frames.append(frame)
+    frame.lookups.add((IPV6, address))
+    for net, plen, _ in ctx.rib(IPV6).prefixes.lookup_iter(address):
+        entry, legs = resolver.resolve_prefix(IPV6, (net, plen))
+        if entry is not None:
+            return entry, _group_from_legs(legs, policy.max_ecmp_paths), frame.freeze()
+    return None, (), frame.freeze()

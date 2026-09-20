@@ -4,8 +4,6 @@ import csv
 import json
 from dataclasses import replace
 
-import pytest
-
 from netsim.adapters.ngraph import from_scenario
 from netsim.model import srv6 as sr
 from netsim.runtime.failures import FailureSet
@@ -18,18 +16,16 @@ def network():
     return net, ids[0]
 
 
-def test_uncomputed_validity_is_unknown_and_exports_are_detached(tmp_path):
+def test_derived_validity_and_exports_are_detached(tmp_path):
     net, did = network()
     study = Study(net, keep={'timeline': True})
     result = study.iterations([FailureSet(excluded_links=('R1|R2|0',))])
     row = result.rows()[0]
     assert row['destination'] == 'R4' and row['priority'] == 2
     assert row['demand'] == 100
-    assert row['policy_status'] == 'UNCOMPUTED'
-    assert row['policy_basic_valid'] is None and row['policy_strict_valid'] is None
-    assert (
-        row['policy_active_path'] is None and row['policy_programmed_version'] is None
-    )
+    assert row['policy_status'] == 'DOWN'
+    assert row['policy_basic_valid'] is True and row['policy_strict_valid'] is False
+    assert row['policy_active_path'] is None and row['policy_programmed_version'] > 0
     assert (
         row['policy_delivered'] == row['placed']
     )  # observation only, no policy-delivery claim
@@ -45,10 +41,10 @@ def test_uncomputed_validity_is_unknown_and_exports_are_detached(tmp_path):
     result.to_csv(tmp_path / 'flows.csv')
     with (tmp_path / 'flows.csv').open() as f:
         exported = next(csv.DictReader(f))
-    assert exported['policy_status'] == 'UNCOMPUTED'
-    assert exported['policy_basic_valid'] == ''
+    assert exported['policy_status'] == 'DOWN'
+    assert exported['policy_basic_valid'] == 'True'
     assert exported['priority'] == '2'
-    assert json.loads(exported['policy_basic_valid_lists']) == []
+    assert json.loads(exported['policy_basic_valid_lists']) == [[0, 0]]
 
 
 def test_status_fields_are_read_from_committed_state_without_inference():
@@ -142,7 +138,7 @@ def test_failure_snapshot_is_not_replaced_by_recovery_snapshot():
         result.flow_results[0]['data']['netsim']['policies'][0]['name']
         != 'after-recovery'
     )
-    assert result.baseline['data']['netsim']['policies'][0]['status'] == 'UNCOMPUTED'
+    assert result.baseline['data']['netsim']['policies'][0]['status'] == 'UP'
 
 
 def test_repeatable_study_and_empty_csv(tmp_path):
@@ -156,12 +152,11 @@ def test_repeatable_study_and_empty_csv(tmp_path):
     assert empty.rows(events=True) == []
 
 
-@pytest.mark.skip(reason='needs G5 policy derivation')
 def test_study_policy_failover_and_delivered_status():
     net, _ = network()
     result = Study(net).iterations([FailureSet(excluded_nodes=('R2',))])
     row = result.rows()[0]
-    assert row['policy_basic_valid'] is False
+    assert row['policy_basic_valid'] is True
     assert row['policy_strict_valid'] is False
     assert row['policy_active_path'] is None
     assert row['policy_delivered'] == row['placed'] == 0
