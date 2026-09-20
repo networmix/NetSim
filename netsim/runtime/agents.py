@@ -620,9 +620,7 @@ class AgentRuntime:
                 )
                 if req:
                     state = srv6.remove_local_sid(state, device, req.result.sid, client)
-        dev = state.devices[device]
-        table = dev.nht or c.NhtTable()
-        registrations = table.registrations
+        previous_nht = state.devices[device].nht
         for nht_op in output.nht_ops:
             key = nht_op.key
             if key.owner != client:
@@ -632,18 +630,12 @@ class AgentRuntime:
             ):
                 raise ValueError('invalid NHT address family/address')
             if nht_op.kind == c.REGISTER_NHT:
-                if key not in registrations:
-                    registrations = registrations.set(key, None)
+                state = nht.register(state, device, key)
             else:
-                registrations = registrations.remove(key)
-        if registrations is not table.registrations:
-            table = replace(
-                table, registrations=registrations, version=table.version + 1
-            )
-            state = replace(
-                state, devices=state.devices.set(device, replace(dev, nht=table))
-            )
-            # New registrations get their first answer before publication.
+                state = nht.unregister(state, device, key)
+        if state.devices[device].nht is not previous_nht:
+            # Use the same scope validation/canonicalization as NhtClient,
+            # then provide new registrations' answers before publication.
             state = nht.refresh(state, device)
         return state
 
