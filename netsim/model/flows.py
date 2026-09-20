@@ -287,8 +287,9 @@ def _frame_bytes(af: int, payload_size: int) -> int:
 class _PacketState(NamedTuple):
     """Forwarding identity, excluding TTL (FLUID uses SCC loop-cut).
 
-    Production vertices always retain the same normalized header token,
-    including plain IP. Abbreviated states are supported for injected steps.
+    Production vertices retain the same normalized forwarding header token,
+    including plain IP. Source addresses and flow labels do not distinguish
+    FLUID's ideal weighted choices. Abbreviated states support injected steps.
     SR steps must retain the complete remaining SID/action continuation, not
     just the active DA: equal-sized SRHs can have different tails. ``stage``
     distinguishes an unconsumed demand override from subsequent ingress;
@@ -334,6 +335,8 @@ class _PacketState(NamedTuple):
     def frame_bytes(self, payload_size: int) -> int:
         # RFC 8200 section 3 and RFC 8754 section 2: outer 40 + SRH 8 + 16*n.
         if self.wire:
+            if not self.outer and (self.inner_af == IPV4 or not self.wire[7]):
+                return _frame_bytes(self.inner_af, self.wire[6])
             return frame_bytes(_packet_from_token(self.wire))
         size = _frame_bytes(self.inner_af, payload_size)
         if self.outer:
@@ -769,37 +772,27 @@ def walk_class(
         # Use the same header identity before and after either expansion path.
         # The only origin-specific FLUID action is the demand override: TTL is
         # excluded, and ingress steering runs at both origin and transit.
-        initial = {
-            source: _state_from_packet(
-                (
-                    template
-                    or PacketTemplate(
-                        af,
-                        _source_address(state, source, af),
-                        dst,
-                        payload_size=payload_size,
-                        dscp=dscp,
-                    )
-                ).to_packet(),
-                ORIGINATED if steer is not None else TRANSIT,
-            )
-            for source in sources
-        }
+        # All sources of this class share its continuation, so a common tail
+        # is expanded once rather than once per source loopback address.
+        initial = _state_from_packet(
+            (
+                template
+                or PacketTemplate(af, 0, dst, payload_size=payload_size, dscp=dscp)
+            ).to_packet(),
+            ORIGINATED if steer is not None else TRANSIT,
+        )
     else:
-        initial = {
-            source: (
-                _state_from_packet(template.to_packet(), ORIGINATED)
-                if template is not None
-                and (template.inner is not None or template.srh is not None)
-                else _PacketState(af)
-            )
-            for source in sources
-        }
+        initial = (
+            _state_from_packet(template.to_packet(), ORIGINATED)
+            if template is not None
+            and (template.inner is not None or template.srh is not None)
+            else _PacketState(af)
+        )
     expand = _forward_edges if step is None else step
     decisions: dict[_Vertex, _Decision] = {}
     succ: dict[_Vertex, list[_Vertex]] = {}
     order: list[_Vertex] = []
-    frontier = [(d, initial[d]) for d in sorted(sources)]
+    frontier = [(d, initial) for d in sorted(sources)]
     seen: set[_Vertex] = set()
     while frontier:
         v = frontier.pop()
@@ -833,7 +826,7 @@ def walk_class(
             cyclic.add(i)
     inflow: dict[_Vertex, Fraction] = defaultdict(Fraction)
     for s, f in sources.items():
-        inflow[(s, initial[s])] += f
+        inflow[(s, initial)] += f
     edges: dict[int, Fraction] = defaultdict(Fraction)
     carried: dict[int, Fraction] = defaultdict(Fraction)
     transmissions: list[_Transmission] = []
@@ -1199,7 +1192,6 @@ def derive_placement(
     def account(
         demand: Demand,
         edges: dict[int, float],
-        carried_edges: dict[int, float],
         delivered: float,
         drops: dict[tuple[str, str], float],
         attributed: bool = True,
@@ -1240,7 +1232,7 @@ def derive_placement(
             total = float(exact_total)
             if exact_total <= 0:
                 for d in members:
-                    account(d, {}, {}, 0.0, {}, wire=({}, {}))
+                    account(d, {}, 0.0, {}, wire=({}, {}))
                 continue
             for d in members:
                 sources[d.source] += _share(d.rate, exact_total)
@@ -1304,7 +1296,6 @@ def derive_placement(
                     account(
                         d,
                         {e: float(fr) * d.rate for e, fr in sr.edges},
-                        {e: float(fr) * d.rate for e, fr in sr.carried},
                         float(sr.delivered) * d.rate,
                         {(r, w): float(fr) * d.rate for r, w, fr in sr.drops},
                         wire=_wire_rates(sr, payload_size, d.rate),
@@ -1314,8 +1305,12 @@ def derive_placement(
                 f = d.rate / total
                 account(
                     d,
-                    {e: float(fr) * total * f for e, fr in walk.edges},
-                    {e: float(fr) * total * f for e, fr in walk.carried},
+                    # Shared-class edges cannot be attributed to this source.
+                    # Only materialize payload detail when the report uses it;
+                    # aggregate wire accounting below retains its arithmetic.
+                    {e: float(fr) * total * f for e, fr in walk.edges}
+                    if single and detail
+                    else {},
                     float(walk.delivered) * total * f,
                     {(r, w): float(fr) * total * f for r, w, fr in walk.drops},
                     attributed=single,
@@ -1332,7 +1327,6 @@ def derive_placement(
                 account(
                     d,
                     o,
-                    c,
                     dl,
                     dr,
                     wire=wire,
@@ -1356,7 +1350,6 @@ def derive_placement(
                 account(
                     d,
                     o,
-                    c,
                     dl,
                     dr,
                     wire=wire,
@@ -1381,7 +1374,6 @@ def derive_placement(
             account(
                 d,
                 {e: float(fr) * d.rate for e, fr in walk.edges},
-                {e: float(fr) * d.rate for e, fr in walk.carried},
                 float(walk.delivered) * d.rate,
                 {(r, w): float(fr) * d.rate for r, w, fr in walk.drops},
                 policy_outcomes=_scaled_outcomes(walk, d.rate),
@@ -1543,7 +1535,14 @@ def _scaled_outcomes(walk: ClassResult | SourceResult, rate: float) -> tuple:
 
 
 def _packet_token(packet: Any) -> tuple:
-    """Full FLUID header continuation, omitting only TTL/hop limit."""
+    """Forwarding-relevant FLUID continuation, independent of the producing path.
+
+    FLUID enumerates choices by weight, never by hash, and its ingress rules
+    match destination, DSCP and sport. Source addresses and flow labels (also
+    those generated at ENCAP) cannot affect these decisions. Normalize them
+    throughout the stack so converging sources share vertices before and after
+    local actions. HASH retains the actual fields and TTL/hop-limit budgets.
+    """
     payload = packet.payload
     tail = (
         (1, payload.sport, payload.dport)
@@ -1555,7 +1554,7 @@ def _packet_token(packet: Any) -> tuple:
     if isinstance(packet, IPv4Packet):
         return (
             4,
-            packet.src,
+            0,
             packet.dst,
             packet.protocol,
             packet.dscp,
@@ -1578,11 +1577,11 @@ def _packet_token(packet: Any) -> tuple:
     )
     return (
         6,
-        packet.src,
+        0,
         packet.dst,
         packet.next_header,
         packet.traffic_class,
-        packet.flow_label,
+        0,
         packet.payload_size,
         header,
         tail,
