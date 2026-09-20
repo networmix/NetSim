@@ -38,7 +38,7 @@ from netsim.model.routing import (
     resolve_fib,
     rib_apply,
 )
-from netsim.model.state import DeviceOper, DeviceState, NetworkState, PMap
+from netsim.model.state import DeviceOper, DeviceState, NetworkState, PMap, diff_pmap
 
 # Kind order (priority offsets above core.DEFERRED).
 CARRIER = 0
@@ -531,10 +531,10 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
     if old.devices is new.devices:
         return new
     devices = new.devices.builder()
-    for name, dev in new.devices.items():
+    changes = diff_pmap(old.devices, new.devices, by_identity=True)
+    for name in changes.added + changes.changed:
+        dev = new.devices[name]
         odev = old.devices.get(name)
-        if odev is dev:
-            continue
         all_changed = (
             odev is None
             or (

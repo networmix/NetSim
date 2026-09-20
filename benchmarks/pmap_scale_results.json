@@ -1,0 +1,217 @@
+{
+  "date": "2026-09-20",
+  "base_commit": "c2d658e67e62a8df1fe99aa3cae5a1f9f3656630",
+  "candidate_commit": "0659d1e50162ce9f8e1a708f4b3d9ea062331a71",
+  "cpu": "Apple M4 Max, 14 cores",
+  "devices": 100000,
+  "rounds": 7,
+  "statistic": "median",
+  "notes": "Exploratory A/B runs had other workers active nearby. Final quiet-A1/B/A2 monitored every 0.5 s and observed no other Python process above 20% CPU; normal desktop services remained active.",
+  "runs": [
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.6848725,
+        "bump_ms": 9.58957336,
+        "delta_ms": 14.16574668,
+        "commit_ms": 22.78980332,
+        "get_prebuilt_ns": 61.583666,
+        "get_formatted_ns": 89.8605,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "B256",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "candidate worktree/netsim/model/state.py",
+      "shards": 256,
+      "metrics": {
+        "set_ms": 0.00221918,
+        "bump_ms": 0.03348668,
+        "delta_ms": 0.027265,
+        "commit_ms": 0.07521332,
+        "get_prebuilt_ns": 120.478832,
+        "get_formatted_ns": 154.105334,
+        "retained_64_MB": 1.020216,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.68181834,
+        "bump_ms": 8.84529,
+        "delta_ms": 12.224415,
+        "commit_ms": 23.29162668,
+        "get_prebuilt_ns": 62.495,
+        "get_formatted_ns": 90.61766800000001,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "B512",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "candidate worktree/netsim/model/state.py",
+      "shards": 512,
+      "metrics": {
+        "set_ms": 0.00214334,
+        "bump_ms": 0.026075,
+        "delta_ms": 0.02031,
+        "commit_ms": 0.06131668,
+        "get_prebuilt_ns": 125.32375,
+        "get_formatted_ns": 164.228,
+        "retained_64_MB": 0.738868,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "A3",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.71626834,
+        "bump_ms": 9.19301168,
+        "delta_ms": 13.15476668,
+        "commit_ms": 24.560345,
+        "get_prebuilt_ns": 63.002418,
+        "get_formatted_ns": 91.10716599999999,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "B256-repeat",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "candidate worktree/netsim/model/state.py",
+      "shards": 256,
+      "metrics": {
+        "set_ms": 0.00280334,
+        "bump_ms": 0.03303168,
+        "delta_ms": 0.02706332,
+        "commit_ms": 0.07621832,
+        "get_prebuilt_ns": 117.703082,
+        "get_formatted_ns": 152.493666,
+        "retained_64_MB": 1.020216,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "A4",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.7030191600000001,
+        "bump_ms": 8.79231332,
+        "delta_ms": 13.09867668,
+        "commit_ms": 22.90037332,
+        "get_prebuilt_ns": 63.312084000000006,
+        "get_formatted_ns": 93.74675,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      }
+    },
+    {
+      "label": "quiet-A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.67423166,
+        "bump_ms": 8.20822668,
+        "delta_ms": 11.440705,
+        "commit_ms": 21.14722164,
+        "get_prebuilt_ns": 64.020166,
+        "get_formatted_ns": 91.684668,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      },
+      "quiet_monitor": {
+        "interval_seconds": 0.5,
+        "samples": 20,
+        "other_python_above_20_percent_cpu": false
+      }
+    },
+    {
+      "label": "quiet-B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "candidate worktree/netsim/model/state.py",
+      "shards": 256,
+      "metrics": {
+        "set_ms": 0.0023633400000000002,
+        "bump_ms": 0.03263832,
+        "delta_ms": 0.02709332,
+        "commit_ms": 0.074895,
+        "get_prebuilt_ns": 116.88175,
+        "get_formatted_ns": 154.13975,
+        "retained_64_MB": 1.020216,
+        "empty_map_bytes": 104
+      },
+      "quiet_monitor": {
+        "interval_seconds": 0.5,
+        "samples": 8,
+        "other_python_above_20_percent_cpu": false
+      }
+    },
+    {
+      "label": "quiet-A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "gil_enabled": true,
+      "hash_seed": "1",
+      "source": "base archive/netsim/model/state.py",
+      "shards": 1,
+      "metrics": {
+        "set_ms": 0.712185,
+        "bump_ms": 8.59805,
+        "delta_ms": 12.40257332,
+        "commit_ms": 23.122595,
+        "get_prebuilt_ns": 64.184416,
+        "get_formatted_ns": 91.143834,
+        "retained_64_MB": 246.115384,
+        "empty_map_bytes": 104
+      },
+      "quiet_monitor": {
+        "interval_seconds": 0.5,
+        "samples": 21,
+        "other_python_above_20_percent_cpu": false
+      }
+    }
+  ]
+}

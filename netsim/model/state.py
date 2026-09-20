@@ -2,7 +2,7 @@
 
 All simulated state lives in one immutable tree (``NetworkState``), in the
 style of FBOSS ``SwitchState``: records are frozen slotted dataclasses,
-maps are ``PMap`` (an owning dict copied on set), an update produces a new
+maps are ``PMap`` (owning, structurally shared shards), an update produces a new
 root plus a ``StateDelta`` computed identity-first. Every committed leaf is
 transitively immutable; ``validate_immutable`` checks that in debug mode.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import ItemsView, KeysView, ValuesView
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -49,27 +50,94 @@ def empty_pmap() -> PMap[Any, Any]:
 # ---------------------------------------------------------------------------
 
 
-class PMap(Generic[K, V]):
-    """Immutable mapping that owns an unexposed backing dict.
+class PMap(Mapping[K, V]):
+    """Owning persistent map, with insertion-order iteration and set-like keys.
 
-    ``set``/``remove``/``update`` return a new ``PMap`` sharing nothing
-    mutable with the old one; ``set`` returns ``self`` when the value is
-    the identical object (canonicalization). Content equality; not
-    hashable (tree nodes are not keys). Iteration follows insertion order
-    of the backing dict; use ``sorted_items`` for a deterministic order.
+    Up to 512 entries a map owns one flat dict. Above that it promotes to
+    256 shards, selected by the mixed hash of ``(key,)`` (the tuple mixer
+    also spreads aligned integers). Promotion happens at construction or
+    publication; maps never demote. A mutation copies one shard and the
+    shard vector. No backing dict is exposed or mutated after publication.
+
+    Hashes select storage only, never iteration/output order. Shard-local
+    insertion ordinals preserve dict order across promotion and hash seeds;
+    value-only edits share this metadata. Full iteration merges that order,
+    whereas ``sorted_items`` sorts keys directly for canonical output.
+    Unordered input still needs sorting by the caller, just as with dict.
+
+    ``set`` returns self for an identical value; equality skips identical
+    shards before comparing values. Differing layouts fall back to content
+    comparison. Costs are O(S + N/S) for set, O(S + q*N/S) for a diff of q
+    changed shards, and O(N log S) for insertion-order iteration after
+    promotion (fixed S, not an asymptotically sublinear trie).
     """
 
+    # Small/empty maps keep the original one-slot footprint and direct lookup.
+    # Only the private promoted subclass carries shard/order metadata.
     __slots__ = ('_d',)
+    _FLAT_LIMIT = 512
+    _SHARD_COUNT = 256
+
+    def __new__(
+        cls, items: Mapping[K, V] | Iterable[tuple[K, V]] | None = None
+    ) -> PMap[K, V]:
+        d = dict(items) if items is not None else {}
+        return cls._wrap(d)
 
     def __init__(
         self, items: Mapping[K, V] | Iterable[tuple[K, V]] | None = None
     ) -> None:
-        self._d: dict[K, V] = dict(items) if items is not None else {}
+        pass  # __new__ owns the input and selects the representation.
 
     @classmethod
     def _wrap(cls, d: dict[K, V]) -> PMap[K, V]:
-        obj = cls.__new__(cls)
-        obj._d = d
+        if len(d) <= cls._FLAT_LIMIT:
+            obj = object.__new__(PMap)
+            obj._d = d
+            return obj
+        mask = cls._SHARD_COUNT - 1
+        shards: tuple[dict[K, V], ...] = tuple({} for _ in range(mask + 1))
+        order: tuple[dict[K, int], ...] = tuple({} for _ in range(mask + 1))
+        for ordinal, (key, value) in enumerate(d.items()):
+            index = hash((key,)) & mask
+            shards[index][key] = value
+            order[index][key] = ordinal
+        return cls._from_parts(shards, order, len(d), len(d))
+
+    @property
+    def _shards(self) -> tuple[dict[K, V], ...]:
+        return (self._d,)
+
+    @property
+    def _order(self) -> tuple[dict[K, int], ...] | None:
+        return None
+
+    @property
+    def _size(self) -> int:
+        return len(self._d)
+
+    @property
+    def _next(self) -> int:
+        return len(self._d)
+
+    @property
+    def _mask(self) -> int:
+        return 0
+
+    @classmethod
+    def _from_parts(
+        cls,
+        shards: tuple[dict[K, V], ...],
+        order: tuple[dict[K, int], ...] | None,
+        size: int,
+        next_ordinal: int,
+    ) -> PMap[K, V]:
+        if len(shards) == 1:
+            return cls._wrap(shards[0])
+        obj = object.__new__(_ShardedPMap)
+        obj._buckets, obj._ordinals = shards, order
+        obj._n, obj._next_ordinal = size, next_ordinal
+        obj._hash_mask = len(shards) - 1
         return obj
 
     def __getitem__(self, key: K) -> V:
@@ -87,6 +155,20 @@ class PMap(Generic[K, V]):
     def __len__(self) -> int:
         return len(self._d)
 
+    def _items(self) -> Iterator[tuple[K, V]]:
+        if self._order is None:
+            yield from self._shards[0].items()
+        else:
+            # Ordinals are unique: keys/values are never used as sort keys,
+            # so even heterogeneous, non-orderable Hashable keys work.
+            rows = sorted(
+                (order[k], k, v)
+                for shard, order in zip(self._shards, self._order, strict=True)
+                for k, v in shard.items()
+            )
+            for _, k, v in rows:
+                yield k, v
+
     def keys(self):
         return self._d.keys()
 
@@ -97,91 +179,244 @@ class PMap(Generic[K, V]):
         return self._d.items()
 
     def sorted_items(self) -> list[tuple[K, V]]:
-        return sorted(self._d.items(), key=lambda kv: kv[0])  # type: ignore[arg-type, return-value]
+        return sorted(
+            (kv for shard in self._shards for kv in shard.items()),
+            key=lambda kv: kv[0],  # type: ignore[arg-type, return-value]
+        )
+
+    def _changed_shards(
+        self, other: PMap[K, V]
+    ) -> Iterator[tuple[Mapping[K, V], Mapping[K, V]]]:
+        """Comparison boundary: never enumerate entries in shared shards."""
+        if self is other:
+            return
+        if self._mask != other._mask:
+            yield self, other
+        else:
+            for a, b in zip(self._shards, other._shards, strict=True):
+                if a is not b:
+                    yield a, b
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, PMap):
-            return self._d == other._d
-        return NotImplemented
+        if not isinstance(other, PMap):
+            return NotImplemented
+        if self is other:
+            return True
+        if self._size != other._size:
+            return False
+        if self._mask == other._mask:
+            return all(a == b for a, b in self._changed_shards(other))
+        return all(
+            k in other and (v is other[k] or v == other[k]) for k, v in self.items()
+        )
 
     __hash__ = None  # type: ignore[assignment]
 
     def __repr__(self) -> str:
-        return f'PMap({self._d!r})'
+        return f'PMap({dict(self.items())!r})'
+
+    def __reduce__(self):
+        return PMap, (list(self.items()),)
 
     def set(self, key: K, value: V) -> PMap[K, V]:
-        if key in self._d and self._d[key] is value:
+        index = hash((key,)) & self._mask
+        shard = self._shards[index]
+        present = key in shard
+        if present and shard[key] is value:
             return self
-        d = dict(self._d)
+        d = dict(shard)
         d[key] = value
-        return self._wrap(d)
+        shards = list(self._shards)
+        shards[index] = d
+        order = self._order
+        if not present and order is not None:
+            orders = list(order)
+            orders[index] = dict(orders[index])
+            orders[index][key] = self._next
+            order = tuple(orders)
+        return self._from_parts(
+            tuple(shards), order, self._size + (not present), self._next + (not present)
+        )
 
     def remove(self, key: K) -> PMap[K, V]:
-        if key not in self._d:
+        index = hash((key,)) & self._mask
+        if key not in self._shards[index]:
             return self
-        d = dict(self._d)
-        del d[key]
-        return self._wrap(d)
+        shards = list(self._shards)
+        shards[index] = dict(shards[index])
+        del shards[index][key]
+        order = self._order
+        if order is not None:
+            orders = list(order)
+            orders[index] = dict(orders[index])
+            del orders[index][key]
+            order = tuple(orders)
+        return self._from_parts(tuple(shards), order, self._size - 1, self._next)
 
     def update(self, items: Mapping[K, V] | Iterable[tuple[K, V]]) -> PMap[K, V]:
-        """Apply several sets with one copy; returns ``self`` if nothing changed."""
-        pairs: list[tuple[K, V]]
-        if isinstance(items, Mapping):
-            pairs = list(cast(Mapping[K, V], items).items())
-        else:
-            pairs = list(items)
-        if all(k in self._d and self._d[k] is v for k, v in pairs):
-            return self
-        d = dict(self._d)
-        for k, v in pairs:
-            d[k] = v
-        return self._wrap(d)
+        """Apply sets, copying each touched shard once."""
+        builder = self.builder()
+        pairs = (
+            cast(Mapping[K, V], items).items() if isinstance(items, Mapping) else items
+        )
+        for key, value in pairs:
+            builder.set(key, value)
+        return builder.build()
 
     def builder(self) -> PMapBuilder[K, V]:
         return PMapBuilder(self)
 
 
-class PMapBuilder(Generic[K, V]):
-    """Mutable staging area for batch edits; ``build()`` copies the map once."""
+class _ShardedPMap(PMap[K, V]):
+    __slots__ = ('_buckets', '_ordinals', '_n', '_next_ordinal', '_hash_mask')
 
-    __slots__ = ('_base', '_d')
+    _buckets: tuple[dict[K, V], ...]
+    _ordinals: tuple[dict[K, int], ...] | None
+    _n: int
+    _next_ordinal: int
+    _hash_mask: int
+
+    @property
+    def _shards(self) -> tuple[dict[K, V], ...]:
+        return self._buckets
+
+    @property
+    def _order(self) -> tuple[dict[K, int], ...] | None:
+        return self._ordinals
+
+    @property
+    def _size(self) -> int:
+        return self._n
+
+    @property
+    def _next(self) -> int:
+        return self._next_ordinal
+
+    @property
+    def _mask(self) -> int:
+        return self._hash_mask
+
+    def __getitem__(self, key: K) -> V:
+        return self._buckets[hash((key,)) & self._hash_mask][key]
+
+    def get(self, key: K, default: Any = None) -> V | Any:
+        return self._buckets[hash((key,)) & self._hash_mask].get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._buckets[hash((key,)) & self._hash_mask]
+
+    def __iter__(self) -> Iterator[K]:
+        return (k for k, _ in self._items())
+
+    def __len__(self) -> int:
+        return self._n
+
+    def keys(self):
+        return KeysView(self)
+
+    def values(self):
+        return _PMapValues(self)
+
+    def items(self):
+        return _PMapItems(self)
+
+
+class _PMapItems(ItemsView[K, V]):
+    _mapping: PMap[K, V]
+
+    def __iter__(self) -> Iterator[tuple[K, V]]:
+        return cast(PMap[K, V], self._mapping)._items()
+
+
+class _PMapValues(ValuesView[V]):
+    _mapping: PMap[Any, V]
+
+    def __iter__(self) -> Iterator[V]:
+        return (v for _, v in cast(PMap[Any, V], self._mapping)._items())
+
+
+class PMapBuilder(Generic[K, V]):
+    """Mutable staging: copy each touched shard once, detach on publication."""
+
+    __slots__ = (
+        '_base',
+        '_shards',
+        '_order',
+        '_dirty',
+        '_order_dirty',
+        '_size',
+        '_next',
+    )
 
     def __init__(self, base: PMap[K, V]) -> None:
         self._base = base
-        self._d: dict[K, V] | None = None
+        self._shards: list[dict[K, V]] | None = None
+        self._order: list[dict[K, int]] | None = None
+        self._dirty: set[int] = set()
+        self._order_dirty: set[int] = set()
+        self._size, self._next = base._size, base._next
 
-    def _dict(self) -> dict[K, V]:
-        if self._d is None:
-            self._d = dict(self._base._d)
-        return self._d
+    def _shard(self, index: int) -> dict[K, V]:
+        return (self._base._shards if self._shards is None else self._shards)[index]
+
+    def _writable(self, index: int) -> dict[K, V]:
+        if self._shards is None:
+            self._shards = list(self._base._shards)
+        if index not in self._dirty:
+            self._shards[index] = dict(self._shards[index])
+            self._dirty.add(index)
+        return self._shards[index]
+
+    def _writable_order(self, index: int) -> dict[K, int]:
+        if self._order is None:
+            assert self._base._order is not None
+            self._order = list(self._base._order)
+        if index not in self._order_dirty:
+            self._order[index] = dict(self._order[index])
+            self._order_dirty.add(index)
+        return self._order[index]
 
     def __getitem__(self, key: K) -> V:
-        return (self._d if self._d is not None else self._base._d)[key]
+        return self._shard(hash((key,)) & self._base._mask)[key]
 
     def get(self, key: K, default: Any = None) -> V | Any:
-        return (self._d if self._d is not None else self._base._d).get(key, default)
+        return self._shard(hash((key,)) & self._base._mask).get(key, default)
 
     def __contains__(self, key: object) -> bool:
-        return key in (self._d if self._d is not None else self._base._d)
+        return key in self._shard(hash((key,)) & self._base._mask)
 
     def set(self, key: K, value: V) -> None:
-        current = self._d if self._d is not None else self._base._d
-        if key in current and current[key] is value:
+        index = hash((key,)) & self._base._mask
+        current = self._shard(index)
+        present = key in current
+        if present and current[key] is value:
             return
-        self._dict()[key] = value
+        self._writable(index)[key] = value
+        if not present:
+            if self._base._order is not None:
+                self._writable_order(index)[key] = self._next
+            self._size += 1
+            self._next += 1
 
     def remove(self, key: K) -> None:
-        current = self._d if self._d is not None else self._base._d
-        if key in current:
-            del self._dict()[key]
+        index = hash((key,)) & self._base._mask
+        if key in self._shard(index):
+            del self._writable(index)[key]
+            if self._base._order is not None:
+                del self._writable_order(index)[key]
+            self._size -= 1
 
     def build(self) -> PMap[K, V]:
-        """Publish the staged map. The builder detaches from the published
-        dict, so later edits copy again and never reach a snapshot."""
-        if self._d is None:
+        """Publish, then forget mutable ownership of every published shard."""
+        if self._shards is None:
             return self._base
-        built = PMap._wrap(self._d)
-        self._base, self._d = built, None
+        order = self._base._order if self._order is None else tuple(self._order)
+        built = PMap._from_parts(tuple(self._shards), order, self._size, self._next)
+        self._base = built
+        self._shards = self._order = None
+        self._dirty.clear()
+        self._order_dirty.clear()
+        self._size, self._next = built._size, built._next
         return built
 
 
@@ -469,13 +704,18 @@ BOOKKEEPING_FIELDS = frozenset({'resolver_input_epoch', 'resolver_outcomes'})
 
 
 def diff_pmap(
-    old: PMap | None, new: PMap | None, *, by_identity: bool = False
+    old: PMap | None,
+    new: PMap | None,
+    *,
+    by_identity: bool = False,
+    sort_key: Callable[[Any], Any] | None = None,
 ) -> MapDiff:
     """Keys added, removed and changed between two maps.
 
     Identity first: an entry whose value is the same object is unchanged
     without comparison; otherwise values are compared by content unless
-    ``by_identity`` (used for opaque agent state).
+    ``by_identity`` (used for opaque agent state). Shared shards are skipped.
+    ``sort_key`` supports keys with a domain-specific canonical ordering.
     """
     if old is new:
         return MapDiff((), (), ())  # fresh: no shared sentinel on this path
@@ -483,18 +723,21 @@ def diff_pmap(
         old = PMap()
     if new is None:
         new = PMap()
-    od, nd = old._d, new._d
-    added = tuple(sorted(k for k in nd if k not in od))
-    removed = tuple(sorted(k for k in od if k not in nd))
-    changed = []
-    for k, v in nd.items():
-        if k in od:
-            ov = od[k]
-            if ov is v:
-                continue
-            if by_identity or ov != v:
-                changed.append(k)
-    return MapDiff(added, removed, tuple(sorted(changed)))
+    added, removed, changed = [], [], []
+    for od, nd in old._changed_shards(new):
+        removed.extend(k for k in od if k not in nd)
+        for k, v in nd.items():
+            if k not in od:
+                added.append(k)
+            else:
+                ov = od[k]
+                if ov is not v and (by_identity or ov != v):
+                    changed.append(k)
+    return MapDiff(
+        tuple(sorted(added, key=sort_key)),
+        tuple(sorted(removed, key=sort_key)),
+        tuple(sorted(changed, key=sort_key)),
+    )
 
 
 class StateDelta:
@@ -685,9 +928,14 @@ def tree_equal(a: Any, b: Any) -> bool:
     if a is b:
         return True
     if isinstance(a, PMap) and isinstance(b, PMap):
-        if a.keys() != b.keys():
+        if len(a) != len(b):
             return False
-        return all(tree_equal(a[k], b[k]) for k in a)
+        for old, new in a._changed_shards(b):
+            if old.keys() != new.keys():
+                return False
+            if not all(tree_equal(old[k], new[k]) for k in old):
+                return False
+        return True
     if (
         dataclasses.is_dataclass(a)
         and dataclasses.is_dataclass(b)
