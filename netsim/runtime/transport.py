@@ -649,19 +649,24 @@ class TransportRuntime:
                 return self._reject(device, agent, generation, c.UNREACHABLE_ENDPOINT)
             key = _key(device, op.local)
             listener = transport.listeners.get(key)
-            if listener is not None and not self._live(
-                listener.device, listener.agent, listener.generation
-            ):
-                # Reset dispatch defers tree cleanup to TRANSPORT. A new
-                # generation's on_init may run first and replace its stale
-                # listener without colliding with that retired incarnation.
-                listener = None
             if op.kind == c.LISTEN_OP:
                 if listener is not None and (listener.agent, listener.generation) != (
                     agent,
                     generation,
                 ):
-                    return self._reject(device, agent, generation, 'ADDRESS_IN_USE')
+                    # A restarted agent's on_init runs before the TRANSPORT
+                    # kind removes its previous generation's listener in the
+                    # same round: an obsolete listener (owner not live or its
+                    # interface re-created) is replaced; only a live owner
+                    # of another generation or agent is a collision.
+                    owner = interface(state, device, listener.interface)
+                    obsolete = (
+                        not self._live(device, listener.agent, listener.generation)
+                        or owner is None
+                        or owner.generation != listener.interface_generation
+                    )
+                    if not obsolete:
+                        return self._reject(device, agent, generation, 'ADDRESS_IN_USE')
                 new = c.Listener(
                     device, agent, op.local, generation, node.name, node.generation
                 )
