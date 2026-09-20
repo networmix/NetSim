@@ -375,6 +375,11 @@ def _link_endpoints(delta: StateDelta, state: NetworkState) -> set[tuple[str, st
     return out
 
 
+def _interface(state: NetworkState, key: tuple[str, str]):
+    dev = state.devices.get(key[0])
+    return dev.interfaces.get(key[1]) if dev is not None else None
+
+
 def carrier_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
     out: set[tuple[str, str]] = set(_link_endpoints(delta, state))
     d = delta.devices()
@@ -388,51 +393,95 @@ def carrier_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
         for iface, cfg_changed, _ in delta.interface_changes(name):
             if cfg_changed:
                 out.add((name, iface))
-                peer = (
-                    derive.peer_endpoint(state, name, iface)
-                    if (name, iface) in _ethernets_of(state, name)
-                    else None
-                )
-                if peer is not None:
-                    out.add(peer)
-    return {e for e in out if e in _ethernets_of(state, e[0])}
+                for root in (delta.old, state):
+                    if isinstance(_interface(root, (name, iface)), EthernetNode):
+                        peer = derive.peer_endpoint(root, name, iface)
+                        if peer is not None:
+                            out.add(peer)
+    return {e for e in out if isinstance(_interface(state, e), EthernetNode)}
+
+
+def _bundle_of(state: NetworkState, key: tuple[str, str]) -> tuple[str, str] | None:
+    node = _interface(state, key)
+    if isinstance(node, PortChannelNode):
+        return key
+    if isinstance(node, EthernetNode) and node.config.aggregate_id is not None:
+        return key[0], node.config.aggregate_id
+    return None
 
 
 def lag_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
     out: set[tuple[str, str]] = set()
     d = delta.devices()
     for name in d.added + d.changed:
-        changes = delta.interface_changes(name)
-        if delta.config_changed(name) or any(
-            cfg or (oper and (name, iface) in _ethernets_of(state, name))
-            for iface, cfg, oper in changes
-        ):
+        if delta.config_changed(name):
             out |= _bundles_of(state, name)
-    for lid in delta.links().keys:
-        link = state.links.get(lid)
-        if link is not None:
-            out |= _bundles_of(state, link.a[0]) | _bundles_of(state, link.b[0])
+        for iface, cfg, oper in delta.interface_changes(name):
+            if cfg or (
+                oper and isinstance(_interface(state, (name, iface)), EthernetNode)
+            ):
+                for root in (delta.old, state):
+                    bundle = _bundle_of(root, (name, iface))
+                    if bundle is not None:
+                        out.add(bundle)
+                        node = _interface(root, (name, iface))
+                        if isinstance(node, EthernetNode):
+                            peer = derive.peer_bundle_key(root, name, iface)
+                            if peer is not None:
+                                out.add(peer)
+    for endpoint in _link_endpoints(delta, state):
+        for root in (delta.old, state):
+            bundle = _bundle_of(root, endpoint)
+            if bundle is not None:
+                out.add(bundle)
+    return out
+
+
+def _l3_related(state: NetworkState, key: tuple[str, str]) -> set[tuple[str, str]]:
+    """Local/peer L3 owners, including bundle owners for member config changes."""
+    out = {key}
+    node = _interface(state, key)
+    if isinstance(node, EthernetNode):
+        owner = _bundle_of(state, key)
+        if owner is not None:
+            out.add(owner)
+        peer = derive.peer_endpoint(state, *key)
+        if peer is not None:
+            out.add(peer)
+            owner = _bundle_of(state, peer)
+            if owner is not None:
+                out.add(owner)
+    elif isinstance(node, PortChannelNode):
+        for member in derive.bundle_members(state.devices[key[0]], key[1]):
+            peer = derive.peer_endpoint(state, key[0], member.name)
+            if peer is not None:
+                out.add(_bundle_of(state, peer) or peer)
     return out
 
 
 def l3_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
-    out: set[str] = set()
+    # Per-interface entities coalesce independently; l3_run unions them per
+    # device. Plain device names are the full-recompute causes.
+    out: set[Any] = set()
     d = delta.devices()
     for name in d.added + d.changed:
-        if delta.config_changed(name) or delta.interface_changes(name):
+        if delta.config_changed(name):
             out.add(name)
-            for iface, cfg, _ in delta.interface_changes(name):
-                if cfg:
-                    peer = (
-                        derive.peer_endpoint(state, name, iface)
-                        if (name, iface) in _ethernets_of(state, name)
-                        else None
-                    )
-                    if peer is not None:
-                        out.add(peer[0])
-    for e in _link_endpoints(delta, state):
-        out.add(e[0])
-    return {n for n in out if n in state.devices}
+        for iface, cfg, oper in delta.interface_changes(name):
+            if cfg:
+                out |= _l3_related(delta.old, (name, iface))
+                out |= _l3_related(state, (name, iface))
+            elif oper:
+                out.add((name, iface))
+    for endpoint in _link_endpoints(delta, state):
+        out |= _l3_related(delta.old, endpoint)
+        out |= _l3_related(state, endpoint)
+    return {
+        e
+        for e in out
+        if (e if isinstance(e, str) else e[0]) in state.devices
+        and (isinstance(e, str) or e[0] not in out)
+    }
 
 
 def igp_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
@@ -525,7 +574,11 @@ def build_kinds(
         return derive.derive_lag(state, now, entities, delay_elapsed)
 
     def l3_run(state: NetworkState, now: float, entities: list[Any]) -> NetworkState:
-        return derive.derive_l3(state, now, entities)
+        return derive.derive_l3(
+            state,
+            now,
+            [e if isinstance(e, str) else (e[0], frozenset((e[1],))) for e in entities],
+        )
 
     def igp_run(state: NetworkState, now: float, entities: list[Any]) -> NetworkState:
         for source in network.sources:

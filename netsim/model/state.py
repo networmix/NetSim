@@ -667,6 +667,10 @@ class DeviceState:
     srv6_policies: Any = None
     agents: PMap[str, Any] = field(default_factory=empty_pmap)
     nht: Any = None
+    l3_interfaces: PMap[str, Any] | None = None
+    """Per-interface L3 contributions, owned by derive_l3; None before initialization."""
+    interface_index: Any = None
+    """Immutable bundle membership index, maintained with committed interface changes."""
 
 
 @record
@@ -700,7 +704,9 @@ class MapDiff:
         return self.added + self.removed + self.changed
 
 
-BOOKKEEPING_FIELDS = frozenset({'resolver_input_epoch', 'resolver_outcomes'})
+BOOKKEEPING_FIELDS = frozenset(
+    {'resolver_input_epoch', 'resolver_outcomes', 'l3_interfaces', 'interface_index'}
+)
 
 
 def diff_pmap(
