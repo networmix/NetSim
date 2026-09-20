@@ -104,6 +104,30 @@ def from_network(
     seed: int = 0,
 ) -> Network:
     """Build a NetSim ``Network`` from a NetGraph ``Network``."""
+    net = Network(seed=seed)
+    with net.batch():
+        _populate_network(
+            net,
+            network,
+            addressing=addressing,
+            capacity_unit=capacity_unit,
+            igp=igp,
+            ipv6=ipv6,
+            pools=pools,
+        )
+    return net
+
+
+def _populate_network(
+    net: Network,
+    network: Any,
+    *,
+    addressing: str = 'unnumbered',
+    capacity_unit: float = 1e9,
+    igp: bool = True,
+    ipv6: bool = False,
+    pools: dict[str, str] | None = None,
+) -> None:
     if addressing not in ('unnumbered', 'p2p'):
         raise ValueError("addressing must be 'unnumbered' or 'p2p'")
     pools = pools or {}
@@ -113,7 +137,6 @@ def from_network(
         pools.get('loopback_v6', DEFAULT_LOOPBACK_POOL_V6),
         pools.get('link_v6', DEFAULT_LINK_POOL_V6),
     )
-    net = Network(seed=seed)
     net.ngraph_link_ids = {}
     for name in sorted(network.nodes):
         node = network.nodes[name]
@@ -172,7 +195,6 @@ def from_network(
                 net.device(d)[po].configure(forwarding_v6=True)
     if igp:
         net.add_source(oracle_igp)
-    return net
 
 
 def _next_name(counters: dict[str, int], device: str) -> str:
@@ -252,6 +274,17 @@ def demands_from(
     capacity_unit: float = 1e9,
 ) -> list[str]:
     """Expand NetGraph ``TrafficDemand`` entries into NetSim demands (loopback destinations)."""
+    with net.batch():
+        return _populate_demands(network, net, demand_sets, capacity_unit=capacity_unit)
+
+
+def _populate_demands(
+    network: Any,
+    net: Network,
+    demand_sets: dict[str, list[Any]],
+    *,
+    capacity_unit: float = 1e9,
+) -> list[str]:
     ids: list[str] = []
     for set_name in sorted(demand_sets):
         for i, td in enumerate(demand_sets[set_name]):
@@ -317,15 +350,19 @@ def from_scenario(
 ) -> tuple[Network, list[str], FailureSchedule | None]:
     """NetGraph ``Scenario`` → ``(Network, demand ids, FailureSchedule | None)``."""
     seed = int(getattr(scenario, 'seed', 0) or 0)
-    net = from_network(
-        scenario.network,
-        addressing=addressing,
-        capacity_unit=capacity_unit,
-        seed=seed,
-        **kw,
-    )
-    sets = getattr(getattr(scenario, 'demand_set', None), 'sets', {}) or {}
-    ids = demands_from(scenario.network, net, sets, capacity_unit=capacity_unit)
+    net = Network(seed=seed)
+    with net.batch():
+        _populate_network(
+            net,
+            scenario.network,
+            addressing=addressing,
+            capacity_unit=capacity_unit,
+            **kw,
+        )
+        sets = getattr(getattr(scenario, 'demand_set', None), 'sets', {}) or {}
+        ids = _populate_demands(
+            scenario.network, net, sets, capacity_unit=capacity_unit
+        )
     schedule = None
     if iterations:
         schedule = failure_schedule(

@@ -150,6 +150,38 @@ report = sim.timeline.snapshot_at(10).placement
 print(report.dropped_by_reason)            # {'LINK_DOWN': 4e9} until routing reacts
 ```
 
+For bulk construction or a group of timed edits, use a scoped transaction:
+
+```python
+with net.batch() as b:
+    a = b.add_device('A')
+    z = b.add_device('Z')
+    b.add_p2p(a, 'eth0', z, 'eth0', unnumbered=True)
+    a.add_route('192.0.2.0/24', ['eth0'])
+```
+
+The block stages device, interface, link, route and demand edits in private
+builders, then validates and commits once. Hooks and the runtime receive one
+delta with origin `('batch', n_ops)` at the clock time when the block exits.
+`n_ops` counts primitive builder/update calls, including no-ops; `add_p2p`
+counts as three. An empty or content-equivalent batch commits nothing. Route
+edits are folded into one `rib_apply` per device and address family. Existing
+single-operation calls retain their immediate commit behavior.
+
+An exception escaping the block restores the original tree and all allocator
+counters. Handles created for provisional entities are permanently stale after
+an abort (`exists` is false), even if a later entity reuses their name and
+generation; their equality/hash incarnation also stays distinct. Handles for
+existing entities remain valid. Nested batches raise `RuntimeError`. As with
+`update()`, a hook exception after publication does not undo a commit.
+
+Reads see staged edits: `state`, device `node`, and `fork()` publish immutable
+snapshots, and explicit `update(fn)` passes an immutable snapshot to `fn`.
+These reads/updates are freeze boundaries and can reduce the bulk-construction
+benefit if performed on every iteration. `update()` returns `None` inside a
+batch because no delta is committed yet. Non-tree settings (client profiles,
+route sources, capacity model and adapter metadata) are outside the transaction.
+
 Every committed change is one timeline record (`seq`, `time`, `round`,
 `origin`) plus flat, typed events extracted from it: link state,
 interface oper transitions with RFC 2863 names and reasons, carrier

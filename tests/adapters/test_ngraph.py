@@ -204,3 +204,48 @@ def test_real_ngraph_readme_topology():
         net.placement.dropped_by_reason == {}
         or fw.LOOP not in net.placement.dropped_by_reason
     )
+
+
+@pytest.mark.parametrize('entry', ['from_network', 'from_scenario', 'demands_from'])
+def test_adapter_bulk_construction_commits_once(entry, monkeypatch):
+    from contextlib import contextmanager
+
+    from netsim.model.network import Network
+    from netsim.model.state import tree_equal
+
+    graph = diamond_stub()
+    sets = {'traffic': [TrafficDemand('^R1$', '^R[234]$', 100)]}
+    scenario = Scenario(graph, DemandSet(sets))
+    calls = []
+
+    def factory(**kw):
+        net = Network(**kw)
+        net.on_delta.append(lambda *args: calls.append(args))
+        return net
+
+    monkeypatch.setattr(adapter, 'Network', factory)
+
+    def build():
+        if entry == 'from_scenario':
+            return adapter.from_scenario(scenario)[0]
+        net = adapter.from_network(graph)
+        if entry == 'demands_from':
+            calls.clear()
+            adapter.demands_from(graph, net, sets)
+        return net
+
+    net = build()
+    assert len(calls) == 1
+    assert calls[0][1][0] == 'batch'
+    assert len(calls[0][2].new.devices) == 4
+
+    @contextmanager
+    def unbatched(self):
+        yield self
+
+    monkeypatch.setattr(Network, 'batch', unbatched)
+    expected = build()
+    assert tree_equal(net.state, expected.state)
+    net.converge()
+    expected.converge()
+    assert tree_equal(net.state, expected.state)

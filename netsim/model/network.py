@@ -10,7 +10,8 @@ owns the per-(device, AF) resolver input epochs.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Callable, Iterable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterable, Iterator
 
 from netsim.model import derive
 from netsim.model.addressing import LOCAL_ADMIN_BASE, mac_from_index
@@ -39,13 +40,164 @@ from netsim.model.state import (
     DeviceConfig,
     DeviceState,
     NetworkState,
+    PMap,
     StateDelta,
+    canon,
     check_name,
     validate_immutable,
 )
 
 DeltaHook = Callable[[float, Any, StateDelta], None]
 RouteSource = Callable[[NetworkState, float], NetworkState]
+
+
+class _MapEdit:
+    """An owned PMapBuilder plus a write journal; never part of a state tree."""
+
+    def __init__(self, base: PMap, edits: _Edits) -> None:
+        self.base = base
+        self.builder = base.builder()
+        self.journal = edits.undo
+        self.touched: dict[Any, None] = {}
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return self.builder.get(key, default)
+
+    def __getitem__(self, key: Any) -> Any:
+        return self.builder[key]
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self.builder
+
+    def set(self, key: Any, value: Any) -> None:
+        self.journal.append((self, key, key in self.builder, self.get(key)))
+        self.touched[key] = None
+        self.builder.set(key, value)
+
+    def remove(self, key: Any) -> None:
+        self.journal.append((self, key, key in self.builder, self.get(key)))
+        self.touched[key] = None
+        self.builder.remove(key)
+
+    def items(self) -> Iterator[tuple[Any, Any]]:
+        for key in self.base:
+            if key in self.builder:
+                yield key, self.builder[key]
+        for key in self.touched:
+            if key not in self.base and key in self.builder:
+                yield key, self.builder[key]
+
+    def build(self) -> PMap:
+        return canon(self.base, self.builder.build())
+
+
+class _Edits:
+    """Private staging area shared by builder operations within a transaction.
+
+    Only snapshot() publishes immutable records. Explicit reads and pure
+    update callbacks are snapshot boundaries; ordinary operations never freeze
+    top-level or per-device maps. Failed operations undo only their writes.
+    """
+
+    def __init__(self, base: NetworkState) -> None:
+        self.base = base
+        self.undo: list[tuple[_MapEdit, Any, bool, Any]] = []
+        self.devices = _MapEdit(base.devices, self)
+        self.links = _MapEdit(base.links, self)
+        self.demands = _MapEdit(base.demands, self)
+        self.ifindices = _MapEdit(base.allocators.next_ifindex, self)
+        self.allocators = base.allocators
+        self.interface_maps: dict[str, _MapEdit] = {}
+        self.rib_ops: dict[str, dict[int, list[dict[str, Any]]]] = {}
+
+    def interfaces(self, name: str) -> _MapEdit:
+        result = self.interface_maps.get(name)
+        if result is None:
+            result = self.interface_maps[name] = _MapEdit(
+                self.devices[name].interfaces, self
+            )
+        return result
+
+    def take_ifindex(self, name: str) -> int:
+        index = self.ifindices.get(name, 1)
+        self.ifindices.set(name, index + 1)
+        return index
+
+    def apply(self, fn: Callable[[_Edits], None]) -> None:
+        allocators = self.allocators
+        try:
+            fn(self)
+        except BaseException:
+            for mapping, key, existed, value in reversed(self.undo):
+                if existed:
+                    mapping.builder.set(key, value)
+                else:
+                    mapping.builder.remove(key)
+            self.allocators = allocators
+            raise
+        finally:
+            self.undo.clear()
+
+    def device_snapshot(self, name: str) -> DeviceState:
+        dev = self.devices[name]
+        fields: dict[str, Any] = {}
+        if name in self.interface_maps:
+            fields['interfaces'] = self.interface_maps[name].build()
+        ribs = dev.ribs.builder()
+        for af, operations in self.rib_ops.get(name, {}).items():
+            from netsim.model.routing import RibState, rib_apply
+
+            rib = dev.ribs.get(af) or RibState.empty(af)
+            # Fold all upserts/deletes/syncs before calling rib_apply once.
+            # This uses only the existing routing API (including T3's index).
+            rows = {r.key: r for shard in rib.shards.values() for r in shard.values()}
+            clients: dict[Any, set[Any]] = {}
+            for key, row in rows.items():
+                clients.setdefault(row.source, set()).add(key)
+            for op in operations:
+                sync = op.get('sync')
+                if sync is not None:
+                    client, added = sync
+                    for key in clients.get(client, ()):
+                        rows.pop(key, None)
+                    clients[client] = set()
+                else:
+                    added = op.get('add', ())
+                for key in op.get('delete', ()):
+                    previous = rows.pop(key, None)
+                    if previous is not None:
+                        clients[previous.source].discard(key)
+                for row in added:
+                    rows[row.key] = row
+                    clients.setdefault(row.source, set()).add(row.key)
+            deleted = tuple(
+                key for shard in rib.shards.values() for key in shard if key not in rows
+            )
+            new = rib_apply(rib, add=tuple(rows.values()), delete=deleted)
+            if new is not rib:
+                ribs.set(af, new)
+        fields['ribs'] = ribs.build()
+        return canon(dev, dataclasses.replace(dev, **fields))
+
+    def snapshot(self) -> NetworkState:
+        devices = self.devices.build().builder()
+        touched = dict.fromkeys(self.interface_maps)
+        touched.update(dict.fromkeys(self.rib_ops))
+        for name in touched:
+            devices.set(name, self.device_snapshot(name))
+        candidate = dataclasses.replace(
+            self.base,
+            devices=canon(self.base.devices, devices.build()),
+            links=self.links.build(),
+            demands=self.demands.build(),
+            allocators=canon(
+                self.base.allocators,
+                dataclasses.replace(
+                    self.allocators, next_ifindex=self.ifindices.build()
+                ),
+            ),
+        )
+        return canon(self.base, candidate)
 
 
 class Network:
@@ -64,6 +216,10 @@ class Network:
         self.capacity_model: int = 1  # flows.UNCONSTRAINED
         self.debug_validate = DEBUG_VALIDATE
         self._dispatching = False
+        self._edits: _Edits | None = None
+        self._batch_ops = 0
+        self._handle_incarnation = 0
+        self._batch_handles: list[_Handle] = []
         self._handles: dict[tuple, _Handle] = {}
         self.ngraph_link_ids: dict[str, str] = {}
         """NetGraph link id → NetSim link id, filled by the NetGraph adapter."""
@@ -73,7 +229,79 @@ class Network:
 
     @property
     def state(self) -> NetworkState:
-        return self._state
+        return self._edits.snapshot() if self._edits is not None else self._state
+
+    @contextmanager
+    def batch(self) -> Iterator[Network]:
+        """Stage builder operations and commit once, with origin ('batch', n_ops).
+
+        Yields this network. Nested batches are rejected. n_ops counts primitive
+        builder/update calls (including no-ops); add_p2p contributes three.
+        Hooks run only at exit, at the commit clock time. Explicit state/node
+        reads and pure update callbacks freeze a snapshot of staged work.
+
+        An exception aborts the tree and allocators. Handles for entities born
+        in the batch are permanently invalidated on abort, even if a later
+        entity reuses the same generation. Exceptions from post-commit hooks
+        retain the committed tree, as for update().
+        """
+        if self._edits is not None or self._dispatching:
+            raise RuntimeError('nested Network.batch()')
+        old = self._state
+        self._edits = _Edits(old)
+        self._batch_ops = 0
+        self._batch_handles = []
+        try:
+            yield self
+            candidate = self._edits.snapshot()
+            count = self._batch_ops
+            self._edits = None
+            self.update(lambda _: candidate, ('batch', count))
+        finally:
+            self._edits = None
+            if self._state is old:
+                # Only escaped provisional handles need invalidation. An
+                # existing entity first looked up in the block stays valid.
+                invalidated = False
+                for handle in self._batch_handles:
+                    if handle.generation >= old.allocators.next_generation:
+                        handle._valid = False
+                        key = (type(handle).__name__, handle.key, handle.generation)
+                        del self._handles[key]
+                        invalidated = True
+                if invalidated:
+                    self._handle_incarnation += 1
+            self._batch_handles = []
+
+    def _edit(self, fn: Callable[[_Edits], None], origin: Any) -> None:
+        if self._dispatching:
+            raise RuntimeError('nested Network.update() from a derivation or observer')
+        edits = self._edits
+        if edits is not None:
+            edits.apply(fn)
+            self._batch_ops += 1
+        else:
+            edits = _Edits(self._state)
+            edits.apply(fn)
+            self.update(lambda _: edits.snapshot(), origin)
+
+    def _device_node(self, name: str) -> DeviceState | None:
+        if self._edits is not None:
+            return self._edits.devices.get(name)
+        return self._state.devices.get(name)
+
+    def _interface_node(self, device: str, name: str) -> Any:
+        if self._edits is not None:
+            if device not in self._edits.devices:
+                return None
+            return self._edits.interfaces(device).get(name)
+        dev = self._state.devices.get(device)
+        return dev.interfaces.get(name) if dev is not None else None
+
+    def _link_node(self, lid: str) -> LinkNode | None:
+        if self._edits is not None:
+            return self._edits.links.get(lid)
+        return self._state.links.get(lid)
 
     def fork(self) -> Network:
         """A new ``Network`` starting from this one's current root.
@@ -85,7 +313,7 @@ class Network:
         runs many failure iterations from one converged baseline.
         """
         net = Network(seed=self.seed)
-        net._state = self._state
+        net._state = self.state
         net.profiles = dict(self.profiles)
         net.sources = list(self.sources)
         net.capacity_model = self.capacity_model
@@ -98,6 +326,12 @@ class Network:
     ) -> StateDelta | None:
         if self._dispatching:
             raise RuntimeError('nested Network.update() from a derivation or observer')
+        if self._edits is not None:
+            snapshot = self._edits.snapshot()
+            candidate = fn(derive.bump_epochs(self._edits.base, snapshot))
+            self._edits = _Edits(candidate)
+            self._batch_ops += 1
+            return None
         old = self._state
         candidate = fn(old)
         if candidate is old:
@@ -123,6 +357,8 @@ class Network:
         h = self._handles.get(cache_key)
         if h is None:
             h = self._handles[cache_key] = cls(self, key, generation)
+            if self._edits is not None:
+                self._batch_handles.append(h)
         return h
 
     # -- clients --------------------------------------------------------------
@@ -151,7 +387,7 @@ class Network:
         check_name(name, allow_slash=allow_slash)
         now = self.clock()
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
             if name in state.devices:
                 raise ValueError(f'device {name!r} exists')
             allocators, gen = state.allocators.take_generation()
@@ -164,22 +400,21 @@ class Network:
                 resolution_policy=resolution_policy,
             )
             dev = DeviceState(name, gen, config=cfg)
-            return dataclasses.replace(
-                state, devices=state.devices.set(name, dev), allocators=allocators
-            )
+            state.devices.set(name, dev)
+            state.allocators = allocators
 
-        self.update(fn, ('add_device', name))
+        self._edit(fn, ('add_device', name))
         return self.device(name)
 
     def device(self, name: str) -> Device:
-        dev = self._state.devices.get(name)
+        dev = self._device_node(name)
         if dev is None:
             raise KeyError(name)
         return self._handle(Device, (name,), dev.generation)
 
     @property
     def devices(self) -> dict[str, Device]:
-        return {n: self.device(n) for n, _ in self._state.devices.sorted_items()}
+        return {n: self.device(n) for n, _ in self.state.devices.sorted_items()}
 
     def __getitem__(self, name: str) -> Device:
         return self.device(name)
@@ -197,14 +432,16 @@ class Network:
     ) -> Interface:
         check_name(name)
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
+            device._check_valid()
             dev = state.devices.get(device.name)
             if dev is None or dev.generation != device.generation:
                 raise StaleHandleError(device.name)
-            if name in dev.interfaces:
+            interfaces = state.interfaces(device.name)
+            if name in interfaces:
                 raise ValueError(f'{device.name} already has interface {name!r}')
             allocators, gen = state.allocators.take_generation()
-            allocators, index = allocators.take_ifindex(device.name)
+            index = state.take_ifindex(device.name)
             if kind == 'loopback':
                 node: Any = LoopbackNode(name, index, gen, config, LoopbackOper())
             else:
@@ -222,22 +459,16 @@ class Network:
                         name, index, gen, mac_value, config, PortChannelOper()
                     )
             self._validate_interface_config(state, device.name, name, node, config)
-            new_dev = dataclasses.replace(
-                dev, interfaces=dev.interfaces.set(name, node)
-            )
-            return dataclasses.replace(
-                state,
-                devices=state.devices.set(device.name, new_dev),
-                allocators=allocators,
-            )
+            interfaces.set(name, node)
+            state.allocators = allocators
 
-        self.update(fn, ('add_interface', device.name, name))
+        self._edit(fn, ('add_interface', device.name, name))
         return device.interface(name)
 
     def _validate_interface_config(
-        self, state: NetworkState, device: str, name: str, node: Any, cfg: Any
+        self, state: _Edits, device: str, name: str, node: Any, cfg: Any
     ) -> None:
-        dev = state.devices[device]
+        interfaces = state.interfaces(device)
         if isinstance(cfg, EthernetConfig):
             if cfg.speed <= 0 or cfg.metric <= 0:
                 raise ValueError('speed and metric must be positive')
@@ -246,7 +477,7 @@ class Network:
                     raise ValueError(
                         f'{device}:{name} is a bundle member and may not carry addresses'
                     )
-                po = dev.interfaces.get(cfg.aggregate_id)
+                po = interfaces.get(cfg.aggregate_id)
                 if not isinstance(po, PortChannelNode):
                     raise ValueError(
                         f'{device} has no PortChannel {cfg.aggregate_id!r}'
@@ -262,7 +493,7 @@ class Network:
             raise ValueError('IPv6 requires MTU >= 1280')
         # No duplicate host addresses on the device.
         seen: set[tuple[int, int]] = set()
-        for other_name, other in dev.interfaces.items():
+        for other_name, other in interfaces.items():
             c = cfg if other_name == name else other.config
             for af_addrs in (c.ipv4, c.ipv6):
                 for host, plen in af_addrs:
@@ -271,24 +502,32 @@ class Network:
                     seen.add((host, plen))
 
     def _check_single_partner(
-        self, state: NetworkState, device: str, po: str, extra: Any = None
+        self, state: _Edits, device: str, po: str, extra: Any = None
     ) -> None:
         """Reject a bundle whose members terminate on different peer bundles.
 
         ``extra`` is a member node not (yet) in the tree; a member without a
         link has no partner and cannot conflict.
         """
-        dev = state.devices[device]
+        interfaces = state.interfaces(device)
         partners = set()
-        members = list(derive.bundle_members(dev, po))
-        if extra is not None and extra.name not in dev.interfaces:
+        members = [
+            n
+            for _, n in interfaces.items()
+            if isinstance(n, EthernetNode) and n.config.aggregate_id == po
+        ]
+        if extra is not None and extra.name not in interfaces:
             members.append(extra)
         for m in members:
-            if m.link is None or m.name not in dev.interfaces:
+            if m.link is None or m.name not in interfaces:
                 continue
-            pk = derive.peer_bundle_key(state, device, m.name)
-            if pk is not None:
-                partners.add(pk)
+            peer = state.links[m.link].other((device, m.name))
+            pnode = state.interfaces(peer[0]).get(peer[1])
+            if (
+                isinstance(pnode, EthernetNode)
+                and pnode.config.aggregate_id is not None
+            ):
+                partners.add((peer[0], pnode.config.aggregate_id))
         if len(partners) > 1:
             raise ValueError(
                 f'{device}:{po} members terminate on different peer bundles: {sorted(partners)}'
@@ -305,6 +544,10 @@ class Network:
         delay: float = 0.0,
         risk_groups: Iterable[str] = (),
     ) -> Link:
+        if isinstance(a, Interface):
+            a._check_valid()
+        if isinstance(b, Interface):
+            b._check_valid()
         ea = a.endpoint if isinstance(a, Interface) else a
         eb = b.endpoint if isinstance(b, Interface) else b
         if delay < 0:
@@ -312,7 +555,7 @@ class Network:
         lid = link_id(ea, eb)
         now = self.clock()
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
             if ea[0] == eb[0]:
                 raise ValueError('a link needs two different devices')
             if lid in state.links:
@@ -320,7 +563,7 @@ class Network:
             nodes = {}
             for dev_name, if_name in (ea, eb):
                 dev = state.devices.get(dev_name)
-                node = dev.interfaces.get(if_name) if dev else None
+                node = state.interfaces(dev_name).get(if_name) if dev else None
                 if not isinstance(node, EthernetNode):
                     raise ValueError(
                         f'{dev_name}:{if_name} is not an Ethernet interface'
@@ -342,44 +585,31 @@ class Network:
                 LinkConfig(capacity, delay, tuple(sorted(risk_groups))),
                 LinkOper(1, now),
             )
-            devices = state.devices.builder()
             for (dev_name, if_name), node in nodes.items():
-                dev = devices[dev_name]
-                devices.set(
-                    dev_name,
-                    dataclasses.replace(
-                        dev,
-                        interfaces=dev.interfaces.set(
-                            if_name, dataclasses.replace(node, link=lid)
-                        ),
-                    ),
+                state.interfaces(dev_name).set(
+                    if_name, dataclasses.replace(node, link=lid)
                 )
-            new_state = dataclasses.replace(
-                state,
-                devices=devices.build(),
-                links=state.links.set(lid, link),
-                allocators=allocators,
-            )
+            state.links.set(lid, link)
+            state.allocators = allocators
             for dev_name, if_name in (ea, eb):
-                node = new_state.devices[dev_name].interfaces[if_name]
+                node = state.interfaces(dev_name)[if_name]
                 if node.config.aggregate_id is not None:
                     self._check_single_partner(
-                        new_state, dev_name, node.config.aggregate_id
+                        state, dev_name, node.config.aggregate_id
                     )
-            return new_state
 
-        self.update(fn, ('add_link', lid))
+        self._edit(fn, ('add_link', lid))
         return self.link(lid)
 
     def link(self, lid: str) -> Link:
-        link = self._state.links.get(lid)
+        link = self._link_node(lid)
         if link is None:
             raise KeyError(lid)
         return self._handle(Link, (lid,), link.generation)
 
     @property
     def links(self) -> dict[str, Link]:
-        return {i: self.link(i) for i, _ in self._state.links.sorted_items()}
+        return {i: self.link(i) for i, _ in self.state.links.sorted_items()}
 
     def add_p2p(
         self,
@@ -490,19 +720,19 @@ class Network:
 
         demand = make_demand(id, source, dst, rate, **kw)
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
             if demand.source not in state.devices:
                 raise ValueError(f'unknown source device {demand.source!r}')
             if state.demands.get(id) == demand:
-                return state
-            return dataclasses.replace(state, demands=state.demands.set(id, demand))
+                return
+            state.demands.set(id, demand)
 
-        self.update(fn, ('add_demand', id))
+        self._edit(fn, ('add_demand', id))
         return demand
 
     def remove_demand(self, id: str) -> None:
-        self.update(
-            lambda state: dataclasses.replace(state, demands=state.demands.remove(id)),
+        self._edit(
+            lambda state: state.demands.remove(id),
             ('remove_demand', id),
         )
 
@@ -517,27 +747,27 @@ class Network:
     def place(self) -> Any:
         """Clock-free placement over the current FIBs; returns the report."""
         self.update(self._placement, 'place')
-        return self._state.placement
+        return self.state.placement
 
     @property
     def placement(self) -> Any:
-        return self._state.placement
+        return self.state.placement
 
     # -- forwarding -------------------------------------------------------------------
 
     def view(self, device: str) -> _View:
-        return _View(self._state, device)
+        return _View(self.state, device)
 
     def trace(self, device: Device | str, packet: Any, max_hops: int = 64):
         from netsim.model.forwarding import trace as _trace
 
         name = device.name if isinstance(device, Device) else device
-        state = self._state
+        state = self.state
         return _trace(lambda d: _View(state, d), name, packet, max_hops)
 
     def validate(self) -> list[str]:
         problems: list[str] = []
-        state = self._state
+        state = self.state
         for dname, dev in state.devices.sorted_items():
             for name, node in dev.interfaces.sorted_items():
                 if isinstance(node, PortChannelNode):
