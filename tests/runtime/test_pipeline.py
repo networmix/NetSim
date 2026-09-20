@@ -359,18 +359,85 @@ def test_retry_restores_the_entire_failed_batch():
     assert not kind.retryable
 
 
-@pytest.mark.parametrize('target', [1, 5])
-def test_retry_preserves_new_requests_from_failed_run(target):
+@pytest.mark.parametrize('mode', [COALESCE, DEBOUNCE])
+@pytest.mark.parametrize('failures', [0, 1, 2])
+def test_retry_keeps_fresh_work_in_successor_round(mode, failures):
+    attempts = []
+    completed = []
+
+    def run(state, now, entities):
+        attempts.append((pipe.round_of(now), entities))
+        if len(attempts) == 1:
+            pipe.mark(kind, {'new'}, now)
+        if len(attempts) <= failures:
+            raise RuntimeError('boom')
+        completed.append((pipe.round_of(now), entities))
+        return state
+
+    env, kind, pipe, _ = pipeline(mode, run)
+    pipe.mark(kind, {'old'}, 0)
+    for _ in range(failures):
+        with pytest.raises(RuntimeError, match='boom'):
+            env.run()
+        new = kind.pending['new']
+        pipe.retry()
+        assert kind.pending['new'] == new
+    env.run()
+    assert attempts == [(0, ['old'])] * (failures + 1) + [(1, ['new'])]
+    assert completed == [(0, ['old']), (1, ['new'])]
+    assert not kind.pending
+    assert not kind._heap
+    assert not kind.retryable
+    assert not pipe.successor
+    assert not pipe.scheduled
+    assert not pipe.round_end_scheduled
+
+
+@pytest.mark.parametrize('mode', [COALESCE, DEBOUNCE])
+def test_successor_heap_head_does_not_hide_retried_ticket(mode):
+    env = Environment()
     attempts = []
 
     def run(state, now, entities):
-        attempts.append((now, entities))
+        attempts.append((now, pipe.round_of(now), entities))
+        if len(attempts) == 1:
+            raise RuntimeError('boom')
+        return state
+
+    def late(state, now, entities):
+        pipe.mark(kind, {'new'}, now)
+        # Moving the failed deadline to now gives it a newer ticket than the
+        # successor entry at the heap head. Claiming must reach it anyway.
+        pipe.retry()
+        return state
+
+    kind = Kind(0, mode, run, lambda d, s: set())
+    last = Kind(3, COALESCE, late, lambda d, s: set())
+    pipe = Pipeline(env, Network(), [kind, last])
+    pipe.mark(kind, {'old'}, 0)
+    with pytest.raises(RuntimeError, match='boom'):
+        env.run()
+    env.run(until=1)
+    pipe.mark(last, {'initial'}, env.now)
+    env.run()
+    assert attempts == [(0, 0, ['old']), (1, 0, ['old']), (1, 1, ['new'])]
+    assert not kind.pending
+    assert not kind._heap
+
+
+@pytest.mark.parametrize('mode', [COALESCE, DEBOUNCE])
+@pytest.mark.parametrize('target', [1, 5])
+def test_retry_preserves_new_requests_from_failed_run(mode, target):
+    attempts = []
+
+    def run(state, now, entities):
+        attempts.append((now, pipe.round_of(now), entities))
         if len(attempts) == 1:
             pipe.schedule_entity(kind, 'newer', target, now)
             raise RuntimeError('boom')
         return state
 
-    env, kind, pipe, _ = pipeline(run=run)
+    env, kind, pipe, _ = pipeline(mode, run)
     pipe.mark(kind, {'restore', 'newer'}, 1)
     with pytest.raises(RuntimeError, match='boom'):
         env.run()
@@ -378,12 +445,8 @@ def test_retry_preserves_new_requests_from_failed_run(target):
     pipe.retry()
     assert kind.pending['newer'] == newer
     env.run()
-    expected = [(1, ['newer', 'restore'])]
-    expected += (
-        [(1, ['newer', 'restore'])]
-        if target == 1
-        else [(1, ['restore']), (5, ['newer'])]
-    )
+    expected = [(1, 0, ['newer', 'restore']), (1, 0, ['restore'])]
+    expected += [(1, 1, ['newer'])] if target == 1 else [(5, 0, ['newer'])]
     assert attempts == expected
     assert not kind.pending
 

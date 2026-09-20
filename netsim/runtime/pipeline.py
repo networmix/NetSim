@@ -121,14 +121,25 @@ class Kind:
         # engine queue until consumed; generation and pending-deadline checks
         # make them harmless. Do not remove their scheduled/ROUND_END keys here.
 
-    def _claim_due(self, now: float) -> dict[Any, tuple[float, int]]:
+    def _claim_due(
+        self, now: float, successor: set[Any] | None = None
+    ) -> dict[Any, tuple[float, int]]:
         claimed: dict[Any, tuple[float, int]] = {}
+        deferred: list[tuple[float, int, Any]] = []
         while self._heap and self._heap[0][0] <= now:
             deadline, ticket, entity = heappop(self._heap)
             pending = self.pending.get(entity)
             if pending is None or pending[1] != ticket:
                 continue
+            # Retrying a failed batch must not claim fresh successor work.
+            # Set these entries aside so they cannot hide an eligible ticket
+            # behind them in the heap; preserve their deadlines and tickets.
+            if successor is not None and entity in successor:
+                deferred.append((deadline, ticket, entity))
+                continue
             claimed[entity] = self.pending.pop(entity)
+        for entry in deferred:
+            heappush(self._heap, entry)
         self._compact()
         return claimed
 
@@ -270,7 +281,8 @@ class Pipeline:
         kind = self.by_offset[event.kind]
         # Claim before running: a cause raised by this very commit (the kind
         # re-dirtying itself) must create fresh work for the successor round.
-        claimed = kind._claim_due(now)
+        # ROUND_END clears successor eligibility when the next round opens.
+        claimed = kind._claim_due(now, self.successor.get(kind.offset))
         due = sorted(claimed, key=repr)
         # A retry can revisit an earlier band without moving the frontier back.
         self._round_frontier = max(self._round_frontier, kind.offset)
