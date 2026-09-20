@@ -21,7 +21,6 @@ from typing import Any
 
 from netsim.core import Environment
 from netsim.model.addressing import to_address
-from netsim.model.contracts import AgentNode
 from netsim.model.network import Network
 from netsim.model.srv6 import policy_status
 from netsim.model.state import NetworkState, StateDelta
@@ -608,25 +607,13 @@ class Study:
 
     def _simulation(self, start: float = 0.0, *, warmup: float = 0.0) -> Simulation:
         network = self.network.fork()
-        if network.agents:
-            # A model fork has no inboxes, timers or connections. Reinitialize
-            # every plugin from its configuration, never reuse protocol state.
-            # As for reset_agent(purge=False), owned rows remain until sync.
-            def fresh(state: NetworkState) -> NetworkState:
-                devices = state.devices
-                for device, name in sorted(network.agents):
-                    dev = devices[device]
-                    node = dev.agents[name]
-                    initial = AgentNode(name, node.generation, node.client, node.config)
-                    if node != initial:
-                        devices = devices.set(
-                            device, replace(dev, agents=dev.agents.set(name, initial))
-                        )
-                if devices is state.devices and state.transport is None:
-                    return state
-                return replace(state, devices=devices, transport=None)
-
-            network.update(fresh, origin='study_restart')
+        if network.agents and network.state.transport is not None:
+            # Runtime queues/connections cannot be restored from a model fork.
+            # Leave agent nodes intact: Simulation calls AgentRuntime.restart_all
+            # to assign new generations before initial convergence, without purging.
+            network.update(
+                lambda state: replace(state, transport=None), origin='study_restart'
+            )
         sim = Simulation(
             Environment(initial_time=-float(warmup)),
             network,
@@ -847,10 +834,10 @@ class Study:
         budget includes warm-up, pre-failure, observation and recovery events.
 
         Warm-up runs [-warmup, 0], then the failure is at t0. Agents always
-        get a fresh runtime and initial AgentNode, with client rows retained
-        until sync (the reset_agent(purge=False) rule); a model fork is not
-        a warm protocol restart. Wall warm-up cost lives in result.costs;
-        deterministic warmup_events also appears in iteration metrics.
+        get a fresh runtime; Simulation restarts initialized nodes with fresh
+        generations and retains client rows until sync (reset_agent(purge=False)).
+        A model fork is not a warm protocol restart. Wall warm-up cost lives in
+        result.costs; deterministic warmup_events also appears in iteration metrics.
 
         Stability is checked over the *final* quiet interval of each full
         observation window; liveness events do not restart it. None selects

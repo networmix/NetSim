@@ -224,6 +224,8 @@ def test_fresh_agent_runtime_uses_configuration_and_warms_every_iteration(monkey
     )
     assert net.state is root
     assert len(runtimes) == 2 and runtimes[0] is not runtimes[1]
+    assert all(node.generation != stale.generation for node in seen)
+    assert seen[0].generation == seen[1].generation  # deterministic independent forks
     assert all(
         not node.initialized and node.state is None and node.runs == 0 for node in seen
     )
@@ -522,3 +524,70 @@ def test_warmup_changes_are_excluded_from_observation_metrics():
     assert result.netsim['event_counts'] == {'PlacementEvent': 1}
     assert result.netsim['rounds'] == 0
     assert result.netsim['max_utilization'] > 0
+
+
+def test_real_initialized_agents_restart_and_warm_repeatably():
+    from tests.runtime.test_agent_fresh_runtime import running_network
+
+    network, original_runtime = running_network()
+    original_root = network.state
+    generations = {
+        device: network.state.devices[device].agents['ref'].generation
+        for device in ('R1', 'R2')
+    }
+    study = Study(network)
+    _, simulations = with_timer(study, period=0.125)
+    options = dict(t0=0, warmup=0.5, horizon=0.25, quiet=0.125, restore=False)
+    first = study.iterations([FailureSet()], **options)
+    second = study.iterations([FailureSet()], **options)
+    assert first.to_ngraph() == second.to_ngraph()
+    assert metrics(first)['warmup_events'] > 4  # agent initialization + NORMAL timer
+    assert metrics(first)['status'] == 'converged'
+    for sim in simulations:
+        for device, old_generation in generations.items():
+            node = sim.state.devices[device].agents['ref']
+            assert node.generation != old_generation
+            assert node.initialized and node.runs == 2
+            assert node.state == ('run', 0.001, ('init', -0.5))
+    assert network.state is original_root
+    assert original_runtime.env.now == 2
+
+
+def test_default_processing_delay_delivers_during_real_agent_warmup():
+    from netsim.model import contracts as c
+    from tests.model.test_agent_contract import Minimal
+
+    class Hello(Minimal):
+        config = c.AgentConfig(run_delay=0, listen_ports=(179,))
+
+        def on_init(self, ctx):
+            return c.AgentOutput(
+                state=(),
+                datagrams=(c.Datagram('e', b'hello', port=179),),
+            )
+
+        def on_run(self, ctx):
+            return c.AgentOutput(
+                state=ctx.agent_state
+                + tuple(
+                    (entry.time, entry.payload)
+                    for entry in ctx.inbox
+                    if isinstance(entry, c.Delivery)
+                )
+            )
+
+    network = two_rate_network()
+    network.add_agent('a', Hello(), name='ref')
+    network.add_agent('b', Hello(), name='ref')
+    assert all(link.config.delay == 0 for link in network.state.links.values())
+    study = Study(network)
+    _, simulations = with_timer(study, period=0.125)
+    result = study.iterations(
+        [FailureSet()], t0=0, warmup=0.125, horizon=0.25, quiet=0.125, restore=False
+    )
+    assert metrics(result)['status'] == 'converged'
+    for device in ('a', 'b'):
+        node = simulations[0].state.devices[device].agents['ref']
+        assert node.config.processing_delay == 0.001
+        assert node.state == ((-0.124, b'hello'),)
+        assert node.runs == 2

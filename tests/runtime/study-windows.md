@@ -1,7 +1,9 @@
 # Gate C / C5 study windows and qualification
 
-Base: `9032ea8` (revision 16 / C0). No model, routing, forwarding,
-placement or protocol implementation is changed. Local checks do not replace CI.
+Initial qualification base: `9032ea8` (revision 16 / C0). Integration update:
+main `6ff26e9` was merged after C5 commit `e003e4a`; see the update below.
+C5's own changes do not modify model, routing, forwarding, placement or
+protocol implementations. Local checks do not replace CI.
 
 ## API and clock rules
 
@@ -29,8 +31,11 @@ still means 100 seconds for process mode and the legacy default for iterations.
   `budget_exceeded`, without dispatching it. Empty clock advancement consumes
   no synthetic engine event. Ordinary callback errors still propagate.
 - Agent iterations create a new Environment, Simulation, AgentRuntime and
-  TransportRuntime, reset AgentNode to its registration configuration and clear
-  transport state. Registered plugin configuration is reused. Existing client
+  TransportRuntime and clear transport state. Simulation's **restart_all()**
+  owns agent restart: initialized nodes get a fresh generation and registration
+  configuration; nodes not yet initialized keep their registration generation.
+  C5 leaves agent nodes intact before binding so the runtime can recognize
+  initialized nodes. Registered plugin configuration is reused. Existing client
   rows remain until sync, matching **reset_agent(purge=False)**. A model fork
   cannot restore protocol timers, inboxes, connections or RNG progress.
   The oracle path shares the converged immutable baseline as before.
@@ -107,6 +112,10 @@ The pinned sorted-JSON SHA-256, shared by normal and free-threaded interpreters:
 Final command results and measured workload tables are recorded below.
 
 ## Measurement method
+
+The following timing and memory tables describe C5 commit `e003e4a` against
+its C0 base, before the main integration update. They are preserved as the
+original qualification evidence, not refreshed timings for main `6ff26e9`.
 
 CPython 3.14.5, macOS 26.6.1 arm64, GC enabled. Builds and convergence are
 outside timed regions. Default-path A/B/A loads the C0 study module using
@@ -232,17 +241,17 @@ claim about flat-domain large-scale protocol state, LSDBs or transport queues.
   transport scheduler or derivation kinds were changed.
 - `Timeline.on_record` is the one additive C1-file change; preserve that hook
   when integrating C1's agent events. C5 consumes it before history eviction.
-- Agent warm-up runs ordinary runtime events. C1/C3 are seams on this base;
-  real reference-protocol/transport convergence remains an integration check
-  after those slices land. C5 tests intentionally use recurring NORMAL timers
-  instead of implementing an agent scheduler.
+- Agent warm-up runs ordinary runtime events. The original measurements used
+  C0 seams and recurring NORMAL timers. The main integration update now also
+  tests real C1 initialized-agent restarts and C3 datagram delivery during
+  warm-up; full C4 reference-protocol qualification remains separate.
 - Preserve negative initial runtime time for warm-up, the non-purging restart
   rule, and the separation of wall costs from deterministic exports.
 - Future fault schedules and returned result documents retain their explicit
   workload size; only streaming observation and completed-history memory are
   bounded independently of run length.
 
-## Final checks
+## Initial C5 checks (before main integration)
 
 - `bash .superset/workspace.sh setup`: passed; worktree venv configured without
   replacing shared hooks. This branch was first fast-forwarded from its older
@@ -262,3 +271,43 @@ claim about flat-domain large-scale protocol state, LSDBs or transport queues.
 C0 contracts are unchanged. The new public records are local to netsim.study:
 Stability and Workload; StudyResult adds the defaulted costs field. No new
 runtime dependency is introduced. CI after integration is still required.
+
+## Main integration update: 6ff26e9
+
+Merged main `6ff26e9` after the initial C5 commit. Its real C1/C2/C3
+implementations and fresh-runtime rules are now included in this branch.
+The merge preserves the additive Timeline.on_record hook.
+
+A regression first demonstrated that C5's local AgentNode reset prevented
+Simulation's restart_all() from detecting previously initialized nodes: the
+new-generation assertion failed. C5 now leaves those nodes intact and lets
+AgentRuntime.restart_all() assign their fresh generations before convergence.
+The study still clears transport state on its private fork; client-owned routes,
+policies, SIDs and NHT registrations follow the runtime's non-purging rule.
+No C1/C2/C3-owned implementation required an additional edit for this correction.
+
+The existing fresh-runtime fixture now pins both a changed generation and equal
+restart generations across independent forks. Two added integration tests run
+actual runtime agents: an initialized agent's on_init runs again during negative-
+time warm-up, and agents exchange datagrams across a zero-delay link using
+main's default processing_delay=0.001. Delivery occurs strictly after send time.
+Original runtimes stay untouched and repeated study exports remain identical.
+C5 does not override processing_delay; existing exact-wire-timing fixtures on
+main retain their explicit zero override.
+
+Post-merge verification:
+
+- Focused study/SRv6/fresh-runtime tests: **76 passed, 1 skipped**.
+- `make check-ci`: format, lint and pyright pass; **1,441 passed, 14 skipped**,
+  **95.26%** coverage, 20.83 s pytest time.
+- `make check-ft`: format, lint and pyright pass; **1,441 passed, 14 skipped**,
+  **95.26%** coverage, 19.70 s pytest time. Includes the pinned study fingerprint
+  and the updated idle-agent scale fixture initialized through the real runtime.
+- Real NetGraph adapter and window tests: **174 passed**, 1.75 s.
+- Enabled workload benchmarks: **3 passed, 9 deselected**, 4.11 s.
+- `git diff --check`: pass.
+
+The timing/memory tables above remain the pre-merge qualification record.
+This integration update makes no new performance claim. C5 adds no further
+shared contract fields or validation changes; processing_delay's new default
+and the restart ownership/generation rule come from main.
