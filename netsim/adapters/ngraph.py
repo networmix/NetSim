@@ -20,6 +20,7 @@ from netsim.model.flows import PlacementReport
 from netsim.model.igp import oracle_igp
 from netsim.model.network import Network
 from netsim.model.state import check_name
+from netsim.runtime.failures import Draws, FaultEvent, Schedule, resolve_groups
 
 DEFAULT_LOOPBACK_POOL = '10.255.0.0/16'
 DEFAULT_LINK_POOL = '10.0.0.0/8'
@@ -51,26 +52,22 @@ class FailureSchedule:
     ) -> list[float]:
         """Schedule each iteration ``dwell`` seconds apart from ``start``;
         returns the times at which each iteration is in effect."""
-        times = []
-        for i, it in enumerate(self.iterations):
-            t = start + i * dwell
-            times.append(t)
-
-            def fail(it=it):
-                for n in it.excluded_nodes:
-                    net.device(_device_name(n)).configure(enabled=False)
-                for lid in it.excluded_links:
-                    net.link(_link_ids(net).get(lid, lid)).fail()
-
-            def heal(it=it):
-                for n in it.excluded_nodes:
-                    net.device(_device_name(n)).configure(enabled=True)
-                for lid in it.excluded_links:
-                    net.link(_link_ids(net).get(lid, lid)).restore()
-
-            sim.at(t, fail)
-            if restore:
-                sim.at(t + dwell / 2, heal)
+        if net is not sim.network:
+            raise ValueError('schedule network must match the simulation')
+        times = [start + i * dwell for i in range(len(self.iterations))]
+        sim.failures(
+            Schedule(
+                FaultEvent(
+                    tuple(
+                        [('device', n) for n in it.excluded_nodes]
+                        + [('link', lid) for lid in it.excluded_links]
+                    ),
+                    time,
+                    dwell / 2 if restore else None,
+                )
+                for it, time in zip(self.iterations, times, strict=False)
+            )
+        )
         return times
 
 
@@ -138,11 +135,23 @@ def _populate_network(
         pools.get('link_v6', DEFAULT_LINK_POOL_V6),
     )
     net.ngraph_link_ids = {}
+    failure_parameters: dict[tuple[str, str], dict[str, Any]] = {}
+    # Adapter metadata is outside the immutable forwarding tree. Study copies
+    # it before forking, so no model-layer dependency on this adapter is needed.
+    net.netsim_capacity_unit = capacity_unit  # type: ignore[attr-defined]
+    net.netsim_demand_destinations = {}  # type: ignore[attr-defined]
+    net.netsim_failure_parameters = failure_parameters  # type: ignore[attr-defined]
     for name in sorted(network.nodes):
         node = network.nodes[name]
         check_name(name, allow_slash=True)
         dev = net.add_device(name, enabled=not node.disabled, allow_slash=True)
-        attrs = getattr(node, 'attrs', {}) or {}
+        attrs = _attrs(node)
+        settings = attrs.get('netsim', {})
+        dev.configure(
+            **{k: settings[k] for k in ('fib_delay', 'fast_failover') if k in settings}
+        )
+        if 'mtbf' in settings and 'mttr' in settings:
+            failure_parameters[('device', name)] = dict(settings)
         v4 = attrs.get('loopback_ipv4') or f'{next(p.loopbacks)}/32'
         v6 = attrs.get('loopback_ipv6') or (
             str(next(p.loopbacks_v6).network_address) + '/128' if ipv6 else None
@@ -152,14 +161,14 @@ def _populate_network(
     lag_groups: dict[tuple[str, str, str], list[Any]] = {}
     for lid in sorted(network.links):
         link = network.links[lid]
-        attrs = getattr(link, 'attrs', {}) or {}
+        attrs = _attrs(link)
         lag = attrs.get('lag')
         if lag is not None:
             lag_groups.setdefault((link.source, link.target, str(lag)), []).append(link)
             continue
         _add_link(net, link, counters, p, addressing, capacity_unit, ipv6)
     for (src, dst, lag), links in sorted(lag_groups.items()):
-        attrs = getattr(links[0], 'attrs', {}) or {}
+        attrs = _attrs(links[0])
         min_links = int(attrs.get('min_links', 1))
         members_a = [_next_name(counters, src) for _ in links]
         members_b = [_next_name(counters, dst) for _ in links]
@@ -193,8 +202,51 @@ def _populate_network(
         if ipv6 and addressing == 'unnumbered':
             for d, po in ((src, lag), (dst, lag)):
                 net.device(d)[po].configure(forwarding_v6=True)
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for name, node in sorted(network.nodes.items()):
+        for group in sorted(getattr(node, 'risk_groups', ())):
+            groups.setdefault(group, []).append(('device', name))
+    for lid, link in sorted(network.links.items()):
+        for group in sorted(getattr(link, 'risk_groups', ())):
+            groups.setdefault(group, []).append(('link', lid))
+        settings = _attrs(link).get('netsim', {})
+        if 'mtbf' in settings and 'mttr' in settings:
+            failure_parameters[('link', lid)] = dict(settings)
+        imported = net.link(net.ngraph_link_ids[lid])
+        imported.configure(risk_groups=tuple(sorted(getattr(link, 'risk_groups', ()))))
+        for device, iface in (imported.node.a, imported.node.b):
+            delay = {
+                k: settings[k]
+                for k in ('carrier_delay_down', 'carrier_delay_up')
+                if k in settings
+            }
+            if delay:
+                net.device(device)[iface].configure(**delay)
+
+    def group_members(group: Any, visiting: set[str]) -> None:
+        if group.name in visiting:
+            raise ValueError(f'cyclic risk group: {group.name}')
+        visiting = visiting | {group.name}
+        groups.setdefault(group.name, [])
+        settings = _attrs(group).get('netsim', {})
+        if 'mtbf' in settings and 'mttr' in settings:
+            failure_parameters[('risk_group', group.name)] = dict(settings)
+        for child in sorted(group.children, key=lambda g: g.name):
+            groups[group.name].append(('risk_group', child.name))
+            group_members(child, visiting)
+
+    for _, group in sorted(getattr(network, 'risk_groups', {}).items()):
+        group_members(group, set())
+    net.netsim_risk_groups = resolve_groups(groups)  # type: ignore[attr-defined]
     if igp:
         net.add_source(oracle_igp)
+
+
+def _attrs(entity: Any) -> dict[str, Any]:
+    """Legacy top-level attrs plus the namespaced NetSim settings."""
+    attrs = dict(getattr(entity, 'attrs', {}) or {})
+    attrs.update(attrs.get('netsim', {}))
+    return attrs
 
 
 def _next_name(counters: dict[str, int], device: str) -> str:
@@ -228,7 +280,7 @@ def _add_link(
     capacity_unit: float,
     ipv6: bool,
 ) -> None:
-    attrs = getattr(link, 'attrs', {}) or {}
+    attrs = _attrs(link)
     a_name = attrs.get('source_interface') or _next_name(counters, link.source)
     b_name = attrs.get('target_interface') or _next_name(counters, link.target)
     v4 = _pair(p.links) if addressing == 'p2p' else None
@@ -310,6 +362,9 @@ def _populate_demands(
                     priority=int(getattr(td, 'priority', 0)),
                     tag=set_name,
                 )
+                destinations = getattr(net, 'netsim_demand_destinations', None)
+                if destinations is not None:
+                    destinations[did] = t
                 ids.append(did)
     return ids
 
@@ -329,14 +384,15 @@ def failure_schedule(
     seed: int | None = None,
 ) -> FailureSchedule:
     """Failure iterations from NetGraph's ``FailureManager`` (requires ``ngraph``)."""
-    fm_module = importlib.import_module('ngraph.analysis.failure_manager')
-    fm = fm_module.FailureManager(network, failure_policy_set)
-    pol = failure_policy_set.get_policy(policy) if policy else None
-    out = []
-    for i in range(iterations):
-        nodes, links = fm.compute_exclusions(pol, seed_offset=(seed or 0) + i)
-        out.append(FailureIteration(i, tuple(sorted(nodes)), tuple(sorted(links))))
-    return FailureSchedule(tuple(out))
+    draws = Draws.from_policy(
+        network, failure_policy_set, policy=policy, iterations=iterations, seed=seed
+    )
+    return FailureSchedule(
+        tuple(
+            FailureIteration(i, d.excluded_nodes, d.excluded_links)
+            for i, d in enumerate(draws)
+        )
+    )
 
 
 def from_scenario(
@@ -345,6 +401,7 @@ def from_scenario(
     addressing: str = 'unnumbered',
     capacity_unit: float = 1e9,
     failure_policy: str | None = None,
+    demand_set: str | None = None,
     iterations: int = 0,
     **kw: Any,
 ) -> tuple[Network, list[str], FailureSchedule | None]:
@@ -360,6 +417,8 @@ def from_scenario(
             **kw,
         )
         sets = getattr(getattr(scenario, 'demand_set', None), 'sets', {}) or {}
+        if demand_set is not None:
+            sets = {demand_set: sets[demand_set]}
         ids = _populate_demands(
             scenario.network, net, sets, capacity_unit=capacity_unit
         )
@@ -483,3 +542,108 @@ __all__ = [
     'FailureSchedule',
     'FailureIteration',
 ]
+
+
+# Registration is optional; importing the zero-dependency core never imports this
+# adapter. Importlib keeps NetGraph out of the static typing dependency graph too.
+try:
+    _workflow = importlib.import_module('ngraph.workflow.base')
+except ModuleNotFoundError as exc:
+    if exc.name != 'ngraph':
+        raise
+else:
+
+    @dataclass
+    class NetSimStudy(_workflow.WorkflowStep):
+        """NetGraph workflow entry point for serial NetSim studies."""
+
+        demand_set: str | None = None
+        failure_policy: str | None = None
+        iterations: int = 1
+        mode: str = 'iterations'
+        addressing: str = 'unnumbered'
+        capacity_unit: float = 1e9
+        horizon: float = 100.0
+        rate: float = 1.0
+        duration: Any = 1.0
+        keep: dict[str, Any] | None = None
+        keep_roots: int | None = 0
+        keep_deltas: int = 0
+        keep_arrays: bool = False
+        keep_reports: bool = False
+        keep_timeline: bool = False
+        t0: float = 1.0
+        settle: float = 1.0
+        restore: bool = True
+        parallelism: int = 1
+        results_json: str | dict[str, Any] | None = None
+        step: str | None = None
+        select: list[str] | None = None
+        # Explicit declarations also make construction independent of whether
+        # a type checker can inspect the optional base class.
+        name: str = ''
+        seed: int | None = None
+
+        def run(self, scenario: Any) -> None:
+            from netsim.runtime.failures import Process
+            from netsim.study import Study
+
+            keep = {
+                'roots': self.keep_roots,
+                'deltas': self.keep_deltas,
+                'arrays': self.keep_arrays,
+                'reports': self.keep_reports,
+                'timeline': self.keep_timeline,
+                **(self.keep or {}),
+            }
+            study = Study.from_scenario(
+                scenario,
+                demand_set=self.demand_set,
+                addressing=self.addressing,
+                capacity_unit=self.capacity_unit,
+                keep=keep,
+            )
+            options = {
+                't0': self.t0,
+                'settle': self.settle,
+                'restore': self.restore,
+                'parallelism': self.parallelism,
+            }
+            if self.mode == 'iterations':
+                draws = Draws.from_policy(
+                    scenario.network,
+                    scenario.failure_policy_set,
+                    policy=self.failure_policy,
+                    iterations=self.iterations,
+                    seed=self.seed,
+                )
+                result = study.iterations(draws, **options)
+            elif self.mode == 'process':
+                seed = self.seed if self.seed is not None else int(scenario.seed or 0)
+                if self.failure_policy:
+                    source = Process.from_policy(
+                        scenario.network,
+                        scenario.failure_policy_set,
+                        policy=self.failure_policy,
+                        rate=self.rate,
+                        duration=self.duration,
+                        seed=seed,
+                    )
+                else:
+                    source = Process(study.failure_parameters, seed=seed)
+                result = study.process(source, self.horizon)
+            elif self.mode == 'replay':
+                document = (
+                    self.results_json
+                    if self.results_json is not None
+                    else scenario.results.to_dict()
+                )
+                result = study.replay(document, self.step, self.select, **options)
+            else:
+                raise ValueError('mode must be iterations, process or replay')
+            exported = result.to_ngraph()
+            scenario.results.put('metadata', exported['metadata'])
+            scenario.results.put('data', exported['data'])
+
+    _workflow.register_workflow_step('NetSimStudy')(NetSimStudy)
+    __all__.append('NetSimStudy')

@@ -233,3 +233,147 @@ make check-ft     # lint + tests on the free-threaded venv
 ## License
 
 MIT
+
+## Failure and availability studies
+
+`netsim.study.Study` adds transient measurements to the network model. The
+core, explicit schedules, enumerations and renewal processes need no runtime
+packages beyond Python. NetGraph supplies scenario YAML and policy selection
+when installed separately.
+
+```python
+from netsim.runtime import Draws, Process, Schedule
+from netsim.study import Study
+
+study = Study(network)  # Private, converged baseline; network is unchanged.
+result = study.enumerate('links')  # Every single link; k=2 for all link pairs.
+result = study.enumerate('devices')
+rows = result.rows()  # One row per flow/pattern, with occurrence_count.
+step_document = result.to_ngraph()
+
+# Per-entity renewal: MTBF is healthy time before failure; MTTR is repair time.
+source = Process({('link', link_id): {
+    'mtbf': 100, 'mttr': 2, 'ttf': 'exponential',
+    'ttr': {'kind': 'lognormal', 'sigma': 0.5},
+}}, seed=42)
+availability = study.process(source, horizon=10_000)
+
+# Explicit (entities, start seconds, duration seconds or None) rows.
+schedule = Schedule([
+    ([('device', 'R2')], 1.0, 3.0),
+    ([('link', link_id)], 2.0, None),
+])
+# On an existing simulation: sim.failures(schedule); sim.run_until(10).
+```
+
+Entities use `('device', name)`, `('link', id)`, or `('risk_group', name)`.
+For native networks, pass a group mapping to
+`sim.failures(schedule, risk_groups={'rack': (('device', 'R2'),)})` on the
+first call. Nested groups resolve once; unknown groups and cycles are rejected.
+All sources on a simulation share leases: an entity fails on its first lease
+and returns to its original state on its last release. A pre-disabled entity
+stays disabled. A `None` duration holds the lease permanently. Direct manual
+fail/restore calls during active leases are outside this ownership contract.
+
+Renewal distributions are `exponential`, `lognormal`, `weibull`, or `constant`.
+Their arithmetic means come from `mtbf`/`mttr`; lognormal `sigma` is log-space
+standard deviation and Weibull `shape` determines its shape. Both default to
+1.0. An explicit duration number means constant seconds; a duration dictionary
+uses `{'kind': ..., 'mean': ...}`. Renewal starts healthy and samples the next
+TTF after repair. Each entity has an independent stream derived with NetGraph's
+SHA-256 seed formula and components `('netsim', kind, name)`.
+
+```python
+from netsim.runtime import Draws, Process
+from netsim.study import Study
+
+study = Study.from_scenario(scenario, demand_set='traffic', capacity_unit=1e9)
+draws = Draws.from_policy(
+    scenario.network, scenario.failure_policy_set,
+    policy='single_link_failure', iterations=50, seed=42,
+)
+result = study.iterations(draws, t0=1, settle=1, restore=True, parallelism=1)
+result = study.replay('results.json', 'tm_placement', select=['failure_id_here'])
+
+source = Process.from_policy(
+    scenario.network, scenario.failure_policy_set,
+    policy='single_link_failure', rate=0.1,
+    duration={'kind': 'exponential', 'mean': 5}, seed=42,
+)
+result = study.process(source, horizon=1000)
+```
+
+Policy draws use `FailureManager.compute_exclusions` with `effective_seed + i`,
+including NetGraph's fallback to the policy seed. Empty/no-rule policies produce
+no failure iterations. Identical patterns run once with their multiplicity in
+`occurrence_count`; replay preserves that weight. Failure IDs use NetGraph's
+BLAKE2s formula, with `""` for empty patterns. `Schedule.replay(results, step,
+select, start=1, dwell=1)` instead lays the selected unique patterns onto one
+timeline with timed repairs. Link IDs in results remain NetGraph IDs.
+
+`settle` is a minimum observation window after failure and repair. Iterations
+drain any longer pending derivations before sampling/restoring; process runs
+stop at their exact horizon. Only serial `parallelism=1` is implemented.
+`data.netsim` contains settle/recovery times, transient bits lost, the full-window
+loss integral (bits), per-demand downtime (seconds) and unavailability,
+drop reasons (bit/s), and event counts. Process results additionally expose the
+concurrent leased-entity histogram as seconds at each count. Loss integrates
+the timeline's left-constant delivered samples, including the final interval;
+multiple transitions at one timestamp contribute no elapsed time.
+
+Flow rates in `to_ngraph()` use the scenario's capacity unit (default Gbit/s),
+or bit/s for native networks; loss is always bits. The baseline and failure
+records follow NetGraph's `FlowIterationResult` shape. This is format and
+failure-pattern compatibility: the existing NetSim adapter's demand expansion
+and capacity model remain unchanged. In particular, the included square-mesh
+scenario offers 144 units through NetSim's per-pair expansion versus 12 in
+NetGraph's workflow result. Do not treat their placed totals as equivalent
+without first aligning demand expansion and placement models.
+
+`Study(network, keep={...})` accepts `roots` and `deltas` (both default 0),
+`arrays`, `reports`, and `timeline` (default false). Metrics always retain
+placement samples for the current iteration/run. `arrays=True` exports edge
+utilization series; `timeline=True` exports event rows. Events/records grow with
+the run; bounded root/delta retention is not a bounded total-history guarantee.
+An undefined utilization is exported as JSON `null`.
+
+Importing `netsim.adapters.ngraph` registers the optional `NetSimStudy` workflow
+step. Timing and interface overrides live in node/link/risk-group `attrs.netsim`:
+`mtbf`, `mttr`, `ttf`, `ttr`, node `fib_delay`/`fast_failover`, link
+`carrier_delay_down`/`carrier_delay_up`, `source_interface`/`target_interface`,
+and node `loopback_ipv4`/`loopback_ipv6`. Renewal parameters are imported for
+entities with both `mtbf` and `mttr`. `Process.from_network(imported_network)`
+reads those parameters. Risk-group members, including nested groups, are
+resolved from the expanded scenario.
+
+```yaml
+workflow:
+  - type: NetSimStudy
+    name: transients
+    demand_set: traffic
+    failure_policy: single_link_failure
+    iterations: 50
+    seed: 42
+    mode: iterations
+    addressing: unnumbered
+    capacity_unit: 1000000000
+    keep: {roots: 0, deltas: 0, arrays: false, timeline: false}
+```
+
+`mode: process` accepts `horizon`, `rate` and `duration`; omit `failure_policy`
+for renewal from entity attributes. `mode: replay` accepts `results_json`,
+`step`, and optional `select` failure IDs; omit `results_json` to read an earlier
+step in the same scenario. The step also accepts `t0`, `settle`, `restore`, and
+individual `keep_roots`, `keep_deltas`, `keep_arrays`, `keep_reports`,
+`keep_timeline` options (entries in `keep` take precedence).
+
+```sh
+netsim run scenario.yaml --results results.json
+# Equivalent module entry point:
+python -m netsim run scenario.yaml --results results.json
+```
+
+The command requires NetGraph, registers the step before parsing, runs
+`Scenario.from_yaml(text).run()`, and writes the complete NetGraph results
+including all workflow steps. Without `--results`, it writes `results.json` in
+the current directory. Core imports and `netsim --help` work without NetGraph.

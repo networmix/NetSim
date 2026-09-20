@@ -1,0 +1,85 @@
+seed: 42
+network:
+  nodes:
+    N1: {}
+    N2: {}
+    N3: {}
+    N4: {}
+  links:
+    - source: N1
+      target: N2
+      capacity: 2.0
+      cost: 1.0
+    - source: N1
+      target: N3
+      capacity: 1.0
+      cost: 1.0
+    - source: N1
+      target: N4
+      capacity: 2.0
+      cost: 1.0
+    - source: N2
+      target: N3
+      capacity: 2.0
+      cost: 1.0
+    - source: N2
+      target: N4
+      capacity: 1.0
+      cost: 1.0
+    - source: N3
+      target: N4
+      capacity: 2.0
+      cost: 1.0
+failures:
+  single_link_failure:
+    modes:
+      - weight: 1.0
+        rules:
+          - scope: link
+            mode: choice
+            count: 1
+demands:
+  baseline_traffic_matrix:
+    - source: ^N([1-4])$
+      target: ^N([1-4])$
+      volume: 12.0
+      mode: pairwise
+      attrs:
+        euclidean_km: 10
+workflow:
+  - type: MaximumSupportedDemand
+    name: msd_baseline
+    demand_set: baseline_traffic_matrix
+    acceptance_rule: hard
+    alpha_start: 1.0
+    growth_factor: 2.0
+    alpha_min: 0.001
+    alpha_max: 1000000.0
+    resolution: 0.05
+    max_bracket_iters: 16
+    max_bisect_iters: 32
+  - type: TrafficMatrixPlacement
+    name: tm_placement
+    demand_set: baseline_traffic_matrix
+    failure_policy: single_link_failure
+    iterations: 1000
+    parallelism: 8
+    seed: 42
+    store_failure_patterns: true
+    include_flow_details: true
+    alpha_from_step: msd_baseline
+    alpha_from_field: data.alpha_star
+  - type: MaxFlow
+    name: node_to_node_capacity_matrix
+    source: ^(N[1-4])$
+    target: ^(N[1-4])$
+    mode: pairwise
+    failure_policy: single_link_failure
+    iterations: 1000
+    parallelism: 8
+    shortest_path: false
+    flow_placement: PROPORTIONAL
+    seed: 42
+    store_failure_patterns: true
+    include_flow_details: true
+    include_min_cut: true

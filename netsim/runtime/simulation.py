@@ -9,6 +9,7 @@ from netsim.model import derive
 from netsim.model.network import Network
 from netsim.model.state import NetworkState
 from netsim.runtime.events import EventBus, Stats
+from netsim.runtime.failures import Entity, LeaseRegistry, Process, Schedule
 from netsim.runtime.pipeline import Pipeline, build_kinds, dirty_everything
 from netsim.runtime.timeline import Timeline
 
@@ -26,6 +27,8 @@ class Simulation:
         extract_events: bool = True,
         keep_events: int | None = None,
         keep_records: int | None = None,
+        keep_arrays: bool = True,
+        keep_reports: bool = False,
     ) -> None:
         if getattr(network, '_simulation', None) is not None:
             raise RuntimeError('network is already bound to a Simulation')
@@ -38,7 +41,10 @@ class Simulation:
             extract=extract_events,
             keep_events=keep_events,
             keep_records=keep_records,
+            keep_arrays=keep_arrays,
+            keep_reports=keep_reports,
         )
+        self._failure_registry: LeaseRegistry | None = None
         self.stats = Stats()
         self.bus = EventBus(env, network)
         ref: dict[str, Any] = {}
@@ -112,6 +118,39 @@ class Simulation:
 
     def retry(self) -> None:
         self.pipeline.retry()
+
+    def failures(
+        self,
+        source: Schedule | Process,
+        horizon: float | None = None,
+        *,
+        risk_groups: dict[str, tuple[Entity, ...]] | None = None,
+    ) -> LeaseRegistry:
+        """Schedule faults through this simulation's shared lease registry.
+
+        Process horizons and event times are absolute simulation times.
+        Groups are fixed by the first call; later sources share that mapping.
+        """
+        if isinstance(source, Process):
+            if horizon is None:
+                raise ValueError('a Process requires a horizon')
+            events = source.events(horizon)
+        else:
+            events = source.events
+        if self._failure_registry is None:
+            self._failure_registry = LeaseRegistry(
+                self,
+                risk_groups=risk_groups
+                if risk_groups is not None
+                else getattr(self.network, 'netsim_risk_groups', {}),
+            )
+        elif risk_groups is not None:
+            from netsim.runtime.failures import resolve_groups
+
+            if resolve_groups(risk_groups) != self._failure_registry.risk_groups:
+                raise ValueError('risk groups cannot change within a simulation')
+        self._failure_registry.schedule(events)
+        return self._failure_registry
 
     def dirty_all(self) -> None:
         dirty_everything(self.pipeline, self.network.state, self.env.now)
