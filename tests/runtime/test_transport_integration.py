@@ -501,10 +501,6 @@ def test_fresh_runtime_reestablishes_sessions_with_initial_listeners():
     assert sim.state.transport.connections[1].state == c.ESTABLISHED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='C1: AgentRuntime._context must rebase a scoped remote endpoint to local.scope',
-)
 def test_connection_view_remote_scope_is_local_to_the_observing_agent():
     sim = session()
     sim.run_until(0.125)

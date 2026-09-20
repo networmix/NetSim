@@ -895,6 +895,16 @@ class AgentContext(Protocol):
 
     def lookup(self, af: int, address: int, scope: str | None = None) -> LookupView: ...
 
+    def resolve(
+        self, key: NhtKey, *, exclude_rows: frozenset[Any] = frozenset()
+    ) -> NhtResult:
+        """Prospective local RIB resolution, optionally excluding candidate rows."""
+        ...
+
+    def installed(self, key: NhtKey) -> LookupView:
+        """Installed local forwarding, scoped by the key's interface generation."""
+        ...
+
     @property
     def nht(self) -> PMap[NhtKey, NhtResult | None]: ...
 

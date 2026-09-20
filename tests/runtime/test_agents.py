@@ -312,12 +312,13 @@ def test_same_time_loop_and_positive_delay_event_budget():
 
 
 def test_inbox_limit_and_float_deadlines():
-    from netsim.runtime.agents import AgentBatchError
+    from netsim.runtime.agents import AgentBatchError, AgentInboxOverflow
 
     sim = fixture(Plugin(config=c.AgentConfig(run_delay=1, inbox_limit=1)))
     sim.settle()
     assert sim.agents.deliver('r', 'test', c.TimerFired(0, 'first'))
-    assert not sim.agents.deliver('r', 'test', c.TimerFired(0, 'overflow'))
+    with pytest.raises(AgentInboxOverflow):
+        sim.agents.deliver('r', 'test', c.TimerFired(0, 'overflow'))
     sim.run_until(1)
     assert not sim.agents.budget()['inbox_entries']
     sim = fixture(
@@ -690,14 +691,13 @@ def test_link_neighbor_and_connection_projections(monkeypatch):
     )
     monkeypatch.setattr(
         sim.transport,
-        'budget',
+        'connection_counters',
         # The transport reports one counter dict per direction (a->b, b->a);
         # side a of connection 1 sees its own sending direction.
-        lambda: {
-            'connections': {
-                1: ({'messages': 2, 'bytes': 50}, {'messages': 9, 'bytes': 99})
-            }
-        },
+        lambda cid: ({'messages': 2, 'bytes': 50}, {'messages': 9, 'bytes': 99})
+        if cid == 1
+        else ({}, {}),
+        raising=False,
     )
     sim.settle()
     ctx = contexts[0]

@@ -402,7 +402,8 @@ def test_observer_failure_does_not_replay_real_published_outboxes():
         len(entries(sim, 'R1', c.Delivery)) == len(entries(sim, 'R2', c.Delivery)) == 1
     )
     assert not entries(sim, 'R1', c.Rejection) and not entries(sim, 'R2', c.Rejection)
-    assert sim.stats.counters['integration.left.runs'] == [(0, 1), (5 / 32, 1)]
+    stats = sim.stats.aggregates['integration.left.runs']
+    assert (stats.count, stats.sum, stats.last_time) == (2, 2, 5 / 32)
 
 
 @pytest.mark.parametrize('device', ['R1', 'R2'])

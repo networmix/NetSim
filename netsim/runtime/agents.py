@@ -12,7 +12,11 @@ are implemented by their own slice; the method names below are fixed):
 - ``AgentRuntime.deliver(device, agent, entry)`` appends an inbox entry for
   the agent's *current* generation and schedules a run (``run_delay``);
   it returns ``False`` when the agent is gone, the generation is stale or
-  the inbox is full (the caller reports the outcome, never drops silently).
+  the data inbox is full. Data Deliveries and control notifications have
+  separate allowances of ``config.inbox_limit`` entries each. A live control
+  notification (SessionEvent, Rejection or TimerFired) never returns False:
+  exhausting its allowance raises ``AgentInboxOverflow`` through the caller
+  to the simulation driver. Callers must propagate it, never count-and-ignore.
   Scheduled deliveries must stamp ``entry.generation`` with the destination
   generation. ``None`` remains compatible with immediate current-generation
   callers. A stale generation is rejected before touching the inbox.
@@ -23,11 +27,18 @@ are implemented by their own slice; the method names below are fixed):
   cancel_agent(device, agent, generation)`` aborts everything of a
   generation on reset or removal. Cancellation is invoked by commit dispatch
   (it must not synchronously call Network.update from that hook).
-- Optional connection counters are read from ``transport.budget()['connections']``:
-  a mapping of connection id to a pair of per-direction dicts (``a->b``,
+- ``transport.connections_of(device, agent, generation)`` supplies owned ids;
+  ``transport.connection_counters(cid)`` supplies per-direction dicts (``a->b``,
   ``b->a``) with ``messages`` and ``bytes``; an agent sees the direction it
-  sends on; absent counters default to zero. No transport runtime object
-  enters the context.
+  sends on. Until C3 supplies these methods, a delta-maintained owner index
+  and a bounded per-session compatibility read serve the same purpose; no
+  global budget scan or transport runtime object enters the context.
+
+Opaque state and SR views returned by identity are trusted. Normal admission
+checks only the top-level immutable representation; persistent builders own
+their contents. ``network.debug_validate`` enables whole-tree validation of
+the provisional journal, matching Network.update's debug boundary. Operation
+records and message payloads still undergo transitive validation.
 """
 
 from __future__ import annotations
@@ -35,7 +46,8 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from netsim.model import contracts as c
@@ -43,9 +55,11 @@ from netsim.model import derive, interfaces, nht, routing, srv6
 from netsim.model.addressing import MacAddress
 from netsim.model.network import mark_published
 from netsim.model.state import (
+    FloatArray,
     NetworkState,
     PMap,
     StateDelta,
+    diff_pmap,
     validate_immutable,
 )
 from netsim.runtime.pipeline import COALESCE, Kind
@@ -60,6 +74,37 @@ def _future(now: float, delay: float) -> float:
     if not math.isfinite(target) or target <= now:
         raise ValueError('positive delay must advance the finite float clock')
     return target
+
+
+def _check_opaque(value: Any) -> None:
+    """Shallow normal-mode admission; never visit opaque state children."""
+    if isinstance(value, (list, dict, set, bytearray, memoryview)):
+        raise TypeError(f'mutable {type(value).__name__} as agent state')
+    if isinstance(
+        value,
+        (
+            int,
+            float,
+            str,
+            bytes,
+            bool,
+            type(None),
+            tuple,
+            frozenset,
+            PMap,
+            FloatArray,
+            Enum,
+        ),
+    ):
+        return
+    if is_dataclass(value) and not isinstance(value, type):
+        params = getattr(value, '__dataclass_params__', None)
+        if params is not None and params.frozen:
+            return
+        raise TypeError(f'non-frozen dataclass {type(value).__name__} as agent state')
+    if getattr(type(value), '__netsim_immutable__', False):
+        return
+    raise TypeError(f'unrecognized object {type(value).__name__} as agent state')
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +137,21 @@ class Context:
     _fibs: PMap[int, Any]
     _epochs: PMap[int, int]
     _processed: PMap[int, int]
+    _resolver: nht.LocalContext
+
+    def resolve(
+        self, key: c.NhtKey, *, exclude_rows: frozenset[routing.RowKey] = frozenset()
+    ) -> c.NhtResult:
+        return nht.resolve(
+            self._resolver,
+            self.config.resolution_policy or routing.ResolutionPolicy(),
+            key,
+            exclude_rows=exclude_rows,
+            input_epoch=self._epochs.get(key.af, 0),
+        )
+
+    def installed(self, key: c.NhtKey) -> c.LookupView:
+        return nht.installed(self._resolver, key)
 
     def rib_view(self, af: int) -> tuple[c.RouteView, ...]:
         return self._rows.get(af, ())
@@ -112,7 +172,9 @@ class Context:
             entry.action if entry else None,
             fib.version if fib else 0,
             processed,
-            'PENDING' if self._epochs.get(af, 0) != processed else 'INSTALLED',
+            'PENDING'
+            if af not in self._processed or self._epochs.get(af, 0) != processed
+            else 'INSTALLED',
         )
 
 
@@ -139,6 +201,21 @@ class AgentBatchError(RuntimeError):
         )
 
 
+class AgentInboxOverflow(RuntimeError):
+    """A live control notification could not be reported within its bound."""
+
+    def __init__(self, device: str, agent: str, generation: int, limit: int) -> None:
+        self.device, self.agent, self.generation, self.limit = (
+            device,
+            agent,
+            generation,
+            limit,
+        )
+        super().__init__(
+            f'control inbox overflow for {device}/{agent} generation {generation} (limit {limit})'
+        )
+
+
 class _AgentKind(Kind):
     def _claim_due(self, now, successor=None):
         # A fresh arrival cannot implicitly retry a rejected captured run.
@@ -158,6 +235,8 @@ class AgentRuntime:
         self.subscriptions = SubscriptionIndex()
         self._live: dict[tuple[str, str], int] = {}
         self._inboxes: dict[tuple[str, str, int], deque[c.InboxEntry]] = {}
+        self._inbox_counts: dict[tuple[str, str, int], list[int]] = {}
+        self._connections: dict[tuple[str, str, int], set[int]] = {}
         self._causes: dict[tuple[str, str, int], set[c.Cause]] = {}
         self._captures: dict[tuple[str, str, int], _Capture] = {}
         self._timers: dict[tuple[str, str, int], dict[str, tuple[float, int]]] = {}
@@ -229,6 +308,10 @@ class AgentRuntime:
         return dev.agents.get(name) if dev is not None else None
 
     def bind(self) -> None:
+        transport = self.sim.state.transport
+        if transport is not None and not hasattr(self.sim.transport, 'connections_of'):
+            for cid, conn in transport.connections.items():
+                self._index_connection(cid, conn, add=True)
         for device, name in sorted(self.sim.network.agents):
             node = self.sim.state.devices[device].agents.get(name)
             if node is not None:
@@ -258,6 +341,14 @@ class AgentRuntime:
         out: set[Any] = set()
         if not self._live and not self.sim.network.agents:
             return out
+        if delta.old.transport is not state.transport and not hasattr(
+            self.sim.transport, 'connections_of'
+        ):
+            before = delta.old.transport.connections if delta.old.transport else PMap()
+            after = state.transport.connections if state.transport else PMap()
+            for cid in diff_pmap(before, after, by_identity=True).keys:
+                self._index_connection(cid, before.get(cid), add=False)
+                self._index_connection(cid, after.get(cid), add=True)
         for device in delta.devices().keys:
             old, new = delta.old.devices.get(device), state.devices.get(device)
             changes = delta.agents(device)
@@ -368,13 +459,21 @@ class AgentRuntime:
         ):
             return False
         validate_immutable(entry, 'inbox')
-        queue = self._inboxes.setdefault((device, agent, generation), deque())
+        key = (device, agent, generation)
+        queue = self._inboxes.setdefault(key, deque())
+        counts = self._inbox_counts.setdefault(key, [0, 0])
         node = self.sim.state.devices[device].agents[agent]
-        if len(queue) >= node.config.inbox_limit:
+        category = 0 if isinstance(entry, c.Delivery) else 1
+        if counts[category] >= node.config.inbox_limit:
+            if category:
+                raise AgentInboxOverflow(
+                    device, agent, generation, node.config.inbox_limit
+                )
             return False
         # Validate before admission, so an unrepresentable deadline changes nothing.
         self._delay(self.sim.state, (device, agent))
         queue.append(entry)
+        counts[category] += 1
         kind = (
             c.CAUSE_TIMER
             if isinstance(entry, c.TimerFired)
@@ -389,6 +488,37 @@ class AgentRuntime:
         )
         self.sim.pipeline.mark(self._kind, {(device, agent)}, self.sim.env.now)
         return True
+
+    def _index_connection(self, cid: int, conn: Any, *, add: bool) -> None:
+        if conn is None:
+            return
+        for device, agent, generation in (
+            (conn.a_device, conn.a_agent, conn.a_generation),
+            (conn.b_device, conn.b_agent, conn.b_generation),
+        ):
+            if device is None or agent is None or generation is None:
+                continue
+            key = (device, agent, generation)
+            if add:
+                self._connections.setdefault(key, set()).add(cid)
+            elif key in self._connections:
+                self._connections[key].discard(cid)
+                if not self._connections[key]:
+                    del self._connections[key]
+
+    def _connection_counters(self, cid: int) -> tuple:
+        accessor = getattr(self.sim.transport, 'connection_counters', None)
+        if accessor is not None:
+            return accessor(cid)
+        # C3R compatibility: read only this session, never materialize budget().
+        session = getattr(self.sim.transport, '_sessions', {}).get(cid)
+        return (
+            tuple(
+                {'messages': len(d.queue), 'bytes': d.size} for d in session.directions
+            )
+            if session
+            else ({}, {})
+        )
 
     def _context(
         self,
@@ -474,10 +604,12 @@ class AgentRuntime:
             )
         connections = {}
         transport = state.transport
-        # C3 may expose per-connection admission counters in its budget snapshot.
-        budgets = self.sim.transport.budget().get('connections', {})
         if transport:
-            for cid, conn in transport.connections.sorted_items():
+            owner = (device, name, node.generation)
+            accessor = getattr(self.sim.transport, 'connections_of', None)
+            owned = accessor(*owner) if accessor else self._connections.get(owner, ())
+            for cid in sorted(owned):
+                conn = transport.connections[cid]
                 a = (conn.a_device, conn.a_agent, conn.a_generation) == (
                     device,
                     name,
@@ -495,7 +627,9 @@ class AgentRuntime:
                 )
                 if local is None:
                     continue
-                directions = budgets.get(cid) if isinstance(budgets, dict) else None
+                if remote is not None and remote.scope is not None:
+                    remote = replace(remote, scope=local.scope)
+                directions = self._connection_counters(cid)
                 counters: dict[str, int] = {}
                 if isinstance(directions, tuple) and len(directions) == 2:
                     counters = directions[0] if a else directions[1]
@@ -556,6 +690,7 @@ class AgentRuntime:
                     for af, outcome in dev.resolver_outcomes.items()
                 }
             ),
+            nht.local_context(dev),
         )
 
     def _apply(
@@ -690,7 +825,15 @@ class AgentRuntime:
                 finally:
                     self.active = None
                 output = c.check_output(output)
-                validate_immutable(output, 'AgentOutput')
+                if output.state is not ctx.agent_state:
+                    _check_opaque(output.state)
+                # Output envelopes do not walk opaque state. Validate operation
+                # records separately; message payloads remain a strict boundary.
+                for field in fields(output):
+                    if field.name not in ('state', 'srdb_view'):
+                        value = getattr(output, field.name)
+                        if value:
+                            validate_immutable(value, f'AgentOutput.{field.name}')
                 for timer in output.timers:
                     if timer.delay is not None:
                         _future(now, timer.delay)
@@ -718,6 +861,21 @@ class AgentRuntime:
                     runs=node.runs + 1,
                     initialized=True,
                 )
+                changed = staging.devices[device]
+                staging = replace(
+                    staging,
+                    devices=staging.devices.set(
+                        device,
+                        replace(changed, agents=changed.agents.set(name, updated)),
+                    ),
+                )
+                # Run the commit boundary while this output's journal is live.
+                # This includes validation of every affected SR consumer and
+                # NHT refresh. Epochs are adopted, so the outer commit is
+                # idempotent and does not double-count this journal's inputs.
+                staging = derive.bump_epochs(journal, staging)
+                if self.sim.network.debug_validate:
+                    validate_immutable(staging)
                 self._published.append((key, output, ctx.stats.drain()))
             except Exception as error:
                 staging = journal
@@ -729,13 +887,14 @@ class AgentRuntime:
                 )
                 updated = replace(node, receipt=receipt)
                 self._rejections.append(AgentRejection(device, name, error, receipt))
-            changed = staging.devices[device]
-            staging = replace(
-                staging,
-                devices=staging.devices.set(
-                    device, replace(changed, agents=changed.agents.set(name, updated))
-                ),
-            )
+                changed = staging.devices[device]
+                staging = replace(
+                    staging,
+                    devices=staging.devices.set(
+                        device,
+                        replace(changed, agents=changed.agents.set(name, updated)),
+                    ),
+                )
         return staging
 
     def _after_run(self, now: float, due: list[Any]) -> None:
@@ -749,60 +908,65 @@ class AgentRuntime:
             ticket = self._kind.pending[entity][1]
             self._kind.retryable.setdefault(now, {})[entity] = ticket
             self.sim.pipeline.successor.get(derive.AGENT, set()).discard(entity)
-        errors = []
-        for key, output, stats in published:
+        # Every accepted receipt is committed. Consume ALL captured prefixes
+        # before stats/transport callbacks, which may raise or deliver new work.
+        for key, _, _ in published:
             capture = self._captures.pop(key)
             queue = self._inboxes.get(key)
             if queue is not None:
-                for _ in capture.inbox:
+                counts = self._inbox_counts[key]
+                for entry in capture.inbox:
                     queue.popleft()
+                    counts[0 if isinstance(entry, c.Delivery) else 1] -= 1
                 if not queue:
                     self._inboxes.pop(key, None)
+                    self._inbox_counts.pop(key, None)
+        errors: list[Exception] = []
+        for key, output, stats in published:
             for stat_name, value in stats + output.stats:
-                self.sim.stats.add(stat_name, now, value)
+                try:
+                    self.sim.stats.add(stat_name, now, value)
+                except Exception as error:
+                    errors.append(error)
             try:
                 self._publish_outbox(key, output, now)
             except Exception as error:
                 errors.append(error)
             # Later arrivals survive a retry's captured prefix and get a run.
             if self._inboxes.get(key):
-                self.sim.pipeline.mark(self._kind, {key[:2]}, now)
+                try:
+                    self.sim.pipeline.mark(self._kind, {key[:2]}, now)
+                except Exception as error:
+                    errors.append(error)
         if rejections:
-            error = AgentBatchError(rejections)
+            errors.append(AgentBatchError(rejections))
+        if errors:
+            error = (
+                errors[0]
+                if len(errors) == 1
+                else ExceptionGroup('agent finalization failures', errors)
+            )
             mark_published(error)
             raise error
-        if errors:
-            mark_published(errors[0])
-            raise errors[0]
 
     def _publish_outbox(
         self, key: tuple[str, str, int], output: c.AgentOutput, now: float
     ) -> None:
         if self.generation(*key[:2]) != key[2]:
             return
+        errors: list[Exception] = []
         for timer in output.timers:
-            armed = self._timers.setdefault(key, {})
-            if timer.delay is None:
-                if armed.pop(timer.name, None) is not None:
-                    self._armed_count -= 1
-            else:
-                target = _future(now, timer.delay)
-                self._timer_ticket += 1
-                ticket = self._timer_ticket
-                if timer.name not in armed:
-                    self._armed_count += 1
-                armed[timer.name] = (target, ticket)
-                event = self.sim.env.timeout(target - now)
-                self._timer_events[ticket] = event
-                assert event.callbacks is not None
-                event.callbacks.append(
-                    lambda _, k=key, n=timer.name, t=ticket: self._fire(k, n, t)
-                )
-        self._compact_timers()
+            try:
+                self._publish_timer(key, timer, now)
+            except Exception as error:
+                errors.append(error)
+        try:
+            self._compact_timers()
+        except Exception as error:
+            errors.append(error)
         # The outbox is published exactly once, after the commit: a transport
         # error is a post-publication error and never replays the receipt.
         transport = self.sim.transport
-        errors: list[Exception] = []
 
         def publish(fn: Any, entries: tuple[Any, ...]) -> None:
             for entry in entries:
@@ -815,7 +979,34 @@ class AgentRuntime:
         publish(transport.send_message, output.messages)
         publish(transport.session_op, output.sessions)
         if errors:
-            raise errors[0]
+            raise (
+                errors[0]
+                if len(errors) == 1
+                else ExceptionGroup('agent outbox failures', errors)
+            )
+
+    def _publish_timer(
+        self, key: tuple[str, str, int], timer: c.TimerOp, now: float
+    ) -> None:
+        armed = self._timers.setdefault(key, {})
+        if timer.delay is None:
+            if armed.pop(timer.name, None) is not None:
+                self._armed_count -= 1
+        else:
+            target = _future(now, timer.delay)
+            self._timer_ticket += 1
+            ticket = self._timer_ticket
+            # Create the event before changing the armed timer, so a failure
+            # here cannot leave an unserviceable armed entry.
+            event = self.sim.env.timeout(target - now)
+            assert event.callbacks is not None
+            event.callbacks.append(
+                lambda _, k=key, n=timer.name, t=ticket: self._fire(k, n, t)
+            )
+            self._timer_events[ticket] = event
+            if timer.name not in armed:
+                self._armed_count += 1
+            armed[timer.name] = (target, ticket)
 
     def _fire(self, key: tuple[str, str, int], name: str, ticket: int) -> None:
         self._timer_events.pop(ticket, None)
@@ -862,6 +1053,7 @@ class AgentRuntime:
         self._live.pop(entity, None)
         self.subscriptions.remove(*entity)
         self._inboxes.pop(key, None)
+        self._inbox_counts.pop(key, None)
         self._causes.pop(key, None)
         self._captures.pop(key, None)
         self._armed_count -= len(self._timers.pop(key, {}))
