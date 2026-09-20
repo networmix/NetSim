@@ -165,7 +165,9 @@ builders, then validates and commits once. Hooks and the runtime receive one
 delta with origin `('batch', n_ops)` at the clock time when the block exits.
 `n_ops` counts primitive builder/update calls, including no-ops; `add_p2p`
 counts as three. An empty or content-equivalent batch commits nothing. Route
-edits are folded into one `rib_apply` per device and address family. Existing
+edits are folded into one `rib_apply` per changed device and address family
+at each freeze, submitting only changed rows and withdrawals. Frozen route
+operations are consumed, so later reads do not replay them. Existing
 single-operation calls retain their immediate commit behavior.
 
 An exception escaping the block restores the original tree and all allocator
@@ -178,8 +180,10 @@ existing entities remain valid. Nested batches raise `RuntimeError`. As with
 Reads see staged edits: `state`, device `node`, and `fork()` publish immutable
 snapshots, and explicit `update(fn)` passes an immutable snapshot to `fn`.
 These reads/updates are freeze boundaries and can reduce the bulk-construction
-benefit if performed on every iteration. `update()` returns `None` inside a
-batch because no delta is committed yet. Non-tree settings (client profiles,
+benefit if performed on every iteration: changed route indexes still need to
+be frozen. Plain reads preserve the epoch baseline; edits after an intermediate
+`converge()` invalidate its processed inputs when the batch commits. `update()`
+returns `None` inside a batch because no delta is committed yet. Non-tree settings (client profiles,
 route sources, capacity model and adapter metadata) are outside the transaction.
 
 Every committed change is one timeline record (`seq`, `time`, `round`,

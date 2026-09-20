@@ -1,0 +1,102 @@
+{
+  "base": "7d4976ad79693663cb3b604f7e0fef1727f812d2",
+  "date": "2026-09-20T16:11:44.657667+00:00",
+  "runs": [
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "network_source": "/tmp/netsim-t2b-baseline-7d4976a/netsim/model/network.py",
+      "rows_per_device": 5000,
+      "edits": 200,
+      "samples_s": [
+        5.929464665940031,
+        5.910125125199556,
+        5.941298292018473
+      ],
+      "median_s": 5.929464665940031,
+      "rib_apply_calls_add_delete_rows": [
+        [
+          803,
+          4015000,
+          0
+        ],
+        [
+          803,
+          4015000,
+          0
+        ],
+        [
+          803,
+          4015000,
+          0
+        ]
+      ],
+      "rib_sha256": "6d575f7532da987a214b1d67f42290ebe6c3f305a40b5217ea6d5752ea22c9c6"
+    },
+    {
+      "label": "B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "rows_per_device": 5000,
+      "edits": 200,
+      "samples_s": [
+        0.18746966705657542,
+        0.19288295786827803,
+        0.18886041711084545
+      ],
+      "median_s": 0.18886041711084545,
+      "rib_apply_calls_add_delete_rows": [
+        [
+          201,
+          201,
+          0
+        ],
+        [
+          201,
+          201,
+          0
+        ],
+        [
+          201,
+          201,
+          0
+        ]
+      ],
+      "rib_sha256": "6d575f7532da987a214b1d67f42290ebe6c3f305a40b5217ea6d5752ea22c9c6"
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "network_source": "/tmp/netsim-t2b-baseline-7d4976a/netsim/model/network.py",
+      "rows_per_device": 5000,
+      "edits": 200,
+      "samples_s": [
+        5.910940832924098,
+        6.385602875147015,
+        6.0820237919688225
+      ],
+      "median_s": 6.0820237919688225,
+      "rib_apply_calls_add_delete_rows": [
+        [
+          803,
+          4015000,
+          0
+        ],
+        [
+          803,
+          4015000,
+          0
+        ],
+        [
+          803,
+          4015000,
+          0
+        ]
+      ],
+      "rib_sha256": "6d575f7532da987a214b1d67f42290ebe6c3f305a40b5217ea6d5752ea22c9c6"
+    }
+  ]
+}

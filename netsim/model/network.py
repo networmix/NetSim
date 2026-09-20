@@ -13,7 +13,7 @@ import dataclasses
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
 
-from netsim.model import derive
+from netsim.model import derive, routing
 from netsim.model.addressing import LOCAL_ADMIN_BASE, mac_from_index
 from netsim.model.contracts import (
     CONNECTED_PROFILE,
@@ -91,6 +91,47 @@ class _MapEdit:
         return canon(self.base, self.builder.build())
 
 
+def _fold_rib_ops(
+    rib: routing.RibState, operations: list[dict[str, Any]]
+) -> routing.RibState:
+    """Fold pending operations into only changed rows, without copying the RIB.
+
+    A sync discards earlier edits for its client. Only synced clients need a
+    scan of existing rows, via the client index; add/delete use keyed lookups.
+    """
+    changes: dict[ClientId, dict[routing.RowKey, routing.Route | None]] = {}
+    synced: set[ClientId] = set()
+    for op in operations:
+        sync = op.get('sync')
+        if sync is not None:
+            client, rows = sync
+            changes[client] = {row.key: row for row in rows}
+            synced.add(client)
+        for key in op.get('delete', ()):
+            changes.setdefault(key[2], {})[key] = None
+        for row in op.get('add', ()):
+            changes.setdefault(row.source, {})[row.key] = row
+    added: list[routing.Route] = []
+    deleted: dict[routing.RowKey, None] = {}
+    for client, wanted in changes.items():
+        if client in synced:
+            for row in rib.rows_of(client):
+                if wanted.get(row.key) is None:
+                    deleted[row.key] = None
+        for key, row in wanted.items():
+            shard = rib.shards.get(key[1])
+            previous = shard.get(key) if shard is not None else None
+            if row == previous:
+                continue
+            if row is None:
+                deleted[key] = None
+            else:
+                added.append(row)
+    if not added and not deleted:
+        return rib
+    return routing.rib_apply(rib, add=tuple(added), delete=tuple(deleted))
+
+
 class _Edits:
     """Private staging area shared by builder operations within a transaction.
 
@@ -143,51 +184,44 @@ class _Edits:
         fields: dict[str, Any] = {}
         if name in self.interface_maps:
             fields['interfaces'] = self.interface_maps[name].build()
-        ribs = dev.ribs.builder()
-        for af, operations in self.rib_ops.get(name, {}).items():
-            from netsim.model.routing import RibState, rib_apply
-
-            rib = dev.ribs.get(af) or RibState.empty(af)
-            # Fold all upserts/deletes/syncs before calling rib_apply once.
-            # This uses only the existing routing API (including T3's index).
-            rows = {r.key: r for shard in rib.shards.values() for r in shard.values()}
-            clients: dict[Any, set[Any]] = {}
-            for key, row in rows.items():
-                clients.setdefault(row.source, set()).add(key)
-            for op in operations:
-                sync = op.get('sync')
-                if sync is not None:
-                    client, added = sync
-                    for key in clients.get(client, ()):
-                        rows.pop(key, None)
-                    clients[client] = set()
-                else:
-                    added = op.get('add', ())
-                for key in op.get('delete', ()):
-                    previous = rows.pop(key, None)
-                    if previous is not None:
-                        clients[previous.source].discard(key)
-                for row in added:
-                    rows[row.key] = row
-                    clients.setdefault(row.source, set()).add(row.key)
-            deleted = tuple(
-                key for shard in rib.shards.values() for key in shard if key not in rows
-            )
-            new = rib_apply(rib, add=tuple(rows.values()), delete=deleted)
-            if new is not rib:
-                ribs.set(af, new)
-        fields['ribs'] = ribs.build()
-        return canon(dev, dataclasses.replace(dev, **fields))
+        operations = self.rib_ops.get(name)
+        if operations:
+            ribs = dev.ribs.builder()
+            base_dev = self.base.devices.get(name)
+            for af, pending in operations.items():
+                rib = dev.ribs.get(af)
+                if rib is None:
+                    rib = routing.RibState.empty(af)
+                new = _fold_rib_ops(rib, pending)
+                # Reads are freeze boundaries, not commits. Undoing a change
+                # after a read must still recover the original RIB identity
+                # and version when its rows return to the baseline contents.
+                base_rib = base_dev.ribs.get(af) if base_dev is not None else None
+                if base_rib is not None and new.shards == base_rib.shards:
+                    new = base_rib
+                if base_rib is None and not new.shards:
+                    ribs.remove(af)
+                elif new is not rib:
+                    ribs.set(af, new)
+            fields['ribs'] = ribs.build()
+        new_dev = canon(dev, dataclasses.replace(dev, **fields))
+        if new_dev is not dev:
+            # Publish the frozen device into staging, without recording a
+            # builder-operation undo entry. The immutable base remains the
+            # last update/converge boundary used for epoch invalidation.
+            self.devices.builder.set(name, new_dev)
+            self.devices.touched[name] = None
+        self.rib_ops.pop(name, None)
+        return new_dev
 
     def snapshot(self) -> NetworkState:
-        devices = self.devices.build().builder()
         touched = dict.fromkeys(self.interface_maps)
         touched.update(dict.fromkeys(self.rib_ops))
         for name in touched:
-            devices.set(name, self.device_snapshot(name))
+            self.device_snapshot(name)
         candidate = dataclasses.replace(
             self.base,
-            devices=canon(self.base.devices, devices.build()),
+            devices=self.devices.build(),
             links=self.links.build(),
             demands=self.demands.build(),
             allocators=canon(
@@ -253,7 +287,12 @@ class Network:
         self._batch_handles = []
         try:
             yield self
+            # A staged converge may already have consumed an earlier epoch.
+            # Invalidate edits since that boundary before comparing against
+            # the batch-entry root during the single outer commit.
             candidate = self._edits.snapshot()
+            if self._edits.base is not old:
+                candidate = derive.bump_epochs(self._edits.base, candidate)
             count = self._batch_ops
             self._edits = None
             self.update(lambda _: candidate, ('batch', count))
