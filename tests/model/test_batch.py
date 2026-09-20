@@ -538,9 +538,10 @@ def test_rib_snapshot_add_delete_does_not_enumerate_existing_rows(monkeypatch):
         a.rib_client().delete_routes((existing.key,))
         snapshot = net.state
     assert snapshot.devices['A'].ribs[4].rows(added.prefix) == (added,)
-    # The routing kernel builds the touched client's index once; the batch
-    # folding layer must not enumerate clients for ordinary add/delete calls.
-    assert len(calls) == 1
+    # The batch folding layer must not enumerate clients for ordinary
+    # add/delete calls; the routing kernel may consult the touched client's
+    # index at most once (the incremental index needs no materialization).
+    assert len(calls) <= 1
 
 
 def test_route_snapshot_reverts_preserve_canonical_root():
