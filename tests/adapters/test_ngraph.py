@@ -204,3 +204,19 @@ def test_real_ngraph_readme_topology():
         net.placement.dropped_by_reason == {}
         or fw.LOOP not in net.placement.dropped_by_reason
     )
+
+
+def test_failure_schedules_share_overlapping_leases():
+    import netsim
+    from netsim.runtime import Simulation
+
+    net = adapter.from_network(diamond_stub())
+    sim = Simulation(netsim.Environment(), net)
+    lid = 'R1|R3|0'
+    schedule = adapter.FailureSchedule((adapter.FailureIteration(0, (), (lid,)),))
+    schedule.apply(net, sim, start=1, dwell=8)
+    schedule.apply(net, sim, start=2, dwell=8)
+    sim.run_until(5.5)
+    assert net.link(net.ngraph_link_ids[lid]).state == 0
+    sim.run_until(6)
+    assert net.link(net.ngraph_link_ids[lid]).state == 1
