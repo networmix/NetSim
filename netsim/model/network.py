@@ -16,17 +16,25 @@ import dataclasses
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
 
-from netsim.model import derive, routing
+from netsim.model import derive, routing, srv6
 from netsim.model.addressing import LOCAL_ADMIN_BASE, mac_from_index
 from netsim.model.contracts import (
     CONNECTED_PROFILE,
     IGP_PROFILE,
     LOCAL_PROFILE,
+    SRV6_LOCAL_PROFILE,
     STATIC_PROFILE,
     ClientId,
     ClientProfile,
 )
-from netsim.model.entities import Device, Interface, Link, StaleHandleError, _Handle
+from netsim.model.entities import (
+    Device,
+    Interface,
+    Link,
+    StaleHandleError,
+    _Handle,
+    _remove_interfaces,
+)
 from netsim.model.interfaces import (
     EthernetConfig,
     EthernetNode,
@@ -248,6 +256,7 @@ class Network:
             IGP_PROFILE.client: IGP_PROFILE,
             CONNECTED_PROFILE.client: CONNECTED_PROFILE,
             LOCAL_PROFILE.client: LOCAL_PROFILE,
+            SRV6_LOCAL_PROFILE.client: SRV6_LOCAL_PROFILE,
         }
         self.sources: list[RouteSource] = []
         self.capacity_model: int = 1  # flows.UNCONSTRAINED
@@ -471,6 +480,20 @@ class Network:
         self._edit(fn, ('add_device', name))
         return self.device(name)
 
+    def remove_device(self, name: str) -> None:
+        owner = self.device(name)
+
+        def apply(state: NetworkState) -> NetworkState:
+            dev = owner._node_in(state)
+            candidate = _remove_interfaces(
+                state, {(name, iface) for iface in dev.interfaces}
+            )
+            return dataclasses.replace(
+                candidate, devices=candidate.devices.remove(name)
+            )
+
+        self.update(apply, ('remove_device', name))
+
     def device(self, name: str) -> Device:
         dev = self._device_node(name)
         if dev is None:
@@ -534,6 +557,13 @@ class Network:
         self, state: _Edits, device: str, name: str, node: Any, cfg: Any
     ) -> None:
         interfaces = state.interfaces(device)
+        for dname, dev in state.devices.items():
+            if dev.srv6_sids is not None:
+                for loc in dev.srv6_sids.locators.values():
+                    if any(srv6.contains(loc.block, addr) for addr, _ in cfg.ipv6):
+                        raise ValueError(
+                            f'locator block on {dname} covers interface address'
+                        )
         if isinstance(cfg, EthernetConfig):
             if cfg.speed <= 0 or cfg.metric <= 0:
                 raise ValueError('speed and metric must be positive')
@@ -835,8 +865,8 @@ class Network:
         return _trace(lambda d: _View(state, d), name, packet, max_hops)
 
     def validate(self) -> list[str]:
-        problems: list[str] = []
         state = self.state
+        problems: list[str] = srv6.validate(state)
         for dname, dev in state.devices.sorted_items():
             for name, node in dev.interfaces.sorted_items():
                 if isinstance(node, PortChannelNode):

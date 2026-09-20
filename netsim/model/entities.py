@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any, Iterable
 
+from netsim.model import srv6
 from netsim.model.addressing import (
     IPV4,
     IPV6,
@@ -126,10 +127,12 @@ class Device(_Handle):
             cfg = dev.config
             if 'enabled' in fields and fields['enabled'] != cfg.enabled:
                 fields['enabled_since'] = now
-            state.devices.set(
-                self.name,
-                dataclasses.replace(dev, config=dataclasses.replace(cfg, **fields)),
-            )
+            new_cfg = dataclasses.replace(cfg, **fields)
+            if not 1 <= new_cfg.srv6_hop_limit <= 255:
+                raise ValueError('invalid SRv6 hop limit')
+            if new_cfg.srv6_source is not None:
+                srv6.ipv6(new_cfg.srv6_source)
+            state.devices.set(self.name, dataclasses.replace(dev, config=new_cfg))
 
         self.network._edit(fn, ('configure', self.name))
 
@@ -246,6 +249,110 @@ class Device(_Handle):
     def interfaces(self) -> list[Interface]:
         return [self.interface(n) for n, _ in self.node.interfaces.sorted_items()]
 
+    # -- SRv6 --------------------------------------------------------------
+
+    def _sr_update(self, fn: Any, operation: str) -> Any:
+        result = None
+
+        def apply(state: NetworkState) -> NetworkState:
+            nonlocal result
+            self._node_in(state)
+            candidate, result = fn(state)
+            return candidate
+
+        self.network.update(apply, (operation, self.name))
+        return result
+
+    def add_locator(
+        self,
+        name: str,
+        prefix: str | tuple[int, int] | None = None,
+        *,
+        structure: srv6.SidStructure = srv6.UNCOMPRESSED,
+        block: str | tuple[int, int] = srv6.DEFAULT_BLOCK,
+        node_id: int | None = None,
+        ranges: srv6.SidRanges | None = None,
+        **options: Any,
+    ) -> srv6.Locator:
+        srv6.require_gate_b(srv6.END, **options)
+        return self._sr_update(
+            lambda state: srv6.add_locator(
+                state,
+                self.name,
+                name,
+                prefix,
+                structure,
+                block,
+                node_id,
+                ranges if ranges is not None else srv6.SidRanges(),
+            ),
+            'add_locator',
+        )
+
+    def add_local_sid(
+        self,
+        behavior: int,
+        *,
+        structure: srv6.SidStructure,
+        flavors: int = 0,
+        sid: int | str | None = None,
+        interface: str | Interface | None = None,
+        nexthop: int | str | None = None,
+        owner: ClientId = STATIC,
+        locator: str | None = None,
+        **options: Any,
+    ) -> srv6.LocalSid:
+        self._sr_client(owner)
+        if isinstance(interface, Interface):
+            if interface.network is not self.network or interface.device != self.name:
+                raise ValueError('SID interface must belong to its device')
+            _ = interface.node  # generation check
+            interface = interface.name
+        return self._sr_update(
+            lambda state: srv6.add_local_sid(
+                state,
+                self.name,
+                behavior,
+                structure=structure,
+                flavors=flavors,
+                sid=sid,
+                interface=interface,
+                nexthop=nexthop,
+                owner=owner,
+                locator=locator,
+                **options,
+            ),
+            'add_local_sid',
+        )
+
+    def remove_local_sid(self, sid: int | str) -> None:
+        self._sr_update(
+            lambda state: (srv6.remove_local_sid(state, self.name, sid), None),
+            'remove_local_sid',
+        )
+
+    def _sr_client(self, client: ClientId) -> None:
+        _ = self.node
+        if client not in self.network.profiles:
+            raise ValueError(f'unregistered client {client}')
+
+    def sid_client(self, client: ClientId = STATIC) -> SidClient:
+        self._sr_client(client)
+        return SidClient(self, client)
+
+    def policy_client(self, client: ClientId = STATIC) -> PolicyClient:
+        self._sr_client(client)
+        return PolicyClient(self, client)
+
+    def remove_interface(self, name: str) -> None:
+        _ = self.interface(name).node
+
+        def apply(state: NetworkState) -> NetworkState:
+            self._node_in(state)
+            return _remove_interfaces(state, {(self.name, name)})
+
+        self.network.update(apply, ('remove_interface', self.name, name))
+
     # -- routing ------------------------------------------------------------
 
     def rib(self, af: int) -> RibState:
@@ -294,6 +401,149 @@ class Device(_Handle):
         return row_status(
             dev.resolver_input_epoch.get(af, 0), dev.resolver_outcomes.get(af), key
         )
+
+
+class SidClient:
+    """Owner-scoped SID requests; request ids are local to a client."""
+
+    def __init__(self, device: Device, client: ClientId) -> None:
+        self.device, self.client = device, client
+
+    def request_sid(
+        self,
+        request_id: str,
+        behavior: int,
+        args: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> srv6.LocalSid:
+        options = dict(args or {})
+        if options.keys() & kwargs.keys():
+            raise ValueError('duplicate SID request arguments')
+        options.update(kwargs)
+        return self.device._sr_update(
+            lambda state: srv6.request_sid(
+                state, self.device.name, self.client, request_id, behavior, options
+            ),
+            'request_sid',
+        )
+
+    def remove_sid(self, sid: int | str) -> None:
+        self.device._sr_update(
+            lambda state: (
+                srv6.remove_local_sid(state, self.device.name, sid, self.client),
+                None,
+            ),
+            'remove_sid',
+        )
+
+
+class PolicyClient:
+    """One owner per policy key; client-scoped steering replacement."""
+
+    def __init__(self, device: Device, client: ClientId) -> None:
+        self.device, self.client = device, client
+
+    def _put(
+        self, policy: srv6.SrPolicy, replace_existing: bool, locator: str | None
+    ) -> srv6.SrPolicy:
+        def apply(state: NetworkState) -> tuple[NetworkState, srv6.SrPolicy]:
+            new = srv6.put_policy(
+                state,
+                self.device.name,
+                self.client,
+                policy,
+                replace_existing=replace_existing,
+                locator=locator,
+            )
+            table = new.devices[self.device.name].srv6_policies
+            assert table is not None
+            return new, table.policies[policy.key]
+
+        return self.device._sr_update(
+            apply, 'replace_policy' if replace_existing else 'add_policy'
+        )
+
+    def add(
+        self, policy: srv6.SrPolicy, *, locator: str | None = None, **options: Any
+    ) -> srv6.SrPolicy:
+        srv6.require_gate_b(srv6.END, **options)
+        return self._put(policy, False, locator)
+
+    def replace(
+        self, policy: srv6.SrPolicy, *, locator: str | None = None, **options: Any
+    ) -> srv6.SrPolicy:
+        srv6.require_gate_b(srv6.END, **options)
+        return self._put(policy, True, locator)
+
+    def delete(self, key: tuple[int, int]) -> None:
+        self.device._sr_update(
+            lambda state: (
+                srv6.delete_policy(state, self.device.name, self.client, key),
+                None,
+            ),
+            'delete_policy',
+        )
+
+    def set_steering(self, rules: Iterable[srv6.SteeringRule]) -> None:
+        rows = tuple(rules)
+        self.device._sr_update(
+            lambda state: (
+                srv6.set_steering(state, self.device.name, self.client, rows),
+                None,
+            ),
+            'set_steering',
+        )
+
+    add_policy = add
+    replace_policy = replace
+    delete_policy = delete
+
+
+def _remove_interfaces(state: NetworkState, keys: set[tuple[str, str]]) -> NetworkState:
+    """Detach physical links and delete bound SIDs, retaining allocator cursors."""
+    devices = state.devices
+    links = state.links
+    for lid, link in state.links.sorted_items():
+        if any(endpoint in keys for endpoint in (link.a, link.b)):
+            links = links.remove(lid)
+            for dname, iface in (link.a, link.b):
+                dev = devices[dname]
+                node = dev.interfaces[iface]
+                devices = devices.set(
+                    dname,
+                    dataclasses.replace(
+                        dev,
+                        interfaces=dev.interfaces.set(
+                            iface, dataclasses.replace(node, link=None)
+                        ),
+                    ),
+                )
+    candidate = dataclasses.replace(state, devices=devices, links=links)
+    for dname, name in sorted(keys):
+        dev = candidate.devices[dname]
+        if dev.srv6_sids:
+            for row in dev.srv6_sids.sids.values():
+                if row.interface == name:
+                    candidate = srv6.remove_local_sid(
+                        candidate, dname, row.sid, row.owner
+                    )
+        dev = candidate.devices[dname]
+        interfaces = dev.interfaces.remove(name)
+        for iname, node in interfaces.sorted_items():
+            if isinstance(node, EthernetNode) and node.config.aggregate_id == name:
+                interfaces = interfaces.set(
+                    iname,
+                    dataclasses.replace(
+                        node, config=dataclasses.replace(node.config, aggregate_id=None)
+                    ),
+                )
+        candidate = dataclasses.replace(
+            candidate,
+            devices=candidate.devices.set(
+                dname, dataclasses.replace(dev, interfaces=interfaces)
+            ),
+        )
+    return candidate
 
 
 def parse_nexthop(spec: Any) -> Nexthop:

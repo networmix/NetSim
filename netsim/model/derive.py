@@ -11,8 +11,15 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Iterable
 
+from netsim.model import srv6
 from netsim.model.addressing import IPV4, IPV6, MacAddress
-from netsim.model.contracts import CONNECTED, CONNECTED_PROFILE, LOCAL, LOCAL_PROFILE
+from netsim.model.contracts import (
+    CONNECTED,
+    CONNECTED_PROFILE,
+    LOCAL,
+    LOCAL_PROFILE,
+    SRV6_LOCAL,
+)
 from netsim.model.forwarding import Fib, NeighborTable
 from netsim.model.interfaces import (
     AdminState,
@@ -31,6 +38,8 @@ from netsim.model.interfaces import (
 )
 from netsim.model.links import LinkNode
 from netsim.model.routing import (
+    SRV6_LOCAL_NH,
+    UNREACHABLE,
     Nexthop,
     ResolutionPolicy,
     RibState,
@@ -594,6 +603,7 @@ def derive_l3(
             rid = _router_id(new_dev)
             if rid != new_dev.oper.router_id:
                 new_dev = dataclasses.replace(new_dev, oper=DeviceOper(rid))
+        new_dev = _derive_srv6_local(new_dev, scope)
         if current is not dev.l3_interfaces:
             new_dev = dataclasses.replace(new_dev, l3_interfaces=current)
         if new_dev is not dev:
@@ -603,6 +613,71 @@ def derive_l3(
         state
         if new_devices is state.devices
         else dataclasses.replace(state, devices=new_devices)
+    )
+
+
+def _derive_srv6_local(dev: DeviceState, scope: set[str] | None) -> DeviceState:
+    db = dev.srv6_sids
+    if db is None:
+        # An explicit removal of the SR-DB must withdraw its old contribution.
+        rib = dev.ribs.get(IPV6)
+        if rib is None or not rib.rows_of(SRV6_LOCAL):
+            return dev
+        new_rib = rib_apply(rib, sync=(SRV6_LOCAL, ()))
+        return dataclasses.replace(dev, ribs=dev.ribs.set(IPV6, new_rib))
+    sids = db.sids
+    rows = []
+    for value, sid in db.sids.sorted_items():
+        if sid.behavior == srv6.END_X and (scope is None or sid.interface in scope):
+            node = (
+                dev.interfaces.get(sid.interface) if sid.interface is not None else None
+            )
+            neighbors = dev.neighbors
+            up = bool(
+                node is not None
+                and dev.config.enabled
+                and l3_usable(node, IPV6)
+                and neighbors is not None
+                and (
+                    neighbors.peer_mac(sid.interface)
+                    if sid.nexthop is None
+                    else neighbors.mac(sid.interface, sid.nexthop)
+                )
+                is not None
+            )
+            if up != sid.adjacency_up:
+                sid = dataclasses.replace(sid, adjacency_up=up)
+                sids = sids.set(value, sid)
+        if dev.config.enabled and sid.adjacency_up:
+            rows.append(
+                Route(
+                    (value, sid.length),
+                    IPV6,
+                    SRV6_LOCAL,
+                    0,
+                    (Nexthop(special=SRV6_LOCAL_NH, behavior=sid),),
+                )
+            )
+    if dev.config.enabled:
+        rows.extend(
+            Route(
+                prefix,
+                IPV6,
+                SRV6_LOCAL,
+                0,
+                (Nexthop(special=UNREACHABLE),),
+                distinguisher=('unknown',),
+            )
+            for prefix in srv6.unknown_prefixes(db)
+        )
+    rib = dev.ribs.get(IPV6) or RibState.empty(IPV6)
+    new_rib = rib_apply(rib, sync=(SRV6_LOCAL, tuple(rows)))
+    if new_rib is rib and sids is db.sids:
+        return dev
+    return dataclasses.replace(
+        dev,
+        ribs=dev.ribs.set(IPV6, new_rib),
+        srv6_sids=db if sids is db.sids else dataclasses.replace(db, sids=sids),
     )
 
 
@@ -698,11 +773,15 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
     between *old* and *new*, unless the epoch already advanced in *new*
     (idempotent across a transaction that bumped it itself). Also maintain
     the interface membership index at this common commit boundary."""
-    if old.devices is new.devices:
+    if old.devices is new.devices and old.links is new.links:
         return new
+    consumer_index = srv6.consumer_index(old, new)
+    if consumer_index is not new.srv6_consumers:
+        new = dataclasses.replace(new, srv6_consumers=consumer_index)
     devices = new.devices.builder()
     changes = diff_pmap(old.devices, new.devices, by_identity=True)
-    for name in changes.added + changes.changed:
+    consumers = srv6.consumers_affected(old, new)
+    for name in sorted(set(changes.added + changes.changed) | consumers):
         dev = new.devices[name]
         index = _interface_index(dev)
         if index is not dev.interface_index:
@@ -718,6 +797,10 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
             or odev.neighbors != dev.neighbors
             or odev.config != dev.config
             or odev.load_balancers != dev.load_balancers
+            or odev.srv6_sids != dev.srv6_sids
+            or srv6.policy_inputs(odev.srv6_policies)
+            != srv6.policy_inputs(dev.srv6_policies)
+            or name in consumers
         )
         epochs = dev.resolver_input_epoch
         # A row of one family may resolve recursively through the other

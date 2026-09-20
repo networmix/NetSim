@@ -39,3 +39,6 @@ CONNECTED = ClientId('connected', 0)
 LOCAL = ClientId('local', 0)
 CONNECTED_PROFILE = ClientProfile(CONNECTED, distance=0)
 LOCAL_PROFILE = ClientProfile(LOCAL, distance=0)
+
+SRV6_LOCAL = ClientId('srv6-local', 0)
+SRV6_LOCAL_PROFILE = ClientProfile(SRV6_LOCAL, distance=0)
