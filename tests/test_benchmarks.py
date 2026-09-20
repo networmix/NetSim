@@ -176,3 +176,32 @@ def test_lpm_lookups(benchmark):
 @pytest.mark.timeout(300)
 def test_clos64_converge(benchmark):
     assert benchmark(_clos_converge, 64, 8) > 0
+
+
+@pytest.mark.parametrize('fixture', ['diamond', 'clos8x4', 'clos16x4'])
+def test_study_windows(benchmark, fixture):
+    """Explicit windows; baseline construction/convergence is outside timing."""
+    if benchmark.disabled:
+        pytest.skip('study qualification requires --benchmark-enable')
+    from dataclasses import asdict
+
+    from netsim.runtime import FailureSet
+    from netsim.study import Study
+    from tests.model.clos import build_clos
+    from tests.runtime.test_study import diamond
+
+    network = (
+        diamond()[0]
+        if fixture == 'diamond'
+        else build_clos(8 if fixture == 'clos8x4' else 16, 4)
+    )
+    study = Study(network, keep={'events': 1, 'records': 1})
+    draws = [
+        FailureSet(excluded_links=(name,)) for name in sorted(network.state.links)[:4]
+    ]
+    benchmark.extra_info['workload'] = asdict(study.describe(duration=0.5))
+    benchmark.extra_info['iterations_per_call'] = len(draws)
+    result = benchmark(study.iterations, draws, horizon=0.25, quiet=0.125)
+    assert all(
+        row['data']['netsim']['status'] == 'converged' for row in result.flow_results
+    )

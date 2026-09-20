@@ -12,19 +12,23 @@ import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from ipaddress import IPv6Address
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from netsim.core import Environment
 from netsim.model.addressing import to_address
+from netsim.model.contracts import AgentNode
 from netsim.model.network import Network
 from netsim.model.srv6 import policy_status
-from netsim.model.state import StateDelta
+from netsim.model.state import NetworkState, StateDelta
 from netsim.runtime.failures import (
     Draws,
     FailureSet,
+    FaultEvent,
     LeaseRegistry,
     Process,
     Schedule,
@@ -32,6 +36,225 @@ from netsim.runtime.failures import (
     resolve_groups,
 )
 from netsim.runtime.simulation import Simulation
+from netsim.runtime.timeline import Event, PlacementEvent, Record
+
+
+class Stability(str, Enum):
+    """Outputs that must stay quiet for the requested simulated interval."""
+
+    ROUTING = 'routing'
+    PROGRAMMING = 'programming'
+    DELIVERY = 'delivery'
+    ALL = 'all'
+
+
+@dataclass(frozen=True)
+class Workload:
+    """Baseline workload, not a protocol throughput or scale guarantee.
+
+    Prefixes are distinct (AF, network, length) in the baseline RIBs;
+    rib_rows counts their per-device/client copies. Unknown future event
+    rate and duration are None; describe() accepts declared values.
+    """
+
+    devices: int
+    links: int
+    prefixes: int
+    rib_rows: int
+    demands: int
+    classes: int
+    agents: int
+    sessions: int
+    event_rate: float | None
+    duration: float | None
+    retention: tuple[tuple[str, Any], ...]
+
+
+def _future(start: float, delay: float, name: str) -> float:
+    import math
+
+    _nonnegative(delay, name)
+    end = float(start + delay)
+    if not math.isfinite(end) or (delay > 0 and end <= start):
+        raise ValueError(f'{name} must advance the finite float clock')
+    return end
+
+
+def _window_options(
+    warmup: float,
+    event_budget: int | None,
+    stability: Stability | str | None,
+    quiet: float,
+) -> Stability:
+    _nonnegative(warmup, 'warmup')
+    _nonnegative(quiet, 'quiet')
+    if event_budget is not None and (
+        isinstance(event_budget, bool)
+        or not isinstance(event_budget, int)
+        or event_budget < 0
+    ):
+        raise ValueError('event_budget must be a non-negative integer or None')
+    return Stability.ALL if stability is None else Stability(stability)
+
+
+def _device_programmed(dev: Any) -> bool:
+    for af, epoch in dev.resolver_input_epoch.items():
+        outcome = dev.resolver_outcomes.get(af)
+        if outcome is None or outcome.processed_epoch != epoch:
+            return False
+    if dev.srv6_policies is not None:
+        table = dev.srv6_policies
+        if any(
+            table.states.get(key) is None
+            or table.states[key].programming != 'INSTALLED'
+            for key in table.policies
+        ):
+            return False
+    return True
+
+
+class _StabilityWindow:
+    def __init__(self, sim: Simulation, start: float, kind: Stability, quiet: float):
+        self.kind, self.quiet = kind, quiet
+        self.start = start
+        self.observation: _StudyObservation = sim._study_observation  # type: ignore[attr-defined]
+        self.routing = kind in (Stability.ALL, Stability.ROUTING)
+        self.programming = kind in (Stability.ALL, Stability.PROGRAMMING)
+        self.delivery = kind in (Stability.ALL, Stability.DELIVERY)
+        self.pending = {
+            name
+            for name, dev in sim.state.devices.items()
+            if self.programming and not _device_programmed(dev)
+        }
+        self.since: float | None = None if self.pending else start
+        self.loss = 0.0
+        self.reason_base = self.observation.loss_by_reason(start)
+        self.reasons = dict(self.reason_base)
+
+    def ready(self, state: NetworkState) -> bool:
+        return not self.programming or all(
+            _device_programmed(dev) for dev in state.devices.values()
+        )
+
+    def on_delta(self, time: float, origin: Any, delta: StateDelta) -> None:
+        changed = False
+        if self.routing or self.programming:
+            for name in delta.devices().keys:
+                old, new = delta.old.devices.get(name), delta.new.devices.get(name)
+                if self.routing and (
+                    old is None or new is None or old.fibs != new.fibs
+                ):
+                    changed = True
+                if self.programming:
+                    if new is None or _device_programmed(new):
+                        self.pending.discard(name)
+                    else:
+                        self.pending.add(name)
+        if self.delivery:
+            old, new = delta.old.placement, delta.new.placement
+            if old is not new and (
+                old is None
+                or new is None
+                or old.delivered_total != new.delivered_total
+                or old.dropped_by_reason != new.dropped_by_reason
+            ):
+                changed = True
+        if self.pending:
+            self.since = None
+        elif self.since is None or changed:
+            self.since = max(time, self.start)
+            self.loss = self.observation.phase.total_loss(self.since)
+            self.reasons = self.observation.loss_by_reason(self.since)
+
+    def transient(self, end: float, converged: bool) -> tuple[float, dict[str, float]]:
+        loss = self.loss if converged else self.observation.phase.total_loss(end)
+        reasons = self.reasons if converged else self.observation.loss_by_reason(end)
+        return loss, {
+            reason: value - self.reason_base.get(reason, 0.0)
+            for reason, value in reasons.items()
+        }
+
+    def result(self, end: float, exhausted: bool) -> tuple[str, float | None]:
+        if exhausted:
+            return 'budget_exceeded', None
+        if self.since is not None and end >= _future(self.since, self.quiet, 'quiet'):
+            return 'converged', self.since
+        return 'deadline_exceeded', None
+
+
+class _Runner:
+    """Bound all dispatched engine events, including NORMAL liveness timers.
+
+    Advancing an empty clock consumes no synthetic event or budget. All events
+    at the deadline are included; work past it is left pending.
+    """
+
+    def __init__(self, sim: Simulation, budget: int | None):
+        self.sim, self.budget = sim, budget
+        self.events = 0
+        self.exhausted = False
+
+    def until(self, deadline: float) -> None:
+        env = self.sim.env
+        observation: _StudyObservation = self.sim._study_observation  # type: ignore[attr-defined]
+        while env.peek() <= deadline:
+            if not observation.begun and env.peek() >= observation.integrals.start:
+                observation.begin(self.sim)
+            if self.budget is not None and self.events >= self.budget:
+                self.exhausted = True
+                return
+            env.step()
+            self.events += 1
+        if not observation.begun and deadline >= observation.integrals.start:
+            observation.begin(self.sim)
+        env._now = deadline
+
+
+class _StudyRegistry(LeaseRegistry):
+    """Aggregate completed lease history instead of retaining every transition.
+
+    The source API still materializes scheduled future faults; this bounds
+    *past* history, independently of Timeline retention.
+    """
+
+    def __init__(self, sim: Simulation, start: float, risk_groups: Any):
+        super().__init__(sim, risk_groups=risk_groups)
+        self.cursor, self.active = start, 0
+        self.histogram: dict[int, float] = {}
+        self.fault_events = 0
+        self.history.clear()
+
+    def _sample(self) -> None:
+        now = max(self.cursor, self.sim.env.now)
+        dt = now - self.cursor
+        if dt:
+            self.histogram[self.active] = self.histogram.get(self.active, 0.0) + dt
+        self.cursor, self.active = now, len(self.counts)
+        self.history.clear()
+
+    def acquire(self, entities: Any) -> int:
+        token = super().acquire(entities)
+        self._sample()
+        return token
+
+    def release(self, token: int) -> None:
+        super().release(token)
+        self._sample()
+
+    def schedule(self, events: Iterable[FaultEvent]) -> None:
+        super().schedule(events)
+        self.trace.clear()
+
+    def _start(self, event: FaultEvent) -> None:
+        super()._start(event)
+        self.fault_events += 1
+
+    def histogram_at(self, end: float) -> dict[int, float]:
+        result = dict(self.histogram)
+        dt = max(0.0, end - self.cursor)
+        if dt:
+            result[self.active] = result.get(self.active, 0.0) + dt
+        return result
 
 
 @dataclass
@@ -40,6 +263,8 @@ class StudyResult:
     flow_results: list[dict[str, Any]]
     metadata: dict[str, Any] = field(default_factory=dict)
     netsim: dict[str, Any] = field(default_factory=dict)
+    costs: dict[str, Any] = field(default_factory=dict)
+    """Wall costs, excluded from rows()/to_ngraph() for reproducible exports."""
 
     def to_ngraph(self) -> dict[str, Any]:
         """A detached JSON-safe NetGraph results.json **step** document."""
@@ -126,7 +351,9 @@ def _shortfall(offered: float, delivered: float) -> float:
     residual for exported drops, integrals and downtime so they cannot disagree.
     """
     residual = offered - delivered
-    return residual if residual > max(1e-12, abs(offered) * 1e-9) else 0.0
+    return (
+        residual if residual > 0 and residual > max(1e-12, abs(offered) * 1e-9) else 0.0
+    )
 
 
 class _DeliveryIntegrals:
@@ -140,25 +367,28 @@ class _DeliveryIntegrals:
         self.offered = dict(offered)
         self.start = self.time = start
         self.values: dict[str, float] = {}
+        self.shortfalls = dict(offered)
         self.loss = dict.fromkeys(offered, 0.0)
         self.downtime = dict.fromkeys(offered, 0.0)
 
     def sample(self, time: float, values: Iterable[tuple[str, float]]) -> None:
         dt = max(0.0, time - self.time)
         if dt:
-            for name, rate in self.offered.items():
-                shortfall = _shortfall(rate, self.values.get(name, 0.0))
+            for name, shortfall in self.shortfalls.items():
                 self.loss[name] += shortfall * dt
                 if shortfall:
                     self.downtime[name] += dt
             self.time = time
         self.values = dict(values)
+        self.shortfalls = {
+            name: _shortfall(rate, self.values.get(name, 0.0))
+            for name, rate in self.offered.items()
+        }
 
     def metrics(self, end: float) -> dict[str, dict[str, float]]:
         dt = max(0.0, end - self.time)
         result = {}
-        for name, rate in self.offered.items():
-            shortfall = _shortfall(rate, self.values.get(name, 0.0))
+        for name, shortfall in self.shortfalls.items():
             downtime = self.downtime[name] + (dt if shortfall else 0.0)
             result[name] = {
                 'downtime': downtime,
@@ -170,7 +400,12 @@ class _DeliveryIntegrals:
         return result
 
     def total_loss(self, end: float) -> float:
-        return sum(row['loss_integral'] for row in self.metrics(end).values())
+        # Stability checkpoints need only the total, not detached per-demand rows.
+        dt = max(0.0, end - self.time)
+        return sum(
+            self.loss[name] + shortfall * dt
+            for name, shortfall in self.shortfalls.items()
+        )
 
 
 class _StudyObservation:
@@ -185,8 +420,73 @@ class _StudyObservation:
         self.last_commit_time = sim.env.now
         self.max_utilization = 0.0
         self.drop_reasons: set[str] = set()
-        self._placement(sim.env.now, sim.state.placement)
+        self.reason_rates: dict[str, float] = {}
+        self.reason_loss: dict[str, float] = {}
+        self.reason_time = start
+        self.event_counts: Counter[str] = Counter()
+        self.commits = self.rounds = 0
+        self.last_round: tuple[float, int] | None = None
+        # Seed one logical observation baseline, independent of constructor
+        # events that may already have been evicted by the time we attach.
+        if sim.state.placement is not None:
+            self.event_counts['PlacementEvent'] = 1
+            self.commits = 1
+        self.begun = False
+        sim.timeline.on_record.append(self.on_record)
+        self._placement(start, sim.state.placement)
         sim.network.on_delta.append(self.on_delta)
+
+    def begin(self, sim: Simulation) -> None:
+        """Take the baseline at the observation boundary, after pre-window work."""
+        self.begun = True
+        self.max_utilization = 0.0
+        self.drop_reasons.clear()
+        self._placement(self.integrals.start, sim.state.placement)
+
+    def on_record(self, record: Record, events: list[Event]) -> None:
+        if record.time >= self.integrals.start:
+            self.commits += 1
+            self.event_counts.update(type(event).__name__ for event in events)
+            key = (record.time, record.round)
+            if record.origin.kind == 'stage' and key != self.last_round:
+                self.rounds += 1
+                self.last_round = key
+        for event in events:
+            if isinstance(event, PlacementEvent):
+                self._sample(
+                    event.time,
+                    event.demand_delivered,
+                    dict(event.dropped),
+                    event.max_utilization,
+                )
+
+    def _sample(
+        self,
+        time: float,
+        values: Iterable[tuple[str, float]],
+        reasons: dict[str, float],
+        utilization: float,
+    ) -> None:
+        values = tuple(values)
+        self.integrals.sample(time, values)
+        if self.phase is not self.integrals:
+            self.phase.sample(time, values)
+        dt = max(0.0, time - self.reason_time)
+        for reason, rate in self.reason_rates.items():
+            self.reason_loss[reason] = self.reason_loss.get(reason, 0.0) + rate * dt
+        self.reason_time = max(time, self.reason_time)
+        self.reason_rates = reasons
+        if time >= self.integrals.start:
+            self.max_utilization = max(self.max_utilization, utilization)
+            self.drop_reasons.update(reasons)
+
+    def loss_by_reason(self, end: float) -> dict[str, float]:
+        dt = max(0.0, end - self.reason_time)
+        return {
+            reason: self.reason_loss.get(reason, 0.0)
+            + self.reason_rates.get(reason, 0.0) * dt
+            for reason in sorted(self.reason_loss.keys() | self.reason_rates.keys())
+        }
 
     def _placement(self, time: float, report: Any) -> None:
         values = (
@@ -194,17 +494,15 @@ class _StudyObservation:
             if report is not None
             else ()
         )
-        self.integrals.sample(time, values)
-        if self.phase is not self.integrals:
-            self.phase.sample(time, values)
-        if report is not None:
-            self.max_utilization = max(self.max_utilization, report.max_utilization())
-            self.drop_reasons.update(report.dropped_by_reason)
+        self._sample(
+            time,
+            values,
+            dict(report.dropped_by_reason) if report else {},
+            report.max_utilization() if report else 0.0,
+        )
 
     def on_delta(self, time: float, origin: Any, delta: StateDelta) -> None:
         self.last_commit_time = time
-        if delta.old.placement is not delta.new.placement:
-            self._placement(time, delta.new.placement)
 
     def start_phase(self, time: float) -> None:
         self.phase = _DeliveryIntegrals(self.integrals.offered, time)
@@ -248,7 +546,55 @@ class Study:
         self.capacity_unit = float(getattr(network, 'netsim_capacity_unit', 1.0))
         self.destinations = dict(getattr(network, 'netsim_demand_destinations', {}))
         self.priorities = dict(getattr(network, 'netsim_demand_priorities', {}))
+        # Many demands share a destination. Cache only baseline address strings;
+        # iteration-specific demands use a fallback without growing this cache.
+        self._addresses = {
+            (demand.af, demand.dst): str(to_address(demand.dst, demand.af))
+            for demand in self.network.state.demands.values()
+        }
         self.scenario: Any = None
+
+    def describe(
+        self,
+        *,
+        event_rate: float | None = None,
+        duration: float | None = None,
+    ) -> Workload:
+        """Count the frozen baseline; event rate/duration are declared, not guessed."""
+        for name, value in (('event_rate', event_rate), ('duration', duration)):
+            if value is not None:
+                _nonnegative(value, name)
+        state = self.network.state
+        prefixes: set[tuple[int, int, int]] = set()
+        rows = 0
+        for dev in state.devices.values():
+            for af, rib in dev.ribs.items():
+                for shard in rib.shards.values():
+                    rows += len(shard)
+                    prefixes.update((af, key[0], key[1]) for key in shard)
+        retention = {
+            'roots': 0,
+            'deltas': 0,
+            'arrays': False,
+            'reports': False,
+            'timeline': False,
+            'events': None,
+            'records': None,
+            **self.keep,
+        }
+        return Workload(
+            len(state.devices),
+            len(state.links),
+            len(prefixes),
+            rows,
+            len(state.demands),
+            len(state.placement.classes) if state.placement else 0,
+            len(self.network.agents),
+            len(state.transport.connections) if state.transport else 0,
+            event_rate,
+            duration,
+            tuple(sorted(retention.items())),
+        )
 
     @classmethod
     def from_scenario(cls, scenario: Any, **adapter_kwargs: Any) -> Study:
@@ -260,10 +606,30 @@ class Study:
         study.scenario = scenario
         return study
 
-    def _simulation(self, start: float = 0.0) -> Simulation:
+    def _simulation(self, start: float = 0.0, *, warmup: float = 0.0) -> Simulation:
+        network = self.network.fork()
+        if network.agents:
+            # A model fork has no inboxes, timers or connections. Reinitialize
+            # every plugin from its configuration, never reuse protocol state.
+            # As for reset_agent(purge=False), owned rows remain until sync.
+            def fresh(state: NetworkState) -> NetworkState:
+                devices = state.devices
+                for device, name in sorted(network.agents):
+                    dev = devices[device]
+                    node = dev.agents[name]
+                    initial = AgentNode(name, node.generation, node.client, node.config)
+                    if node != initial:
+                        devices = devices.set(
+                            device, replace(dev, agents=dev.agents.set(name, initial))
+                        )
+                if devices is state.devices and state.transport is None:
+                    return state
+                return replace(state, devices=devices, transport=None)
+
+            network.update(fresh, origin='study_restart')
         sim = Simulation(
-            Environment(),
-            self.network.fork(),
+            Environment(initial_time=-float(warmup)),
+            network,
             keep_roots=self.keep.get('roots', 0),
             keep_deltas=self.keep.get('deltas', 0),
             keep_arrays=self.keep.get('arrays', False),
@@ -286,12 +652,13 @@ class Study:
             offered = demand.rate / self.capacity_unit
             dropped = shortfall / self.capacity_unit
             placed = offered - dropped
+            destination = self._addresses.get((demand.af, demand.dst))
+            if destination is None:
+                destination = str(to_address(demand.dst, demand.af))
             flows.append(
                 {
                     'source': demand.source,
-                    'destination': self.destinations.get(
-                        name, str(to_address(demand.dst, demand.af))
-                    ),
+                    'destination': self.destinations.get(name, destination),
                     'priority': self.priorities.get(name, demand.priority),
                     'demand': offered,
                     'placed': placed,
@@ -373,8 +740,14 @@ class Study:
             histogram[active] = histogram.get(active, 0.0) + time - cursor
             cursor, active = time, count
         histogram[active] = histogram.get(active, 0.0) + end - cursor
+        if isinstance(registry, _StudyRegistry):
+            histogram = registry.histogram_at(end)
         histogram = {k: v for k, v in sorted(histogram.items()) if v > 0}
-        counts = Counter(type(event).__name__ for event in sim.timeline.events)
+        counts = (
+            observation.event_counts
+            if observation is not None
+            else Counter(type(event).__name__ for event in sim.timeline.events)
+        )
         extras: dict[str, Any] = {
             'start': start,
             'end': end,
@@ -382,12 +755,26 @@ class Study:
             'per_demand': per_demand,
             'concurrent_failure_histogram': {str(k): v for k, v in histogram.items()},
             'event_counts': dict(sorted(counts.items())),
-            'commits': len(sim.timeline.records) + sim.timeline.dropped_records,
+            'commits': observation.commits
+            if observation is not None
+            else len(sim.timeline.records) + sim.timeline.dropped_records,
+            'rounds': observation.rounds
+            if observation is not None
+            else len(
+                {
+                    (r.time, r.round)
+                    for r in sim.timeline.records
+                    if r.origin.kind == 'stage'
+                }
+            ),
+            'bits_lost_by_reason': observation.loss_by_reason(end)
+            if observation is not None
+            else {},
             'dropped_events': sim.timeline.dropped_events,
             'dropped_records': sim.timeline.dropped_records,
-            'fault_events': sum(
-                start <= event.start <= end for event in registry.trace
-            ),
+            'fault_events': registry.fault_events
+            if isinstance(registry, _StudyRegistry)
+            else sum(start <= event.start <= end for event in registry.trace),
             'drop_reasons': _drop_reasons(sim.network),
             'observed_drop_reasons': sorted(
                 observation.drop_reasons
@@ -444,17 +831,48 @@ class Study:
         settle: float = 1.0,
         restore: bool = True,
         parallelism: int = 1,
+        warmup: float = 0.0,
+        horizon: float | None = None,
+        event_budget: int | None = None,
+        stability: Stability | str | None = None,
+        quiet: float = 0.0,
     ) -> StudyResult:
-        """Fork once per unique pattern, holding it for at least ``settle`` seconds.
+        """Observe failures independently, optionally followed by recovery.
 
-        Pending delayed derivations are drained before sampling/restoring, even
-        when they exceed ``settle``. Recovery is observed for the same minimum
-        window. ``parallelism`` is reserved: only 1 is supported for now.
+        With no new options and no agents, preserve the legacy minimum
+        ``settle`` window followed by run_derivations(). Otherwise ``horizon``
+        is a hard observation duration; if omitted, ``settle`` is its alias
+        (an upper bound, no draining beyond it). An explicit horizon wins.
+        Each failure/recovery phase gets that duration. The single event
+        budget includes warm-up, pre-failure, observation and recovery events.
+
+        Warm-up runs [-warmup, 0], then the failure is at t0. Agents always
+        get a fresh runtime and initial AgentNode, with client rows retained
+        until sync (the reset_agent(purge=False) rule); a model fork is not
+        a warm protocol restart. Wall warm-up cost lives in result.costs;
+        deterministic warmup_events also appears in iteration metrics.
+
+        Stability is checked over the *final* quiet interval of each full
+        observation window; liveness events do not restart it. None selects
+        'all'. Legacy settle_time remains compatible; converged_at is always
+        the beginning of an observed quiet interval, never the last commit.
         """
         if parallelism != 1:
             raise ValueError('only serial parallelism=1 is supported')
         _nonnegative(t0, 't0')
         _nonnegative(settle, 'settle')
+        kind = _window_options(warmup, event_budget, stability, quiet)
+        legacy = (
+            horizon is None
+            and not warmup
+            and event_budget is None
+            and stability is None
+            and not quiet
+            and not self.network.agents
+        )
+        duration = settle if horizon is None else horizon
+        deadline = _future(t0, duration, 'horizon')
+        _future(t0, quiet, 'quiet')
         unique: dict[str, FailureSet] = {}
         for draw in draws:
             draw = draw.resolve(self.risk_groups)
@@ -466,9 +884,20 @@ class Study:
                 + (old.occurrence_count if old else 0),
             )
         records = []
+        warmup_seconds = 0.0
+        warmup_events = 0
         for draw in unique.values():
-            sim = self._simulation(start=t0)
-            registry = sim.failures(Schedule(()), risk_groups=self.risk_groups)
+            sim = (
+                self._simulation(start=t0, warmup=warmup)
+                if warmup
+                else self._simulation(start=t0)
+            )
+            runner = _Runner(sim, event_budget)
+            elapsed, warmed = self._warmup(sim, runner, warmup)
+            warmup_seconds += elapsed
+            warmup_events += warmed
+            registry = _StudyRegistry(sim, t0, self.risk_groups)
+            sim._failure_registry = registry
             tokens: list[int] = []
             sim.at(
                 t0,
@@ -476,40 +905,98 @@ class Study:
                     registry.acquire(draw.entities)
                 ),
             )
-            # Bounded observation window: the window, then only pending
-            # derivation work (delayed stages such as fib_delay), never a
-            # drain of the whole heap (a recurring protocol timer would keep
-            # it non-empty forever).
-            sim.run_until(t0 + settle)
-            sim.run_derivations()
-            failed_at = self._settled_time(sim, t0)
+            window = _StabilityWindow(sim, t0, kind, quiet)
+            sim.network.on_delta.append(window.on_delta)
+            if not runner.exhausted:
+                runner.until(deadline)
+            if legacy:
+                runner.events += sim.run_derivations()
+            status, converged_at = window.result(sim.env.now, runner.exhausted)
+            # The failure must actually have occurred before claiming convergence.
+            if not tokens and status == 'converged':
+                status, converged_at = 'deadline_exceeded', None
+            failed_at = (
+                self._settled_time(sim, t0)
+                if legacy
+                else (
+                    converged_at if converged_at is not None else max(t0, sim.env.now)
+                )
+            )
             record = self._record(sim.network, draw)
             failure_drops = _drop_reasons(sim.network)
-            observation: _StudyObservation | None = getattr(
-                sim, '_study_observation', None
+            observation: _StudyObservation = sim._study_observation  # type: ignore[attr-defined]
+            transient_loss, transient_reasons = window.transient(
+                sim.env.now, status == 'converged'
             )
-            assert observation is not None
-            transient_loss = observation.phase.total_loss(failed_at)
-            recovery_time = None
-            if restore:
+            if legacy:
+                transient_loss = observation.phase.total_loss(failed_at)
+                transient_reasons = observation.loss_by_reason(failed_at)
+            recovery_time = recovery_status = recovery_converged_at = None
+            sim.network.on_delta.remove(window.on_delta)
+            if restore and tokens and not runner.exhausted:
                 recovery_start = sim.env.now
                 observation.start_phase(recovery_start)
+                recovery = _StabilityWindow(sim, recovery_start, kind, quiet)
+                sim.network.on_delta.append(recovery.on_delta)
                 sim.at(
                     recovery_start,
                     lambda registry=registry, token=tokens[0]: registry.release(token),
                 )
-                sim.run_until(recovery_start + settle)
-                sim.run_derivations()
-                recovered_at = self._settled_time(sim, recovery_start)
-                recovery_time = recovered_at - recovery_start
-                transient_loss += observation.phase.total_loss(recovered_at)
-            extras = self._metrics(sim, registry, t0, sim.env.now)
+                runner.until(_future(recovery_start, duration, 'horizon'))
+                if legacy:
+                    runner.events += sim.run_derivations()
+                recovery_status, recovery_converged_at = recovery.result(
+                    sim.env.now, runner.exhausted
+                )
+                recovered_at = (
+                    self._settled_time(sim, recovery_start)
+                    if legacy
+                    else recovery_converged_at
+                )
+                recovery_time = (
+                    None if recovered_at is None else recovered_at - recovery_start
+                )
+                recovery_loss, recovery_reasons = recovery.transient(
+                    sim.env.now, recovery_status == 'converged'
+                )
+                transient_loss += (
+                    observation.phase.total_loss(recovered_at)
+                    if legacy and recovered_at is not None
+                    else recovery_loss
+                )
+                if legacy and recovered_at is not None:
+                    recovery_reasons = {
+                        reason: value - recovery.reason_base.get(reason, 0.0)
+                        for reason, value in observation.loss_by_reason(
+                            recovered_at
+                        ).items()
+                    }
+                for reason, value in recovery_reasons.items():
+                    transient_reasons[reason] = (
+                        transient_reasons.get(reason, 0.0) + value
+                    )
+                if recovery_status == 'budget_exceeded':
+                    status = recovery_status
+                elif status == 'converged' and recovery_status != 'converged':
+                    status = recovery_status
+            extras = self._metrics(sim, registry, t0, max(t0, sim.env.now))
             extras.update(
-                settle_time=failed_at - t0,
+                status=status,
+                converged_at=converged_at,
+                convergence_time=None if converged_at is None else converged_at - t0,
+                settle_time=failed_at - t0
+                if legacy
+                else (None if converged_at is None else converged_at - t0),
                 recovery_settle_time=recovery_time,
+                recovery_status=recovery_status,
+                recovery_converged_at=recovery_converged_at,
                 bits_lost_transient=transient_loss,
+                bits_lost_transient_by_reason=dict(sorted(transient_reasons.items())),
                 drop_reasons=failure_drops,
-                fault_events=1,
+                fault_events=int(bool(tokens)),
+                engine_events=runner.events,
+                warmup_events=warmed,
+                observation_end=sim.env.now,
             )
             record['data']['netsim'].update(extras)
             records.append(record)
@@ -524,26 +1011,84 @@ class Study:
                 'capacity_unit': self.capacity_unit,
                 'loss_unit': 'bits',
             },
+            costs={'warmup_seconds': warmup_seconds, 'warmup_events': warmup_events},
         )
 
+    @staticmethod
+    def _warmup(sim: Simulation, runner: _Runner, warmup: float) -> tuple[float, int]:
+        if not warmup:
+            return 0.0, 0
+        before = perf_counter()
+        runner.until(0.0)
+        return perf_counter() - before, runner.events
+
     def enumerate(
-        self, scope: str = 'links', k: int = 1, **options: Any
+        self,
+        scope: str = 'links',
+        k: int = 1,
+        *,
+        warmup: float = 0.0,
+        horizon: float | None = None,
+        event_budget: int | None = None,
+        stability: Stability | str | None = None,
+        quiet: float = 0.0,
+        **options: Any,
     ) -> StudyResult:
         return self.iterations(
             Draws.enumerate(self.network, scope, k, risk_groups=self.risk_groups),
+            warmup=warmup,
+            horizon=horizon,
+            event_budget=event_budget,
+            stability=stability,
+            quiet=quiet,
             **options,
         )
 
-    def process(self, source: Process | Schedule, horizon: float) -> StudyResult:
-        """Observe [0, horizon], without draining repairs beyond the horizon."""
+    def process(
+        self,
+        source: Process | Schedule,
+        horizon: float,
+        *,
+        warmup: float = 0.0,
+        event_budget: int | None = None,
+        stability: Stability | str | None = None,
+        quiet: float = 0.0,
+    ) -> StudyResult:
+        """Observe [0, horizon], after optional [-warmup, 0] warm-up.
+
+        Schedule/Process times remain relative to zero. Report terminal-window
+        stability; future failures/repairs are never drained past the deadline.
+        Costs are separate from deterministic exports, as for iterations().
+        """
         _nonnegative(horizon, 'horizon')
         if horizon == 0:
             raise ValueError('horizon must be > 0')
-        sim = self._simulation()
-        registry = sim.failures(source, horizon, risk_groups=self.risk_groups)
-        sim.run_until(horizon)
-        extras = self._metrics(sim, registry, 0.0, horizon)
-        # This record is a terminal snapshot; availability covers the whole run.
+        kind = _window_options(warmup, event_budget, stability, quiet)
+        _future(0.0, quiet, 'quiet')
+        sim = self._simulation(warmup=warmup) if warmup else self._simulation()
+        runner = _Runner(sim, event_budget)
+        seconds, warmed = self._warmup(sim, runner, warmup)
+        registry = _StudyRegistry(sim, 0.0, self.risk_groups)
+        sim._failure_registry = registry
+        sim.failures(source, horizon, risk_groups=self.risk_groups)
+        window = _StabilityWindow(sim, 0.0, kind, quiet)
+        sim.network.on_delta.append(window.on_delta)
+        if not runner.exhausted:
+            runner.until(horizon)
+        status, converged_at = window.result(sim.env.now, runner.exhausted)
+        end = max(0.0, sim.env.now)
+        extras = self._metrics(sim, registry, 0.0, end)
+        transient_loss, transient_reasons = window.transient(end, status == 'converged')
+        extras.update(
+            status=status,
+            converged_at=converged_at,
+            convergence_time=converged_at,
+            engine_events=runner.events,
+            warmup_events=warmed,
+            observation_end=sim.env.now,
+            bits_lost_transient=transient_loss,
+            bits_lost_transient_by_reason=transient_reasons,
+        )
         inverse = {v: k for k, v in sim.network.ngraph_link_ids.items()}
         failures = FailureSet(
             tuple(n for k, n in registry.counts if k == 'device'),
@@ -562,6 +1107,7 @@ class Study:
                 'loss_unit': 'bits',
             },
             extras,
+            costs={'warmup_seconds': seconds, 'warmup_events': warmed},
         )
 
     def replay(
@@ -569,8 +1115,22 @@ class Study:
         results_json: str | Path | Mapping[str, Any],
         step: str | None,
         select: Iterable[str] | str | None = None,
+        *,
+        warmup: float = 0.0,
+        horizon: float | None = None,
+        event_budget: int | None = None,
+        stability: Stability | str | None = None,
+        quiet: float = 0.0,
         **options: Any,
     ) -> StudyResult:
-        result = self.iterations(Draws.replay(results_json, step, select), **options)
+        result = self.iterations(
+            Draws.replay(results_json, step, select),
+            warmup=warmup,
+            horizon=horizon,
+            event_budget=event_budget,
+            stability=stability,
+            quiet=quiet,
+            **options,
+        )
         result.metadata['mode'] = 'replay'
         return result
