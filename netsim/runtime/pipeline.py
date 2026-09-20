@@ -18,6 +18,7 @@ from typing import Any, Callable
 from netsim import core
 from netsim.model import derive, srv6
 from netsim.model.interfaces import EthernetNode, PortChannelNode
+from netsim.model.network import published_failure
 from netsim.model.state import NetworkState, StateDelta
 
 ROUND_END = core.DEFERRED + 8
@@ -295,7 +296,11 @@ class Pipeline:
             self.network.update(
                 lambda state: kind.run(state, now, due), ('kind', kind.name, gen)
             )
-        except Exception:
+        except Exception as error:
+            if published_failure(error):
+                # Published: the claimed work is consumed exactly once; an
+                # observer failure is reported but never re-executes the run.
+                raise
             retryable = kind.retryable.setdefault(now, {})
             for e in due:
                 deadline, ticket = claimed[e]

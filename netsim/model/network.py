@@ -245,6 +245,20 @@ class _Edits:
         return canon(self.base, candidate)
 
 
+def mark_published(error: BaseException) -> None:
+    """Mark *error* as raised by an observer after the commit was published:
+    the new root stands and the work that produced it is consumed."""
+    try:
+        error.netsim_published = True  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - exotic exception types
+        pass
+
+
+def published_failure(error: BaseException) -> bool:
+    """Whether *error* came from an observer after a successful publication."""
+    return bool(getattr(error, 'netsim_published', False))
+
+
 class Network:
     def __init__(self, *, seed: int = 0) -> None:
         self._state = NetworkState()
@@ -423,6 +437,10 @@ class Network:
         finally:
             self._dispatching = False
         if errors:
+            # The root is published: observers ran after the commit and may
+            # not roll it back. The original exception propagates, marked so
+            # callers can tell it apart from a failure before publication.
+            mark_published(errors[0])
             raise errors[0]
         return delta
 
@@ -1001,4 +1019,4 @@ def _fnv1a(text: str) -> int:
     return h
 
 
-__all__ = ['Network', 'RouteSource', 'DeltaHook']
+__all__ = ['Network', 'RouteSource', 'DeltaHook', 'mark_published', 'published_failure']

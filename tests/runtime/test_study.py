@@ -323,3 +323,33 @@ def test_integrals_timestamp_coalescing_missing_demand_and_window_edges():
 def test_conflicting_retention_aliases_are_rejected():
     with pytest.raises(ValueError, match='conflicting'):
         Study(two_rate_network(), keep={'events': 1, 'keep_events': 2})
+
+
+def test_iterations_end_at_the_observation_window_despite_recurring_timers():
+    """A periodic timer (a protocol hello) never empties the heap; the
+    iteration must stop at t0 + settle, not drain the queue."""
+    from netsim.model.network import Network
+    from netsim.runtime.failures import FailureSet
+    from netsim.study import Study
+
+    net = Network()
+    net.add_device('R')
+    study = Study(net)
+    create = study._simulation
+    ticks = []
+
+    def with_timer(start=0):
+        sim = create(start)
+
+        def heartbeat():
+            while True:
+                yield sim.env.timeout(1)
+                ticks.append(sim.env.now)
+
+        sim.env.process(heartbeat())
+        return sim
+
+    study._simulation = with_timer
+    result = study.iterations([FailureSet()], t0=1, settle=1, restore=False)
+    assert result is not None
+    assert ticks and max(ticks) <= 2.0

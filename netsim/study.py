@@ -476,8 +476,12 @@ class Study:
                     registry.acquire(draw.entities)
                 ),
             )
+            # Bounded observation window: the window, then only pending
+            # derivation work (delayed stages such as fib_delay), never a
+            # drain of the whole heap (a recurring protocol timer would keep
+            # it non-empty forever).
             sim.run_until(t0 + settle)
-            sim.run()  # Only derivation events remain, never a future fault.
+            sim.run_derivations()
             failed_at = self._settled_time(sim, t0)
             record = self._record(sim.network, draw)
             failure_drops = _drop_reasons(sim.network)
@@ -495,7 +499,7 @@ class Study:
                     lambda registry=registry, token=tokens[0]: registry.release(token),
                 )
                 sim.run_until(recovery_start + settle)
-                sim.run()
+                sim.run_derivations()
                 recovered_at = self._settled_time(sim, recovery_start)
                 recovery_time = recovered_at - recovery_start
                 transient_loss += observation.phase.total_loss(recovered_at)

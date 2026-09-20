@@ -629,6 +629,10 @@ class Environment:
             (self._now + delay, priority, next(self._eid), event),
         )
 
+    def peek_priority(self) -> EventPriority | None:
+        """Priority of the next event, or ``None`` when the queue is empty."""
+        return self._queue[0][1] if self._queue else None
+
     def peek(self) -> SimTime:
         """Time of the next scheduled event, or ``Infinity``."""
         try:

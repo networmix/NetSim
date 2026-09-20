@@ -228,3 +228,56 @@ def test_kind_that_dirties_itself_runs_again_in_a_successor_round():
     assert runs == [['A'], ['A']]
     assert net.state.devices['A'].config.seed == 3
     assert not kind.pending
+
+
+def test_observer_failure_after_commit_does_not_re_execute_the_run():
+    """A kind's commit that an observer rejects afterwards is consumed once:
+    retry() has nothing to re-run and the committed state stands."""
+    import dataclasses
+
+    from netsim.model import derive
+    from netsim.model.network import Network, published_failure
+    from netsim.runtime.pipeline import COALESCE, Kind, Pipeline
+
+    net = Network()
+    net.add_device('R')
+    net.converge()
+    env = netsim.Environment()
+    runs = []
+
+    def run(root, now, due):
+        runs.append(now)
+        dev = root.devices['R']
+        dev = dataclasses.replace(
+            dev, agents=dev.agents.set('count', dev.agents.get('count', 0) + 1)
+        )
+        return dataclasses.replace(root, devices=root.devices.set('R', dev))
+
+    kind = Kind(derive.AGENT, COALESCE, run, lambda delta, state: set())
+    kind.name = 'agent'
+    pipeline = Pipeline(env, net, [kind])
+
+    def observer(*args):
+        raise RuntimeError('post-publication failure')
+
+    net.on_delta.append(observer)
+    pipeline.mark(kind, {'R'}, 0)
+    with pytest.raises(RuntimeError, match='post-publication failure') as info:
+        env.run()
+    assert published_failure(info.value)
+    assert net.state.devices['R'].agents['count'] == 1
+    assert not kind.retryable and not kind.pending
+    net.on_delta.clear()
+    pipeline.retry()
+    env.run()
+    assert net.state.devices['R'].agents['count'] == 1 and runs == [0]
+
+    # a failure before publication is still retryable
+    def boom(root, now, due):
+        raise ValueError('prepare failed')
+
+    kind.run = boom
+    pipeline.mark(kind, {'R'}, 0)
+    with pytest.raises(ValueError):
+        env.run()
+    assert kind.retryable

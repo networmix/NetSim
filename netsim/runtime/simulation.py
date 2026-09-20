@@ -98,6 +98,23 @@ class Simulation:
             raise RuntimeError('settle() exceeded max_steps')
         return steps
 
+    def run_derivations(self, max_steps: int = 100_000) -> int:
+        """Finish pending derivation work only: step while the next event is
+        in the DEFERRED band (a stage or settled delivery), advancing time to
+        delayed stages such as ``fib_delay``. Timers and other NORMAL events
+        are left alone, so a recurring protocol timer never keeps this
+        running. Returns the step count."""
+        steps = 0
+        while steps < max_steps:
+            priority = self.env.peek_priority()
+            if priority is None or priority < core.DEFERRED:
+                break
+            self.env.step()
+            steps += 1
+        if steps >= max_steps:
+            raise RuntimeError('run_derivations() exceeded max_steps')
+        return steps
+
     def run_until(self, time: float) -> None:
         if time > self.env.now:
             self.env.run(until=time)
