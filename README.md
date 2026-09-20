@@ -222,6 +222,196 @@ The design document behind this layer (state tree, rounds, RIB/FIB
 resolution, SRv6 plan, placement semantics) is kept with the project
 plans; Gate A ships plain IP, Gate B adds SRv6, Gate C protocol agents.
 
+## Segment routing
+
+Gate B's configuration contract supports H.Encaps/H.Encaps.Red, End and
+End.X with PSP/USD, End.DT46, and NEXT-C-SID (uN, uA, uDT46). B6/uB6,
+nested encapsulation, DT4/DT6/DX4/DX6, USP and VRFs are rejected. Bare local
+SIDs (`block:function::/48`) and composite SIDs
+(`block:node:function::/64`) keep their literal addresses and structures.
+They have different scopes and are never converted into one another.
+
+This branch has the SR database, compression and placement contracts;
+**SR forwarding and policy derivation still require G3/G5 integration**.
+The following diamond example is runnable now: it configures both policy
+candidates, steering, and a timed bundle failure/repair, and prints the
+local adjacency state. Policy state is `UNCOMPUTED` until a producer
+installs it; ordinary placement on this intermediate branch is not proof
+that SR steering executed. Delivery/failover integration tests are explicitly
+skipped with `needs G5 policy derivation`.
+
+```python
+import netsim
+from netsim.model import srv6 as sr
+from netsim.model.contracts import STATIC
+from netsim.model.igp import oracle_igp
+from netsim.model.network import Network
+from netsim.runtime import Simulation
+
+net = Network(seed=7)
+with net.batch():
+    routers = [net.add_device(f'R{i}') for i in range(1, 5)]
+    r1, r2, r3, r4 = routers
+    for i, router in enumerate(routers, 1):
+        router.add_loopback('lo0', ipv4=[f'10.255.0.{i}/32'],
+                            ipv6=[f'2001:db8:ffff::{i}/128'])
+        router.add_locator('loc', structure=sr.F3216_GIB, node_id=i)
+        router.add_local_sid(sr.END, structure=sr.F3216_GIB,
+                             flavors=sr.NEXT_CSID)
+        router.add_local_sid(sr.END_DT46, structure=sr.F3216_TERMINAL)
+    net.add_lag(r1, 'Po1', ['e12a', 'e12b'],
+                r2, 'Po1', ['e21a', 'e21b'],
+                min_links=2, speed=1e9, unnumbered=True)
+    for a, ai, b, bi in ((r1, 'e13', r3, 'e31'),
+                         (r2, 'e24', r4, 'e42'),
+                         (r3, 'e34', r4, 'e43')):
+        net.add_p2p(a, ai, b, bi, speed=1e9, unnumbered=True)
+    for router, interface in ((r1, 'Po1'), (r1, 'e13'),
+                              (r2, 'Po1'), (r2, 'e24'),
+                              (r3, 'e31'), (r3, 'e34'),
+                              (r4, 'e42'), (r4, 'e43')):
+        router[interface].configure(forwarding_v6=True)
+        router.add_local_sid(sr.END_X, structure=sr.F3216_LIB,
+                             flavors=sr.NEXT_CSID, interface=interface)
+    endpoint = r4['lo0'].node.config.ipv6[0][0]
+    primary = sr.CandidatePath(preference=200, name='via-R2',
+        segment_lists=(sr.SegmentList((sr.AdjSeg('R1', 'Po1'),
+            sr.AdjSeg('R2', 'e24'), sr.TermSeg('R4'))),))
+    backup = sr.CandidatePath(preference=100, name='via-R3', discriminator=1,
+        segment_lists=(sr.SegmentList((sr.AdjSeg('R1', 'e13'),
+            sr.AdjSeg('R3', 'e34'), sr.TermSeg('R4'))),))
+    policy = r1.policy_client().add(sr.SrPolicy(STATIC, 10, endpoint,
+        name='diamond', candidate_paths=(primary, backup),
+        fallback=sr.FALLBACK_DROP))
+    r1.policy_client().set_steering((sr.SteeringRule('class-10', policy.key,
+                                                  dscp=10),))
+    net.add_demand('video', 'R1', '10.255.0.4', rate=100e6,
+                   payload_size=1000, dscp=10, steer=sr.PolicyRef(10, endpoint))
+net.add_source(oracle_igp)
+sim = Simulation(netsim.Environment(), net)
+member = net.link(r1['e12a'].node.link)
+sim.at(10, member.fail)
+sim.at(20, member.restore)
+for time in (0, 10, 20):
+    sim.run_until(time)
+    sid = next(s for s in r1.node.srv6_sids.sids.values() if s.interface == 'Po1')
+    state = r1.node.srv6_policies.states.get(policy.key)
+    print(time, sid.adjacency_up, state.status if state else 'UNCOMPUTED',
+          state.active_path if state else None)
+```
+
+With G3/G5 integrated, candidate index 0 (preference 200) carries the demand;
+at t=10 the bundle falls below `min_links=2` and candidate index 1 takes over;
+at t=20 candidate 0 returns. Removing the backup gives `POLICY_DOWN` while
+Po1 is down because fallback is DROP. Policy validity, programmed version,
+and observed delivery must be inspected separately when `fib_delay` is nonzero.
+
+The Gate B accounting targets for a 100 Mbit/s **IP payload** demand with
+1000-byte payloads, IPv4 inner headers and Ethernet framing are:
+
+| Encapsulation on the transmitted hop | Bytes per frame | Wire Mbit/s |
+|---|---:|---:|
+| One compressed container, reduced encapsulation without SRH | 1000 + 20 + 40 + 14 = 1074 | 107.4 |
+| Outer IPv6 plus one-entry SRH | 1000 + 20 + 40 + 24 + 14 = 1098 | 109.8 |
+| Inner packet after decapsulation | 1000 + 20 + 14 = 1034 | 103.4 |
+
+The primary path carries all 100 Mbit/s of payload on Po1 (50 per member)
+and R2→R4; these wire rates are calculated from the actual headers on each
+hop. They are acceptance targets, not a delivery measurement from the
+intermediate branch. The compressor adopts RFC 9800 §6.2 S01–S16;
+H.Encaps.Red omits the SRH only for one segment with no flags, tag or TLVs
+(RFC 8986 §5.2). Reduced SRH permits SL = LE + 1 (RFC 8754 §4.3.1).
+
+The zero-dependency SONiC adapter exposes `sonic.load(mapping_or_json_or_Path)`,
+`sonic.dump(network, optional_path)` and `sonic.appl_db(network)`. The envelope
+is `{"version": 1, "devices": {"R1": {"TABLE": {"key": {"field": "value"}}}}}`.
+It builds an unconnected device set; physical links are added separately with
+`net.add_link((device, interface), (device, interface))`. This is a bounded
+interchange schema, not a full SONiC image configuration. It uses the
+[SONiC static SRv6 table vocabulary](https://github.com/sonic-net/SONiC/blob/master/doc/srv6/srv6_static_config_hld.md)
+and [SID-list APPL_DB table shape](https://github.com/sonic-net/SONiC/blob/master/doc/srv6/srv6_hld.md).
+
+| Table | Version 1 fields |
+|---|---|
+| `PORT` | Interface key; optional `speed` in Mbit/s (default 10000), `mtu` (1500), `admin_status` (`up`/`down`) |
+| `INTERFACE`, `LOOPBACK_INTERFACE` | Interface or `interface\|address/prefix` key; empty object values |
+| `STATIC_ROUTE` | Canonical IP prefix key; `nexthop` and/or `ifname` comma-separated equal-length vectors, or `blackhole: "true"`; optional `distance` (1) |
+| `SRV6_MY_LOCATORS` | Locator name key; required `prefix` (address or prefix); optional `block_len`, `node_len`, `func_len`, `arg_len` (defaults 32/16/16/0), and `vrf: "default"` |
+| `SRV6_MY_SIDS` | `locator\|IPv6-prefix` key; required `action` (`End`, `End.X`, `End.DT46`, `uN`, `uA`, `uDT46`); optional `flavors: ["usid", "psp", "usd"]`, `interface`, `adj`, `decap_dscp_mode: "pipe"`, `decap_vrf: "default"`; four explicit length fields may override structure inference |
+| `SRV6_SID_LIST` | List name key; `path` array of literal IPv6 addresses, or objects with `sid`, optional four length fields and `flavors` |
+| `SRV6_POLICY` | Policy name key; required `color`, IPv6 `endpoint`, `candidate_paths`; optional literal `bsid`, `fallback` (`IGP`/`DROP`, default IGP) |
+
+Each candidate has a required nonempty `segment_lists` array of
+`{"name": "list-name", "weight": 1}` references, and optional `preference`
+(100), `name`, `protocol_origin` (30), `originator` (two integers, `[0, 0]`),
+and `discriminator` (candidate index). Candidate fields, explicit literal
+metadata and the versioned envelope are NetSim extensions. Weights must be
+positive. Integers may be JSON integers or decimal strings, except `version`.
+Unknown tables/fields, duplicate JSON keys, unsupported flavors/actions,
+uniform decapsulation and non-default VRFs produce `SchemaError` with the
+entry path. `decap_vrf` is allowed only on DT46. Gate B combinations are
+also checked by the shared model validator. F3216 SIDs require an F3216
+locator (for example, explicit lengths 32/16/16/64); the legacy locator
+defaults 32/16/16/0 describe a classic structure in the shared contract.
+
+Load→dump preserves the input exactly modulo object key order, including
+address spelling, omitted defaults, standalone unused lists, and bare versus
+composite prefixes. Dump reads current model configuration; changed rows are
+serialized from that configuration. Import spelling/list metadata is copied
+on fork. Configurations with native features outside this subset (such as
+bundles, unnumbered interfaces or symbolic segments) cannot be dumped through
+this adapter. APPL_DB output is keyed by device, then `SRV6_SID_LIST_TABLE`,
+then list name, with comma-separated **forwarding-order** wire SIDs. Explicit
+list metadata enables compression; addresses without metadata stay literal.
+APPL_DB export does not certify policy reachability or installation.
+
+`from_scenario(scenario, srv6=True)` enables an IPv6 underlay and allocates
+one F3216 GIB locator, uN and terminal uDT46 per device. GIB allocation uses a
+`Random(scenario.seed)` permutation of sorted device names. Each L3 link end
+gets one uA, with bundles represented by their PortChannel. A pairwise demand
+with exactly one explicit `StaticPath(nodes=...)` or `StaticPath(links=...)`
+becomes one candidate containing an `AdjSeg` for every hop and a target
+`TermSeg`; `Demand.steer` selects it and fallback is DROP. The `TE_WCMP_UNLIM`,
+`TE_ECMP_UP_TO_256_LSP`, and `TE_ECMP_16_LSP` presets are accepted with that
+pin. Node hops choose the cheapest enabled link, breaking ties by link ID;
+explicit member-link pins into bundles are rejected. Multi-route pins,
+unpinned TE, non-pairwise pins, broad selectors, loops and disconnected hops
+are rejected in the strict subset. `strict=False` retains the legacy opt-out
+for other demand options; explicit paths translated with SR still validate.
+`NetSimStudy` accepts the same `srv6: true` setting.
+
+Study results expose each failure snapshot's `data.netsim.policies` and a
+step-level `data.netsim.policy_iterations` list in `to_ngraph()`. Each policy
+reports basic validity, strict validity of the active lists, selected path
+index, programmed version and observed delivered rate. Missing derived state
+is `UNCOMPUTED` with null validity/version. Delivery is attributed only to
+explicit `Demand.steer` overrides, summed in the study's capacity unit; it is
+null without a placement observation, and does not infer validity. Recovery
+metrics do not overwrite the failure snapshot's policy state.
+
+`StudyResult.rows()` adds `policy_` columns to existing flow rows;
+`to_csv(path)` writes them. Existing columns remain `failure_id`,
+`occurrence_count`, `source`, `destination`, `priority`, `demand`, `placed`,
+`dropped`, `cost_distribution`, and `data`. New columns are `policy_device`,
+`policy_color`, `policy_endpoint`, `policy_name`, `policy_status`,
+`policy_basic_valid`, `policy_strict_valid`, `policy_basic_valid_lists`,
+`policy_strict_valid_lists`, `policy_active_path`, `policy_programmed_version`,
+`policy_reasons`, `policy_delivered`, and `policy_delivery_scope`.
+`strict_valid_lists` contains only active-path `(candidate, list)` indices,
+not all standby lists. Destination labels, original NetGraph priorities,
+and imported capacity units are retained.
+
+With `Study(..., keep={"timeline": True})`, `rows(events=True)` and
+`to_csv(path, events=True)` export retained `PolicyEvent`/`SidEvent` rows.
+Common event columns are `failure_id`, `occurrence_count`, `event`, `seq`,
+`idx`, `time`, `round`, `origin`, `device`, `action`, and `owner`.
+Policy events add `color`, `endpoint`, `name`, `active_path`, `status`,
+`reasons`, `programmed_version`; SID events add `sid`, `behavior`, `flavors`,
+`interface`, `adjacency_up`. CSV columns are sorted, structured cells are
+JSON, and null scalars are blank. Event retention limits still apply;
+these exports do not synthesize evicted events.
+
+
 ## Failure and availability studies
 
 `netsim.study.Study` adds transient measurements to the network model. The
