@@ -171,6 +171,8 @@ class RunReceipt:
     reason: str | None = None
     inbox_consumed: int = 0
     """Length of the captured inbox prefix this run consumed."""
+    causes_count: int = 0
+    ops_count: int = 0
 
 
 RECEIPT_PUBLISHED = 'PUBLISHED'
@@ -241,6 +243,10 @@ class InterfaceView:
     """Active members of a PortChannel."""
     bandwidth: float | None = None
     link: LinkView | None = None
+    generation: int = 0
+    """Interface incarnation for scoped NHT registrations."""
+    config: Any = None
+    """Immutable local interface configuration; no carrier or peer state."""
 
 
 @record
@@ -355,6 +361,7 @@ class Delivery:
     port: int = 0
     seq: int = 0
     """Per-direction sequence number for session messages."""
+    generation: int | None = None
 
     def __post_init__(self) -> None:
         if (self.interface is None) == (self.connection is None):
@@ -365,6 +372,7 @@ class Delivery:
 class TimerFired:
     time: float
     name: str
+    generation: int | None = None
 
 
 # Session event states and reasons.
@@ -391,6 +399,7 @@ class SessionEvent:
     local: Endpoint | None = None
     remote: Endpoint | None = None
     initiator: bool = False
+    generation: int | None = None
 
 
 @record
@@ -403,6 +412,7 @@ class Rejection:
     connection: int | None = None
     interface: str | None = None
     detail: Any = None
+    generation: int | None = None
 
 
 InboxEntry = Delivery | TimerFired | SessionEvent | Rejection

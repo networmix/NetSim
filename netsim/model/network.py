@@ -279,6 +279,7 @@ class Network:
         self.agents: dict[tuple[str, str], DeviceAgent] = {}
         """Registered plugin objects by (device, agent name); the tree keeps
         the matching ``AgentNode`` (config, state, generation)."""
+        self._agent_undo: list[tuple[dict, Any, Any]] = []
         self.capacity_model: int = 1  # flows.UNCONSTRAINED
         self.debug_validate = DEBUG_VALIDATE
         self._dispatching = False
@@ -317,6 +318,7 @@ class Network:
         if self._edits is not None or self._dispatching:
             raise RuntimeError('nested Network.batch()')
         old = self._state
+        self._agent_undo = []
         self._edits = _Edits(old)
         self._batch_ops = 0
         self._batch_handles = []
@@ -333,6 +335,11 @@ class Network:
         finally:
             self._edits = None
             if self._state is old:
+                for mapping, key, value in reversed(self._agent_undo):
+                    if value is None:
+                        mapping.pop(key, None)
+                    else:
+                        mapping[key] = value
                 # Only escaped provisional handles need invalidation. An
                 # existing entity first looked up in the block stays valid.
                 invalidated = False
@@ -345,6 +352,7 @@ class Network:
                 if invalidated:
                     self._handle_incarnation += 1
             self._batch_handles = []
+            self._agent_undo = []
 
     def _edit(self, fn: Callable[[_Edits], None], origin: Any) -> None:
         if self._dispatching:
@@ -487,9 +495,7 @@ class Network:
         owner = self.device(device) if isinstance(device, str) else device
         agent_name = check_name(agent.client.name if name is None else name)
         existing = self.profiles.get(agent.client)
-        if existing is None:
-            self.profiles[agent.client] = agent.profile
-        elif existing != agent.profile:
+        if existing is not None and existing != agent.profile:
             raise ValueError(
                 f'client {agent.client} is registered with a different profile'
             )
@@ -514,8 +520,25 @@ class Network:
                 allocators=allocators,
             )
 
-        self.update(apply, ('add_agent', owner.name, agent_name))
-        self.agents[(owner.name, agent_name)] = agent
+        key = (owner.name, agent_name)
+        previous = self.agents.get(key)
+        self.agents[key] = agent
+        self.profiles[client] = agent.profile
+        try:
+            self.update(apply, ('add_agent', owner.name, agent_name))
+        except BaseException as error:
+            if not published_failure(error):
+                if previous is None:
+                    self.agents.pop(key, None)
+                else:
+                    self.agents[key] = previous
+                if existing is None:
+                    self.profiles.pop(client, None)
+            raise
+        if self._edits is not None:
+            self._agent_undo.extend(
+                ((self.agents, key, previous), (self.profiles, client, existing))
+            )
         node = self.state.devices[owner.name].agents[agent_name]
         assert isinstance(node, AgentNode)
         return node
@@ -535,8 +558,15 @@ class Network:
                 state, devices=state.devices.set(owner.name, dev)
             )
 
-        self.update(apply, ('remove_agent', owner.name, name))
-        self.agents.pop((owner.name, name), None)
+        try:
+            self.update(apply, ('remove_agent', owner.name, name))
+        finally:
+            dev = self.state.devices.get(owner.name)
+            if dev is None or name not in dev.agents:
+                key = (owner.name, name)
+                previous = self.agents.pop(key, None)
+                if self._edits is not None:
+                    self._agent_undo.append((self.agents, key, previous))
 
     def agent(self, device: str, name: str) -> DeviceAgent:
         return self.agents[(device, name)]
@@ -635,9 +665,16 @@ class Network:
                 candidate, devices=candidate.devices.remove(name)
             )
 
-        self.update(apply, ('remove_device', name))
-        for key in [k for k in self.agents if k[0] == name]:
-            del self.agents[key]
+        agent_names = tuple(owner.node.agents)
+        try:
+            self.update(apply, ('remove_device', name))
+        finally:
+            if name not in self.state.devices:
+                for agent_name in agent_names:
+                    key = (name, agent_name)
+                    previous = self.agents.pop(key, None)
+                    if self._edits is not None:
+                        self._agent_undo.append((self.agents, key, previous))
 
     def device(self, name: str) -> Device:
         dev = self._device_node(name)

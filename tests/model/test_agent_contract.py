@@ -295,7 +295,7 @@ class TestRegistration:
 
 
 class TestRuntimeStubs:
-    def test_simulation_binds_runtimes_without_kinds(self):
+    def test_simulation_binds_runtimes(self):
         import netsim
         from netsim.runtime import Simulation
 
@@ -306,4 +306,6 @@ class TestRuntimeStubs:
             net.state.devices['R1'].agents['ref'].generation
         )
         assert sim.agents.generation('R1', 'nope') is None
-        assert sim.agents.budget() == {} and sim.transport.budget() == {}
+        assert sim.agents.budget()['agents'] == 1
+        assert sim.agents.budget()['pending_runs'] == 1
+        assert sim.transport.budget() == {}

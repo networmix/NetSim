@@ -277,6 +277,22 @@ class PolicyEvent(Event):
 
 
 @record
+class AgentRunEvent(Event):
+    seq: int
+    idx: int
+    time: float
+    round: int
+    origin: Origin
+    device: str
+    agent: str
+    generation: int
+    run_id: int
+    status: str
+    causes_count: int
+    ops_count: int
+
+
+@record
 class DeviceEvent(Event):
     seq: int
     idx: int
@@ -524,6 +540,23 @@ def extract_events(
                 action='config',
                 changes=_changes(odev.config, ndev.config),
             )
+        for agent_name in delta.agents(name).added + delta.agents(name).changed:
+            node = ndev.agents[agent_name]
+            previous = odev.agents.get(agent_name) if odev else None
+            receipt = node.receipt
+            if receipt is not None and (
+                previous is None or previous.receipt is not receipt
+            ):
+                emit(
+                    AgentRunEvent,
+                    device=name,
+                    agent=agent_name,
+                    generation=node.generation,
+                    run_id=receipt.run_id,
+                    status=receipt.status,
+                    causes_count=receipt.causes_count,
+                    ops_count=receipt.ops_count,
+                )
         _srv6_events(emit, odev, ndev, name)
         _interface_events(emit, odev, ndev, name, delta)
         _route_events(emit, odev, ndev, name, delta)
@@ -1098,6 +1131,7 @@ __all__ = [
     'Origin',
     'Event',
     'DeviceEvent',
+    'AgentRunEvent',
     'LinkStateEvent',
     'LinkConfigEvent',
     'InterfaceOperEvent',
