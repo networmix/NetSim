@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import field, replace
 from ipaddress import IPv6Address, IPv6Network, summarize_address_range
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from netsim.model.contracts import STATIC, ClientId
 from netsim.model.state import PMap, canon, empty_pmap, record
@@ -37,16 +37,6 @@ END_DX6 = 7
 END_B6_ENCAPS = 8
 
 GATE_B_BEHAVIORS = frozenset({END, END_X, END_DT46})
-BEHAVIOR_NAMES = {
-    END: 'End',
-    END_X: 'End.X',
-    END_DT46: 'End.DT46',
-    END_DT4: 'End.DT4',
-    END_DT6: 'End.DT6',
-    END_DX4: 'End.DX4',
-    END_DX6: 'End.DX6',
-    END_B6_ENCAPS: 'End.B6.Encaps',
-}
 
 # Flavors are bit flags (RFC 8986 §4.16, RFC 9800 §4).
 PSP = 1
@@ -399,7 +389,25 @@ UNSUPPORTED_FLAVOR = 'UNSUPPORTED_FLAVOR'
 
 
 def behavior_name(behavior: int) -> str:
-    return BEHAVIOR_NAMES.get(behavior, str(behavior))
+    """Name of a behaviour (branches, not a shared lookup table: this runs on
+    the timeline's extraction path)."""
+    if behavior == END:
+        return 'End'
+    if behavior == END_X:
+        return 'End.X'
+    if behavior == END_DT46:
+        return 'End.DT46'
+    if behavior == END_DT4:
+        return 'End.DT4'
+    if behavior == END_DT6:
+        return 'End.DT6'
+    if behavior == END_DX4:
+        return 'End.DX4'
+    if behavior == END_DX6:
+        return 'End.DX6'
+    if behavior == END_B6_ENCAPS:
+        return 'End.B6.Encaps'
+    return str(behavior)
 
 
 def check_gate_b(behavior: int, flavors: int) -> str | None:
@@ -1020,21 +1028,50 @@ def set_steering(
     )
 
 
-def unknown_prefixes(db: Srv6Sids) -> tuple[tuple[int, int], ...]:
-    """Exact LIB/WLIB cover, not a summary that could swallow a routed GIB."""
+def unknown_prefixes(
+    db: Srv6Sids, active_prefixes: Iterable[tuple[int, int]] = ()
+) -> tuple[tuple[int, int], ...]:
+    """Exact LIB/WLIB cover minus prefixes installed as active local SIDs.
+
+    Subtract address intervals before summarizing: a cover must neither tie
+    an active SID at the same prefix nor shadow one with a more-specific
+    drop. With no exclusions this returns the complete configured ranges.
+    """
     if not db.drop_unknown_local:
         return ()
     from ipaddress import collapse_addresses
 
-    nets = []
+    intervals = []
     blocks = sorted(
         {loc.block for loc in db.locators.values() if is_csid(loc.structure)}
     )
     for block in blocks:
         ranges = db.ranges.get(block, SidRanges())
         for low, high in (ranges.lib, ranges.wlib):
-            start = block[0] | low << 80
-            end = block[0] | high << 80 | ((1 << 80) - 1)
+            intervals.append(
+                (block[0] | low << 80, block[0] | high << 80 | ((1 << 80) - 1))
+            )
+    exclusions = sorted(
+        (int(net.network_address), int(net.broadcast_address))
+        for net in map(IPv6Network, active_prefixes)
+    )
+    nets = []
+    index = 0
+    for start, end in sorted(intervals):
+        while index < len(exclusions) and exclusions[index][1] < start:
+            index += 1
+        while index < len(exclusions) and exclusions[index][0] <= end:
+            low, high = exclusions[index]
+            if start < low:
+                nets.extend(
+                    summarize_address_range(IPv6Address(start), IPv6Address(low - 1))
+                )
+            start = max(start, high + 1)
+            if high >= end:
+                # This exclusion may also span the next range or block.
+                break
+            index += 1
+        if start <= end:
             nets.extend(summarize_address_range(IPv6Address(start), IPv6Address(end)))
     return tuple(
         (int(net.network_address), net.prefixlen) for net in collapse_addresses(nets)
@@ -1633,15 +1670,31 @@ def policy_status(
                     'device': device,
                     'color': policy.color,
                     'endpoint': str(IPv6Address(policy.endpoint)),
-                    'status': result.status,
-                    'basic_valid': [list(k) for k in result.basic_valid],
-                    'first_valid': [list(k) for k in result.first_valid],
-                    'strict_valid': [list(k) for k in result.strict_valid],
+                    'name': policy.name,
+                    'status': result.status if key in table.states else 'UNCOMPUTED',
+                    'basic_valid': bool(result.basic_valid)
+                    if key in table.states
+                    else None,
+                    'basic_valid_lists': [list(k) for k in result.basic_valid],
+                    'first_valid': bool(result.first_valid)
+                    if key in table.states
+                    else None,
+                    'first_valid_lists': [list(k) for k in result.first_valid],
+                    'strict_valid': bool(result.strict_valid)
+                    if key in table.states
+                    else None,
+                    'strict_valid_lists': [list(k) for k in result.strict_valid],
                     'active_path': result.active_path,
                     'programming': result.programming,
-                    'programmed_version': result.programmed_version,
+                    'programmed_version': result.programmed_version
+                    if key in table.states
+                    else None,
                     'reasons': [list(r) for r in result.reasons],
                     'observed_delivery': delivery,
+                    'delivered': sum(d['delivered'] for d in delivery)
+                    if delivery
+                    else None,
+                    'delivery_scope': 'placement',
                 }
             )
     return rows

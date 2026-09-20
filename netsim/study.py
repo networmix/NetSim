@@ -7,10 +7,13 @@ capacity unit (bit/s for a native network); loss integrals always use bits.
 
 from __future__ import annotations
 
+import csv
+import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from ipaddress import IPv6Address
 from pathlib import Path
 from typing import Any
 
@@ -46,22 +49,74 @@ class StudyResult:
                 'data': {
                     'baseline': self.baseline,
                     'flow_results': self.flow_results,
-                    'netsim': self.netsim,
+                    'netsim': {
+                        **self.netsim,
+                        'policy_iterations': [
+                            {
+                                'failure_id': result['failure_id'],
+                                'policies': result['data']
+                                .get('netsim', {})
+                                .get('policies', []),
+                            }
+                            for result in self.flow_results
+                        ],
+                    },
                 },
             }
         )
 
-    def rows(self) -> list[dict[str, Any]]:
-        """One row per pattern/flow, carrying the pattern's sampling weight."""
+    def rows(self, *, events: bool = False) -> list[dict[str, Any]]:
+        """Flow rows, or retained PolicyEvent/SidEvent rows with ``events=True``.
+
+        Policy delivery is observed demand payload rate, in capacity_unit;
+        validity/selection/programming come separately from the immutable tree.
+        """
+        if events:
+            return [
+                {
+                    'failure_id': result['failure_id'],
+                    'occurrence_count': result['occurrence_count'],
+                    **deepcopy(row),
+                }
+                for result in self.flow_results
+                for row in result['data'].get('netsim', {}).get('timeline', [])
+                if row['event'] in ('PolicyEvent', 'SidEvent')
+            ]
         return [
             {
                 'failure_id': result['failure_id'],
                 'occurrence_count': result['occurrence_count'],
                 **deepcopy(flow),
+                **{
+                    f'policy_{key}': deepcopy(value)
+                    for key, value in flow['data'].get('policy', {}).items()
+                },
             }
             for result in self.flow_results
             for flow in result['flows']
         ]
+
+    def to_csv(self, path: str | Path, *, events: bool = False) -> None:
+        """Write rows with sorted columns; structured cells contain JSON."""
+        rows = self.rows(events=events)
+        fields = sorted({key for row in rows for key in row})
+        with Path(path).open('w', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(
+                {
+                    key: json.dumps(value, sort_keys=True)
+                    if isinstance(value, (dict, list, tuple))
+                    else value
+                    for key, value in row.items()
+                }
+                for row in rows
+            )
+
+
+def _policy_rows(network: Network, capacity_unit: float) -> list[dict[str, Any]]:
+    """Committed validation/programming and measured placement, all steering forms."""
+    return policy_status(network.state, capacity_unit=capacity_unit)
 
 
 def _shortfall(offered: float, delivered: float) -> float:
@@ -222,6 +277,10 @@ class Study:
     def _record(self, network: Network, failures: FailureSet) -> dict[str, Any]:
         report = network.placement
         flows = []
+        policies = _policy_rows(network, self.capacity_unit)
+        policy_by_key = {
+            (row['device'], row['color'], row['endpoint']): row for row in policies
+        }
         for name, demand in network.state.demands.sorted_items():
             shortfall = _shortfall(demand.rate, report.demands[name].delivered)
             offered = demand.rate / self.capacity_unit
@@ -238,10 +297,27 @@ class Study:
                     'placed': placed,
                     'dropped': dropped,
                     'cost_distribution': {},
-                    'data': {'demand_id': name},
+                    'data': {
+                        'demand_id': name,
+                        **(
+                            {
+                                'policy': deepcopy(
+                                    policy_by_key.get(
+                                        (
+                                            demand.source,
+                                            demand.steer.color,
+                                            str(IPv6Address(demand.steer.endpoint)),
+                                        ),
+                                        {},
+                                    )
+                                )
+                            }
+                            if demand.steer is not None
+                            else {}
+                        ),
+                    },
                 }
             )
-        policies = policy_status(network.state, capacity_unit=self.capacity_unit)
         total = sum(f['demand'] for f in flows)
         placed = sum(f['placed'] for f in flows)
         return {
@@ -260,7 +336,7 @@ class Study:
                 'dropped_flows': sum(f['dropped'] > 0 for f in flows),
                 'num_flows': len(flows),
             },
-            'data': {'policies': policies} if policies else {},
+            'data': {'netsim': {'policies': policies}},
         }
 
     def _metrics(
@@ -431,7 +507,7 @@ class Study:
                 drop_reasons=failure_drops,
                 fault_events=1,
             )
-            record['data']['netsim'] = extras
+            record['data']['netsim'].update(extras)
             records.append(record)
         return StudyResult(
             self._record(self.network, FailureSet()),
@@ -470,7 +546,7 @@ class Study:
             tuple(inverse.get(n, n) for k, n in registry.counts if k == 'link'),
         )
         terminal = self._record(sim.network, failures)
-        terminal['data']['netsim'] = extras
+        terminal['data']['netsim'].update(extras)
         return StudyResult(
             self._record(self.network, FailureSet()),
             [terminal],

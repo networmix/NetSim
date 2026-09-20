@@ -13,10 +13,13 @@ from __future__ import annotations
 import copy
 import importlib
 import ipaddress
+import random
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+from netsim.model import srv6 as sr
+from netsim.model.contracts import STATIC
 from netsim.model.flows import PlacementReport
 from netsim.model.igp import oracle_igp
 from netsim.model.network import Network
@@ -369,13 +372,13 @@ SUPPORTED_FLOW_POLICIES = frozenset(
 the oracle IGP; the lossy variant maps to the LOSSY capacity model)."""
 
 
-def _check_supported(td: Any, where: str) -> None:
+def _check_supported(td: Any, where: str, *, srv6: bool = False) -> None:
     """Reject NetGraph demand options the adapter does not translate."""
     paths = getattr(td, 'static_paths', ()) or ()
-    if paths:
-        raise ValueError(
-            f'{where}: static_paths are not supported (Gate B: SR policies)'
-        )
+    if paths and not srv6:
+        raise ValueError(f'{where}: static_paths require srv6=True')
+    if str(getattr(td, 'mode', 'combine')).lower() not in ('combine', 'pairwise'):
+        raise ValueError(f'{where}: unsupported demand mode')
     group_mode = getattr(td, 'group_mode', None)
     if group_mode not in (None, 'flatten'):
         raise ValueError(f'{where}: group_mode {group_mode!r} is not supported')
@@ -383,7 +386,19 @@ def _check_supported(td: Any, where: str) -> None:
     if policy is not None:
         key = getattr(policy, 'name', policy)
         value = getattr(policy, 'value', policy)
-        if key not in SUPPORTED_FLOW_POLICIES and value not in SUPPORTED_FLOW_POLICIES:
+        pinned_te = (
+            paths
+            and srv6
+            and (
+                key in ('TE_WCMP_UNLIM', 'TE_ECMP_UP_TO_256_LSP', 'TE_ECMP_16_LSP')
+                or value in (3, 4, 5)
+            )
+        )
+        if (
+            not pinned_te
+            and key not in SUPPORTED_FLOW_POLICIES
+            and value not in SUPPORTED_FLOW_POLICIES
+        ):
             raise ValueError(
                 f'{where}: flow_policy {key!r} is not supported (only shortest-path ECMP)'
             )
@@ -404,16 +419,28 @@ def _populate_demands(
     excluded. Known approximation: NetGraph re-splits a combined volume over
     the sources that can reach a target in each iteration, NetSim keeps each
     source's share fixed (a cut-off source drops its share). With ``strict``
-    the options that are not translated (static paths, group modes, WCMP and
-    TE flow policies) raise instead of being silently approximated."""
+    unsupported options raise. With srv6=True, one explicit pairwise path
+    (including TE presets) becomes a DROP-fallback SR policy; unpinned TE,
+    group modes and capacity-aware multi-path pins remain unsupported."""
     ids: list[str] = []
     used = _used_ipv4(net)
     for set_name in sorted(demand_sets):
         for i, td in enumerate(demand_sets[set_name]):
             if strict:
-                _check_supported(td, f'{set_name}[{i}]')
+                _check_supported(
+                    td,
+                    f'{set_name}[{i}]',
+                    srv6=bool(getattr(net, 'netsim_srv6', False)),
+                )
             sources = _match(network, td.source)
             targets = _match(network, td.target)
+            if getattr(td, 'static_paths', ()) and getattr(net, 'netsim_srv6', False):
+                ids.append(
+                    _pinned_demand(
+                        network, net, td, set_name, i, sources, targets, capacity_unit
+                    )
+                )
+                continue
             # NetGraph: lower priority numbers are served first; NetSim
             # serves higher numbers first, so the sign flips here and the
             # original value is kept for exported results.
@@ -465,6 +492,167 @@ def _populate_demands(
                     priorities[did] = ng_priority
                 ids.append(did)
     return ids
+
+
+def _allocate_srv6(net: Network, seed: int) -> None:
+    """F3216 GIBs in seeded, sorted-name order; one local uA per L3 link end."""
+    names = sorted(net.state.devices)
+    random.Random(seed).shuffle(names)
+    for name in names:
+        dev = net.device(name)
+        dev.add_locator('ngraph', structure=sr.F3216_GIB)
+        dev.add_local_sid(sr.END, structure=sr.F3216_GIB, flavors=sr.NEXT_CSID)
+        dev.add_local_sid(sr.END_DT46, structure=sr.F3216_TERMINAL)
+        for iface, node in dev.node.interfaces.sorted_items():
+            if not hasattr(node.config, 'speed') and not hasattr(
+                node.config, 'min_links'
+            ):
+                continue
+            if getattr(node.config, 'aggregate_id', None):
+                continue
+            dev.add_local_sid(
+                sr.END_X, structure=sr.F3216_LIB, flavors=sr.NEXT_CSID, interface=iface
+            )
+    net.netsim_srv6 = True  # type: ignore[attr-defined]
+
+
+def _path_interfaces(
+    network: Any, net: Network, path: Any, source: str, target: str
+) -> tuple[sr.AdjSeg, ...]:
+    """Resolve NetGraph StaticPath nodes/links without importing NetGraph-Core.
+
+    Node hops select the cheapest enabled link, then the link id, matching
+    NetGraph's build_static_path_bundles. LAG hops bind the imported bundle.
+    Explicit member-link pins are rejected: a bundle would change their meaning.
+    """
+    if isinstance(path, dict):
+        if path.keys() - {'nodes', 'links'}:
+            raise ValueError('static_paths: unsupported path fields')
+        nodes, links = path.get('nodes', ()), path.get('links', ())
+    else:
+        nodes, links = getattr(path, 'nodes', ()), getattr(path, 'links', ())
+    if bool(nodes) == bool(links) or isinstance(nodes, str) or isinstance(links, str):
+        raise ValueError(
+            'static_paths: each path needs exactly one nodes or links sequence'
+        )
+    if nodes:
+        if len(nodes) < 2 or nodes[0] != source or nodes[-1] != target:
+            raise ValueError(
+                'static_paths: node path must start at source and end at target'
+            )
+        selected = []
+        for a, b in zip(nodes, nodes[1:], strict=False):
+            choices = [
+                link
+                for link in network.links.values()
+                if {link.source, link.target} == {a, b} and not link.disabled
+            ]
+            if not choices:
+                raise ValueError(f'static_paths: no enabled link for {a!r} -> {b!r}')
+            selected.append(
+                min(
+                    choices,
+                    key=lambda link: (
+                        float(
+                            _attrs(link).get('reverse_cost', link.cost)
+                            if link.target == a
+                            else link.cost
+                        ),
+                        link.id,
+                    ),
+                ).id
+            )
+    else:
+        selected = list(links)
+    current = source
+    visited = {source}
+    result = []
+    for lid in selected:
+        if lid not in network.links:
+            raise ValueError(f'static_paths: unknown link {lid!r}')
+        link = network.links[lid]
+        if link.disabled:
+            raise ValueError(f'static_paths: disabled link {lid!r}')
+        if links and _attrs(link).get('lag') is not None:
+            raise ValueError(
+                f'static_paths: member-link pin {lid!r} cannot represent a bundle'
+            )
+        imported = net.link(net.ngraph_link_ids[lid]).node
+        if current not in (imported.a[0], imported.b[0]):
+            raise ValueError(f'static_paths: link {lid!r} does not leave {current!r}')
+        endpoint = imported.a if imported.a[0] == current else imported.b
+        iface = net.device(current)[endpoint[1]].node
+        result.append(
+            sr.AdjSeg(
+                current, getattr(iface.config, 'aggregate_id', None) or endpoint[1]
+            )
+        )
+        current = imported.other(endpoint)[0]
+        if current in visited:
+            raise ValueError('static_paths: path must be simple (no repeated nodes)')
+        visited.add(current)
+    if current != target:
+        raise ValueError('static_paths: link path must end at target')
+    return tuple(result)
+
+
+def _pinned_demand(
+    network: Any,
+    net: Network,
+    td: Any,
+    set_name: str,
+    index: int,
+    sources: list[str],
+    targets: list[str],
+    capacity_unit: float,
+) -> str:
+    if str(getattr(td, 'mode', 'combine')).lower() != 'pairwise':
+        raise ValueError('static_paths: pinned routes require mode pairwise')
+    # NetGraph requires exactly one source/target for pinned routes. Multiple
+    # routes involve capacity-driven rebalancing, outside this strict subset.
+    if len(sources) != 1 or len(targets) != 1 or sources == targets:
+        raise ValueError(
+            'static_paths: selectors must identify one distinct source/target pair'
+        )
+    if len(td.static_paths) != 1:
+        raise ValueError('static_paths: exactly one pinned route per pair is supported')
+    source, target = sources[0], targets[0]
+    if network.nodes[source].disabled or network.nodes[target].disabled:
+        raise ValueError('static_paths: source and target must be enabled')
+    segments = (
+        *_path_interfaces(network, net, td.static_paths[0], source, target),
+        sr.TermSeg(target),
+    )
+    endpoint = net.device(target)['lo0'].node.config.ipv6[0][0]
+    policies = net.device(source).node.srv6_policies
+    color = 1
+    while policies and (color, endpoint) in policies.policies:
+        color += 1
+    did = f'{set_name}:{index}:{source}>{target}'
+    policy = sr.SrPolicy(
+        STATIC,
+        color,
+        endpoint,
+        name=did,
+        candidate_paths=(
+            sr.CandidatePath(segment_lists=(sr.SegmentList(segments, name=did),)),
+        ),
+        fallback=sr.FALLBACK_DROP,
+    )
+    net.device(source).policy_client().add(policy)
+    priority = int(getattr(td, 'priority', 0))
+    net.add_demand(
+        did,
+        source,
+        _loopback_v4(net, target),
+        td.volume * capacity_unit,
+        priority=-priority,
+        tag=set_name,
+        steer=sr.PolicyRef(color, endpoint),
+    )
+    net.netsim_demand_destinations[did] = target  # type: ignore[attr-defined]
+    net.netsim_demand_priorities[did] = priority  # type: ignore[attr-defined]
+    return did
 
 
 def _used_ipv4(net: Network) -> set[int]:
@@ -549,10 +737,15 @@ def from_scenario(
     demand_set: str | None = None,
     iterations: int = 0,
     strict: bool = True,
+    srv6: bool = False,
     **kw: Any,
 ) -> tuple[Network, list[str], FailureSchedule | None]:
     """NetGraph ``Scenario`` → ``(Network, demand ids, FailureSchedule | None)``."""
     seed = int(getattr(scenario, 'seed', 0) or 0)
+    if srv6:
+        if kw.get('ipv6') is False:
+            raise ValueError('srv6=True requires IPv6 underlay interfaces')
+        kw['ipv6'] = True
     net = Network(seed=seed)
     with _MetadataGuard(net), net.batch():
         _populate_network(
@@ -562,6 +755,8 @@ def from_scenario(
             capacity_unit=capacity_unit,
             **kw,
         )
+        if srv6:
+            _allocate_srv6(net, seed)
         sets = getattr(getattr(scenario, 'demand_set', None), 'sets', {}) or {}
         if demand_set is not None:
             sets = {demand_set: sets[demand_set]}
@@ -708,6 +903,7 @@ else:
         iterations: int = 1
         mode: str = 'iterations'
         addressing: str = 'unnumbered'
+        srv6: bool = False
         capacity_unit: float = 1e9
         horizon: float = 100.0
         rate: float = 1.0
@@ -746,6 +942,7 @@ else:
                 scenario,
                 demand_set=self.demand_set,
                 addressing=self.addressing,
+                srv6=self.srv6,
                 capacity_unit=self.capacity_unit,
                 keep=keep,
             )

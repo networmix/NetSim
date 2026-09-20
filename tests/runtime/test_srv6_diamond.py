@@ -85,12 +85,12 @@ def test_study_exports_failure_policy_status_and_observed_delivery():
     p = policy(routers)
     net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
     result = Study(net).iterations([FailureSet(excluded_links=('R1:eth1--R2:eth1',))])
-    before = result.baseline['data']['policies'][0]
-    after = result.flow_results[0]['data']['policies'][0]
+    before = result.baseline['data']['netsim']['policies'][0]
+    after = result.flow_results[0]['data']['netsim']['policies'][0]
     assert before['status'] == 'UP'
     assert before['observed_delivery'][0]['delivered'] == 100e6
-    assert after['basic_valid'] == [[0, 0]]
-    assert after['strict_valid'] == []
+    assert after['basic_valid_lists'] == [[0, 0]]
+    assert after['strict_valid_lists'] == []
     assert after['status'] == 'DOWN' and after['programming'] == 'INSTALLED'
     assert after['observed_delivery'][0]['delivered'] == 0
     assert after['observed_delivery'][0]['drops'] == [[fw.POLICY_DOWN, 'R1', 100e6]]

@@ -529,6 +529,13 @@ def forward_ip(
         if entry is None:
             return StepResult(DROP, NO_ROUTE)
         if entry.action == RECEIVE:
+            # RFC 8754 section 4.3.2: an ordinary local interface cannot consume
+            # an active segment. Only a valid chain with SL=0 can be delivered.
+            if isinstance(packet, IPv6Packet) and (
+                validate_chain(packet) is not None
+                or (packet.srh is not None and packet.srh.segments_left != 0)
+            ):
+                return StepResult(DROP, SRH_MALFORMED)
             return StepResult(DELIVER, packet=packet)
         if entry.action in DROP_ACTIONS:
             reason = (

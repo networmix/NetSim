@@ -63,3 +63,17 @@ def test_records_are_immutable_tree_leaves():
     with pytest.raises(dataclasses.FrozenInstanceError):
         sid.behavior = srv6.END_X  # type: ignore[misc]
     assert policy.key == (10, 0x20010DB8 << 96 | 4)
+
+
+def test_behavior_names_do_not_depend_on_shared_mutable_state():
+    assert not hasattr(srv6, 'BEHAVIOR_NAMES')
+    assert [
+        srv6.behavior_name(b)
+        for b in (srv6.END, srv6.END_X, srv6.END_DT46, srv6.END_B6_ENCAPS, 99)
+    ] == [
+        'End',
+        'End.X',
+        'End.DT46',
+        'End.B6.Encaps',
+        '99',
+    ]

@@ -17,7 +17,7 @@ from math import lcm
 from typing import Any, Iterator, Protocol
 
 from netsim.model.addressing import IPV4, IPV6, mask_for
-from netsim.model.contracts import CONNECTED, ClientId
+from netsim.model.contracts import ClientId
 from netsim.model.forwarding import (
     CROSS_CONNECT,
     DECAP_LOOKUP,
@@ -570,7 +570,9 @@ class _Resolver:
         if isinstance(nh.srv6, Srv6Encap):
             try:
                 packet = encapsulate(
-                    IPv4Packet(0, 0, 17),
+                    # The compiler must retain the inner family through local
+                    # decapsulation (RFC 8986 sections 4.8 and 4.16.3).
+                    IPv4Packet(0, 0, 17) if af == IPV4 else IPv6Packet(0, 0, 17),
                     nh.srv6.entries,
                     behavior=nh.srv6.behavior,
                     source=0,
@@ -637,28 +639,31 @@ class _Resolver:
             if entry.action == SRV6_LOCAL:
                 result = local_sid(packet, entry.sid)
                 if result.action == CROSS_CONNECT:
-                    assert result.adjacency is not None
+                    assert result.adjacency is not None and result.packet is not None
                     adj = result.adjacency
                     return self._resolve_nexthop(
-                        IPV6,
+                        # USD exposes the inner header; egress usability follows
+                        # that packet, while the bound SID neighbor stays IPv6.
+                        result.packet.af,
                         Nexthop.via(adj.interface, adj.nexthop, IPV6),
                     )
                 if result.action == RELOOKUP and isinstance(result.packet, IPv6Packet):
                     return self._resolve_outer(result.packet, visited)
-                if result.action == DECAP_LOOKUP:
-                    # ENCAP dispatch will decapsulate and perform the inner lookup.
+                if result.action == DECAP_LOOKUP and not self.stack:
+                    # Layer-2 policy validation permits a headend terminal: an
+                    # ingress policy exposes an independent inner lookup. During
+                    # route compilation that lookup re-enters the triggering
+                    # prefix, so it cannot supply an outer egress (gray stack).
                     return (_Leg('', None, None, Fraction(1)),)
                 return ()
             if entry.action != FORWARD:
                 return ()
-            # Only connected prefixes need destination neighbor substitution.
-            # An oracle/interface-only transit route already has its peer MAC;
-            # the remote SID is not an on-link neighbor of the headend.
-            return (
-                self._substitute(IPV6, address, legs)
-                if any(key[2] == CONNECTED for key in entry.contributing)
-                else legs
-            )
+            # This is a lookup of the outer packet's DA, not recursive next-hop
+            # resolution. Keep the resolved route's egress exactly as transit
+            # forwarding does, including an unnumbered interface-only peer.
+            # Substituting the remote SID as an on-link neighbor loses that leg.
+            return legs
+
         return ()
 
     def _substitute(

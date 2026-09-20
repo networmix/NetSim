@@ -659,6 +659,9 @@ def _derive_srv6_local(dev: DeviceState, scope: set[str] | None) -> DeviceState:
                 )
             )
     if dev.config.enabled:
+        # Only installed rows suppress the cover. An unusable or deleted
+        # adjacency leaves its range covered by SID_UNKNOWN again.
+        unknown = srv6.unknown_prefixes(db, (row.prefix for row in rows))
         rows.extend(
             Route(
                 prefix,
@@ -668,7 +671,7 @@ def _derive_srv6_local(dev: DeviceState, scope: set[str] | None) -> DeviceState:
                 (Nexthop(special=UNREACHABLE),),
                 distinguisher=('unknown',),
             )
-            for prefix in srv6.unknown_prefixes(db)
+            for prefix in unknown
         )
     rib = dev.ribs.get(IPV6) or RibState.empty(IPV6)
     new_rib = rib_apply(rib, sync=(SRV6_LOCAL, tuple(rows)))

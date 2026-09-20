@@ -216,3 +216,67 @@ def test_deterministic_order_for_different_encaps_on_same_adjacency():
     routers['R1'].add_route('10.99.0.0/16', [b, a])
     net.converge()
     assert routers['R1'].fib(4) is old
+
+
+@pytest.mark.parametrize('af', [4, 6])
+@pytest.mark.parametrize('forwarding_v4', [False, True])
+@pytest.mark.parametrize('behavior', [END_X, END_DT46])
+def test_headend_decap_compilation_respects_inner_family(af, forwarding_v4, behavior):
+    from netsim.model.srv6 import UNCOMPRESSED, USD
+
+    net, routers, _ = path_network()
+    r1 = routers['R1']
+    net.add_p2p(
+        r1,
+        'backup',
+        routers['R4'],
+        'toR1',
+        ipv4=('10.1.14.0/31', '10.1.14.1/31'),
+        ipv6=('2001:db8:14::1/64', '2001:db8:14::2/64'),
+    )
+    r1['toR2'].configure(forwarding_v4=forwarding_v4, forwarding_v6=True)
+    r1.add_locator('headend', '2001:db8:10:1::/64')
+    sid = r1.add_local_sid(
+        behavior,
+        structure=UNCOMPRESSED,
+        sid='2001:db8:10:1:1::',
+        flavors=USD if behavior == END_X else 0,
+        interface='toR2' if behavior == END_X else None,
+    )
+    prefix = '10.0.0.4/32' if af == 4 else '2001:db8::4/128'
+    peer = '10.1.24.1' if af == 4 else '2001:db8:24::2'
+    backup_peer = '10.1.14.1' if af == 4 else '2001:db8:14::2'
+    routers['R2'].add_route(prefix, [('toR4', peer)])
+    primary = r1.add_route(prefix, [Nexthop(srv6=Srv6Encap((sid.sid,)))])
+    backup = r1.add_route(
+        prefix, [('backup', backup_peer)], distance=20, distinguisher=('backup',)
+    )
+    net.converge()
+    packet = inner_packet(af)
+    # Prove the alternate delivers independently of the primary's resolution.
+    without_primary = net.fork()
+    without_primary['R1'].rib_client(af=af).delete_routes((primary.key,))
+    without_primary.converge()
+    assert without_primary.trace('R1', packet).path == ('R1', 'R4')
+    assert without_primary.trace('R1', packet).outcome == fw.DELIVER
+
+    # Headend-local DT46 exposes the triggering destination again, so cannot
+    # compile an outer egress. End.X+USD can send the inner over its bound link.
+    usable = behavior == END_X and (af == 6 or forwarding_v4)
+    assert r1.route_status(af, primary.key) == (
+        ('INSTALLED', None) if usable else ('NOT_INSTALLED', 'UNRESOLVED')
+    )
+    entry = r1.fib(af).lookup(packet.dst)
+    assert entry.contributing == ((primary if usable else backup).key,)
+    assert r1.fib(af).group(entry).adjacencies[0].interface == (
+        'toR2' if usable else 'backup'
+    )
+    assert (6, sid.sid) in entry.depends_on.lookups
+    if behavior == END_X:
+        assert 'toR2' in entry.depends_on.interfaces
+    result = net.trace('R1', packet)
+    assert result.outcome == fw.DELIVER
+    assert result.path == (('R1', 'R2', 'R4') if usable else ('R1', 'R4'))
+    assert (
+        result.hops[0].packet is packet
+    )  # USD, like origination, consumes no inner hop.
