@@ -41,8 +41,11 @@ def test_timed_send_matches_full_trace_and_waits_each_link(path, af):
 
 
 @pytest.mark.parametrize('form', ['bare', 'composite', 'wlib', 'two-blocks'])
-def test_sid_forms_reach_the_intended_edges_in_probes_hash_placement_and_send(form):
-    net, _ = diamond(numbered=True, delay=0.25)
+@pytest.mark.parametrize('numbered', [True, False])
+def test_sid_forms_reach_the_intended_edges_in_probes_hash_placement_and_send(
+    form, numbered
+):
+    net, _ = diamond(numbered=numbered, delay=0.25)
     sids, expected, path = form_path(net, form)
     encap = install_path(net, sids, destination=9)
     assert encap.entries == expected

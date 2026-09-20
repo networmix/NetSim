@@ -819,3 +819,73 @@ def test_public_srdb_hash_placement_uses_actual_transmitted_headers(compressed, 
         assert report.offered[edge] == pytest.approx(wire)
         assert report.carried[edge] == pytest.approx(wire)
     assert not report.dropped_by_reason
+
+
+@pytest.mark.parametrize('af', [4, 6])
+@pytest.mark.parametrize('sl', [0, 1])
+@pytest.mark.parametrize('da', ['2001:db8::4', '2001:db8:24::2'])
+def test_receive_interface_requires_consumed_srh(af, sl, da):
+    net, routers, _ = path_network()
+    packet = outer_packet(af=af, da=da, sl=sl, hop_limit=1)
+    assert routers['R4'].fib(6).lookup(packet.dst).action == fw.RECEIVE
+    result = net.trace('R4', packet)
+    expected = (fw.DROP, SRH_MALFORMED) if sl else (fw.DELIVER, None)
+    assert (result.outcome, result.reason) == expected
+    if sl == 0:
+        assert result.hops[0].packet is packet
+    # Received frames and the timed driver must execute the same delivery check.
+    frame = EthernetFrame(
+        routers['R4']['toR2'].mac, routers['R2']['toR4'].mac, ETHERTYPE_IPV6, packet
+    )
+    received = fw.receive_frame(net.view('R4'), 'toR2', frame)
+    assert (received.outcome, received.reason) == expected
+    sim = Simulation(Environment(), net)
+    proc = sim.send('R4', packet)
+    sim.env.run()
+    assert proc.value == result
+
+
+@pytest.mark.parametrize('af', [4, 6])
+@pytest.mark.parametrize('behavior', [END_X, END_DT46])
+def test_terminal_decap_egress_checks_the_inner_family(af, behavior):
+    net, routers, _ = path_network()
+    install_sid(
+        routers['R2'],
+        LocalSid(
+            address('2001:db8:2:1::'),
+            128,
+            behavior,
+            USD if behavior == END_X else 0,
+            interface='toR4' if behavior == END_X else None,
+        ),
+    )
+    prefix = '10.0.0.4/32' if af == 4 else '2001:db8::4/128'
+    peer = '10.1.24.1' if af == 4 else '2001:db8:24::2'
+    routers['R2'].add_route(prefix, [('toR4', peer)])
+    net.converge()
+    packet = outer_packet(af=af, sl=0, hop_limit=1)
+    expected_inner = packet.payload
+    # Disable the other family: decapsulation must still deliver this family.
+    other_family = 'forwarding_v6' if af == 4 else 'forwarding_v4'
+    routers['R2']['toR4'].configure(**{other_family: False})
+    result = net.trace('R2', packet)
+    assert result.outcome == fw.DELIVER
+    assert result.hops[0].packet is expected_inner
+    # Stale FIB / SID, newly disabled egress: the interpreter checks the inner.
+    this_family = 'forwarding_v4' if af == 4 else 'forwarding_v6'
+    routers['R2']['toR4'].configure(**{this_family: False})
+    assert net.trace('R2', packet).reason == fw.EGRESS_DOWN
+
+
+@pytest.mark.parametrize('malformation', ['last_entry', 'next_header', 'missing_srh'])
+def test_receive_validates_chain_before_accepting_zero_sl(malformation):
+    net, _, _ = path_network()
+    packet = outer_packet(da='2001:db8::4', sl=0)
+    if malformation == 'last_entry':
+        packet = replace(packet, srh=replace(packet.srh, last_entry=2))
+    elif malformation == 'next_header':
+        packet = replace(packet, srh=replace(packet.srh, next_header=17))
+    else:
+        packet = replace(packet, srh=None)  # Next Header still identifies an SRH.
+    result = net.trace('R4', packet)
+    assert (result.outcome, result.reason) == (fw.DROP, SRH_MALFORMED)
