@@ -1,6 +1,11 @@
-"""NetSim — a discrete-event simulation engine."""
+"""NetSim — a discrete-event simulation engine with a network layer.
+
+The engine (``Environment``, ``Event``, ``Process``, resources) lives here;
+the network model is ``netsim.model`` and its clock binding ``netsim.runtime``.
+"""
 
 from netsim.core import (
+    DEFERRED,
     NORMAL,
     URGENT,
     AllOf,
@@ -34,6 +39,7 @@ __all__ = [
     'Condition',
     'ConditionValue',
     'Container',
+    'DEFERRED',
     'EmptySchedule',
     'Environment',
     'Event',

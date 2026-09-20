@@ -119,6 +119,68 @@ with ThreadPoolExecutor() as pool:
     results = list(pool.map(replicate, range(8)))
 ```
 
+## Network layer
+
+`netsim.model` and `netsim.runtime` simulate IP networks on top of the
+engine: devices with a RIB and a FIB, Loopback / Ethernet / PortChannel
+interfaces (min-links, carrier delay), IPv4 and IPv6 addressing, static
+and shortest-path routes with recursive resolution and ECMP, hashed or
+fluid flow placement with per-link utilization, and packet probes. State
+lives in one immutable tree; derivations run as ordered kinds either
+clock-free (`Network.converge()`) or on the DES clock (`Simulation`).
+
+```python
+import netsim
+from netsim.model.network import Network
+from netsim.runtime import Simulation
+
+net = Network()
+r1, r2 = net.add_device('R1'), net.add_device('R2')
+r1.add_loopback('lo0', ipv4=['10.0.0.1/32'])
+r2.add_loopback('lo0', ipv4=['10.0.0.2/32'])
+net.add_p2p(r1, 'eth1', r2, 'eth1', ipv4=('10.1.12.0/31', '10.1.12.1/31'), speed=10e9)
+r1.add_route('10.0.0.2/32', [('eth1', '10.1.12.1')])
+net.add_demand('d1', 'R1', '10.0.0.2', rate=4e9)
+
+env = netsim.Environment()
+sim = Simulation(env, net)                 # initial convergence at t=0
+sim.at(10, net.links['R1:eth1--R2:eth1'].fail)
+sim.run_until(20)
+report = sim.timeline.snapshot_at(10).placement
+print(report.dropped_by_reason)            # {'LINK_DOWN': 4e9} until routing reacts
+```
+
+Every committed change is one timeline record (`seq`, `time`, `round`,
+`origin`) plus flat, typed events extracted from it: link state,
+interface oper transitions with RFC 2863 names and reasons, carrier
+debounce, bundle membership, RIB rows, FIB entries with their next hops,
+demands and placement summaries. Nothing in an event needs the state
+tree, so post-analysis is filtering and tabulating:
+
+```python
+tl = sim.timeline
+print(tl.summary(10))                                  # one line per event at t=10
+tl.select(kind=FibEvent, device='R1', since=10)        # typed, filterable
+tl.interface_series('R1', 'eth1')                      # [(0, 'UP', 'UP'), (10, 'DOWN', 'CARRIER')]
+tl.utilization_series(net.links['R1:eth1--R2:eth1'].edge('R1'))
+tl.to_csv('events.csv')                                # or tl.rows() for pandas
+```
+
+Two device settings decide what a short outage costs. `fib_delay` is the
+control plane's reaction time: until it elapses, the FIB still carries the
+dead leg and flows hashed to it drop with `EGRESS_DOWN`. `fast_failover`
+is data-plane pruning: a next-hop group member whose port has no link is
+skipped at selection time and its flows re-hash over the live members, so a
+slow control plane loses nothing (both behaviours exist on real platforms).
+
+Raw deltas and roots are kept in bounded deques (`keep_deltas`,
+`keep_roots` on `Simulation`); series come from the per-edge arrays the
+placement events carry, so a long run does not retain every tree.
+
+The design document behind this layer (state tree, rounds, RIB/FIB
+resolution, SRv6 plan, placement semantics) is kept with the project
+plans; Gate A ships plain IP, Gate B adds SRv6, Gate C protocol agents.
+
 ## Development
 
 ```bash

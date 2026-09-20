@@ -112,3 +112,67 @@ def test_anyof_timeout(benchmark):
 
 def test_interrupts(benchmark):
     assert benchmark(_interrupts, 10_000) == 10_001
+
+
+# ---------------------------------------------------------------------------
+# Network layer
+# ---------------------------------------------------------------------------
+
+
+def _clos_converge(leaves, spines):
+    from tests.model.clos import build_clos
+
+    net = build_clos(leaves, spines)
+    net.converge()
+    return net.placement.delivered_total
+
+
+def _clos_failure_cascade(leaves, spines):
+    import netsim
+    from netsim.runtime import Simulation
+    from tests.model.clos import build_clos
+
+    net = build_clos(leaves, spines)
+    env = netsim.Environment()
+    sim = Simulation(env, net)
+    links = list(net.links.values())
+    for i, link in enumerate(links[:spines]):
+        sim.at(10 + i, link.fail)
+    sim.run_until(10 + spines + 1)
+    return net.placement.delivered_total
+
+
+def _lpm_lookups(n):
+    import random
+
+    from netsim.model.lpm import PrefixTable
+
+    rng = random.Random(1)
+    t = PrefixTable(32)
+    for _ in range(20_000):
+        plen = rng.choice([8, 16, 24, 32])
+        t.insert(rng.getrandbits(32) & (0xFFFFFFFF ^ ((1 << (32 - plen)) - 1)), plen, 1)
+    f = t.freeze()
+    hits = 0
+    for _ in range(n):
+        if f.lookup(rng.getrandbits(32)) is not None:
+            hits += 1
+    return hits
+
+
+def test_clos8_converge(benchmark):
+    assert benchmark(_clos_converge, 8, 4) > 0
+
+
+def test_clos8_failure_cascade(benchmark):
+    assert benchmark(_clos_failure_cascade, 8, 4) > 0
+
+
+def test_lpm_lookups(benchmark):
+    benchmark(_lpm_lookups, 20_000)
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(300)
+def test_clos64_converge(benchmark):
+    assert benchmark(_clos_converge, 64, 8) > 0

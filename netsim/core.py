@@ -21,6 +21,17 @@ URGENT: int = 0
 NORMAL: int = 1
 """Default event priority."""
 
+DEFERRED: int = 8
+"""Base of the priority band reserved for settle work.
+
+Events scheduled at ``DEFERRED`` or above run after every ``NORMAL`` event
+at the same simulation time, including ``NORMAL`` events scheduled while
+that time is being processed, because the heap orders entries by
+``(time, priority, eid)``. Layers built on the engine (the network layer)
+assign their derivation stages priorities ``DEFERRED + k``; user code keeps
+using ``NORMAL``.
+"""
+
 Infinity: float = float('inf')
 
 # ---------------------------------------------------------------------------
