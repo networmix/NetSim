@@ -605,7 +605,19 @@ class TransportRuntime:
                     agent,
                     generation,
                 ):
-                    return self._reject(device, agent, generation, 'ADDRESS_IN_USE')
+                    # A restarted agent's on_init runs before the TRANSPORT
+                    # kind removes its previous generation's listener in the
+                    # same round: an obsolete listener (owner not live or its
+                    # interface re-created) is replaced; only a live owner
+                    # of another generation or agent is a collision.
+                    owner = interface(state, device, listener.interface)
+                    obsolete = (
+                        not self._live(device, listener.agent, listener.generation)
+                        or owner is None
+                        or owner.generation != listener.interface_generation
+                    )
+                    if not obsolete:
+                        return self._reject(device, agent, generation, 'ADDRESS_IN_USE')
                 new = c.Listener(
                     device, agent, op.local, generation, node.name, node.generation
                 )
