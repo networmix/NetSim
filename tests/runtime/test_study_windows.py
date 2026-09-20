@@ -223,7 +223,8 @@ def test_fresh_agent_runtime_uses_configuration_and_warms_every_iteration(monkey
         restore=False,
     )
     assert net.state is root
-    assert len(runtimes) == 2 and runtimes[0] is not runtimes[1]
+    assert len(runtimes) == 3  # baseline preparation plus two iterations
+    assert all(a is not b for i, a in enumerate(runtimes) for b in runtimes[i + 1 :])
     assert all(node.generation != stale.generation for node in seen)
     assert seen[0].generation == seen[1].generation  # deterministic independent forks
     assert all(
@@ -233,11 +234,13 @@ def test_fresh_agent_runtime_uses_configuration_and_warms_every_iteration(monkey
         4,
         4,
     ]
-    assert result.costs['warmup_events'] == 8
+    assert result.baseline['data']['netsim']['warmup_events'] == 4
+    assert result.costs['warmup_events'] == 12
     assert result.costs['warmup_seconds'] > 0
-    assert [time for i, time in ticks if i == 1] == [
-        time for i, time in ticks if i == 2
+    assert [time for i, time in ticks if i == 2] == [
+        time for i, time in ticks if i == 3
     ]
+    assert [time for i, time in ticks if i == 1] == [-0.375, -0.25, -0.125, 0]
 
 
 def test_all_streamed_metrics_equal_with_tiny_retention():
@@ -547,8 +550,12 @@ def test_real_initialized_agents_restart_and_warm_repeatably():
         for device, old_generation in generations.items():
             node = sim.state.devices[device].agents['ref']
             assert node.generation != old_generation
-            assert node.initialized and node.runs == 2
-            assert node.state == ('run', 0.001, ('init', -0.5))
+            assert node.initialized
+            if sim.env.now == 0:  # baseline stops before the timer's agent run
+                assert node.runs == 1 and node.state == ('init', -0.5)
+            else:
+                assert node.runs == 2
+                assert node.state == ('run', 0.001, ('init', -0.5))
     assert network.state is original_root
     assert original_runtime.env.now == 2
 
@@ -591,3 +598,172 @@ def test_default_processing_delay_delivers_during_real_agent_warmup():
         assert node.config.processing_delay == 0.001
         assert node.state == ((-0.124, b'hello'),)
         assert node.runs == 2
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+@pytest.mark.parametrize('initialized_until', [None, 0.03125, 0.5])
+def test_reference_baseline_matches_prepared_no_fault_iteration(
+    mode, initialized_until
+):
+    from netsim import Environment
+    from netsim.runtime import Simulation
+    from tests.agents.fixtures import topology
+
+    network = topology(numbered=False)
+    if initialized_until is not None:
+        runtime = Simulation(Environment(), network)
+        runtime.run_until(initialized_until)
+        assert all(
+            dev.agents['ref'].initialized for dev in network.state.devices.values()
+        )
+    root = network.state
+    study = Study(network, keep={'events': 0, 'records': 0})
+
+    def run():
+        if mode == 'iterations':
+            return study.iterations(
+                [FailureSet()], t0=0.5, warmup=2, horizon=1, quiet=0.25, restore=False
+            )
+        return study.process(Schedule([]), 1, warmup=2, quiet=0.25)
+
+    result = run()
+    assert result.baseline['summary']['total_placed'] == 2000
+    assert result.baseline['summary'] == result.flow_results[0]['summary']
+    baseline = result.baseline['data']['netsim']
+    assert baseline['baseline_complete'] is True
+    assert baseline['preparation_status'] == 'complete'
+    assert (
+        baseline['preparation_end']
+        == baseline['preparation_deadline']
+        == (0.5 if mode == 'iterations' else 0)
+    )
+    assert baseline['warmup_events'] > 0
+    assert result.costs['warmup_events'] == (
+        baseline['warmup_events'] + metrics(result)['warmup_events']
+    )
+    assert result.costs['warmup_seconds'] > 0
+    assert metrics(result)['status'] == 'converged'
+    assert result.to_ngraph() == run().to_ngraph()
+    assert network.state is root
+    if initialized_until is not None:
+        assert runtime.env.now == initialized_until
+
+
+def test_agent_baseline_runs_to_t0_even_without_warmup_or_draws():
+    from tests.agents.fixtures import topology
+
+    study = Study(topology(numbered=False))
+    result = study.iterations([], t0=0.5)
+    assert result.baseline['summary']['total_placed'] == 2000
+    baseline = result.baseline['data']['netsim']
+    assert baseline['baseline_complete'] is True
+    assert baseline['preparation_end'] == 0.5
+    assert baseline['engine_events'] > 0
+    assert baseline['warmup_events'] == result.costs['warmup_events'] == 0
+    assert result.flow_results == []
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+def test_agent_baseline_has_independent_budget_and_its_wall_cost_is_included(
+    mode, monkeypatch
+):
+    from tests.agents.fixtures import topology
+
+    study = Study(topology(numbered=False))
+
+    def run(budget=None):
+        if mode == 'iterations':
+            return study.iterations(
+                [FailureSet()],
+                t0=0,
+                warmup=2,
+                horizon=1,
+                event_budget=budget,
+                restore=False,
+            )
+        return study.process(Schedule([]), 1, warmup=2, event_budget=budget)
+
+    # Exactly enough events for preparation must not mark the baseline partial,
+    # even when subsequent observation needs another event and exhausts its budget.
+    budget = run().baseline['data']['netsim']['engine_events']
+    times = iter((10.0, 13.0, 20.0, 25.0))
+    monkeypatch.setattr('netsim.study.perf_counter', lambda: next(times))
+    result = run(budget)
+    baseline = result.baseline['data']['netsim']
+    assert baseline['baseline_complete'] is True
+    assert baseline['engine_events'] == budget
+    assert metrics(result)['status'] == 'budget_exceeded'
+    assert metrics(result)['engine_events'] == budget
+    assert result.costs == {'warmup_seconds': 8.0, 'warmup_events': 2 * budget}
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+def test_agent_baseline_does_not_include_later_observation(mode):
+    from tests.agents.fixtures import topology
+
+    study = Study(topology(numbered=False))
+    if mode == 'iterations':
+        result = study.iterations([FailureSet()], t0=0, horizon=1, restore=False)
+    else:
+        result = study.process(Schedule([]), 1)
+    assert result.baseline['summary']['total_placed'] == 0
+    assert result.flow_results[0]['summary']['total_placed'] == 2000
+    baseline = result.baseline['data']['netsim']
+    assert baseline['preparation_end'] == 0
+    assert baseline['baseline_complete'] is True  # requested zero-time preparation
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+def test_agent_baseline_is_captured_before_faults(mode):
+    from tests.agents.fixtures import topology
+
+    study = Study(topology(numbered=False))
+    if mode == 'iterations':
+        result = study.iterations(
+            [FailureSet(excluded_nodes=('r0',))],
+            t0=0.5,
+            warmup=2,
+            horizon=1,
+            restore=False,
+        )
+    else:
+        result = study.process(Schedule([((('device', 'r0'),), 0, 2)]), 1, warmup=2)
+    assert result.baseline['summary']['total_placed'] == 2000
+    assert result.flow_results[0]['summary']['total_placed'] == 0
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+@pytest.mark.parametrize('warmup', [0, 2])
+@pytest.mark.parametrize('budget', [0, 1])
+def test_agent_baseline_marks_incomplete_preparation(mode, warmup, budget):
+    from tests.agents.fixtures import topology
+
+    study = Study(topology(numbered=False), keep={'events': 0, 'records': 0})
+    if mode == 'iterations':
+        result = study.iterations(
+            [FailureSet()], warmup=warmup, event_budget=budget, restore=False
+        )
+    else:
+        result = study.process(Schedule([]), 1, warmup=warmup, event_budget=budget)
+    baseline = result.baseline['data']['netsim']
+    assert baseline['baseline_complete'] is False
+    assert baseline['preparation_status'] == 'budget_exceeded'
+    assert baseline['engine_events'] == budget
+    assert baseline['preparation_end'] <= baseline['preparation_deadline']
+    assert result.costs['warmup_events'] == (
+        baseline['warmup_events'] + metrics(result)['warmup_events']
+    )
+    assert result.to_ngraph()['data']['baseline']['data']['netsim'] == baseline
+
+
+@pytest.mark.parametrize('mode', ['iterations', 'process'])
+def test_oracle_baseline_requires_no_additional_runtime(mode):
+    study = Study(two_rate_network())
+    _, simulations = with_timer(study)
+    if mode == 'iterations':
+        result = study.iterations([], warmup=1)
+        assert simulations == []
+    else:
+        result = study.process(Schedule([]), 1, warmup=1)
+        assert len(simulations) == 1
+    assert result.baseline == study._record(study.network, FailureSet())
