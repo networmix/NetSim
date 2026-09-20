@@ -411,3 +411,220 @@ def test_batch_can_converge_and_read_placement_before_commit():
         assert calls == []
     assert len(calls) == 1
     assert net.placement.delivered_total == 1e6
+
+
+@pytest.mark.parametrize('timed', [False, True])
+@pytest.mark.parametrize('af', [4, 6])
+@pytest.mark.parametrize('converge_last', [False, True])
+def test_routes_after_intermediate_batch_converge(timed, af, converge_last):
+    from netsim import Environment
+    from netsim.runtime import Simulation
+
+    net = Network()
+    a = net.add_device('A')
+    net.converge()
+    sim = Simulation(Environment(), net) if timed else None
+    prefixes = (
+        ('192.0.2.1/32', '192.0.2.2/32')
+        if af == 4
+        else ('2001:db8::1/128', '2001:db8::2/128')
+    )
+    rows = []
+    commits = []
+    net.on_delta.append(lambda time, origin, delta: commits.append(origin))
+
+    def edit():
+        with net.batch():
+            rows.append(a.add_route(prefixes[0], ['blackhole']))
+            net.converge()
+            rows.append(a.add_route(prefixes[1], ['blackhole']))
+            # Reads must not move the baseline used to invalidate resolver inputs.
+            assert len(a.rib(af)) == 2
+            assert len(net.state.devices['A'].ribs[af]) == 2
+            if converge_last:
+                net.converge()
+            assert commits == []
+        assert len(commits) == 1 and commits[0][0] == 'batch'
+        for row in rows:
+            expected = 'INSTALLED' if converge_last else 'PENDING'
+            assert a.route_status(af, row.key)[0] == expected
+
+    if sim is not None:
+        sim.at(5, edit)
+        sim.run_until(5)
+    else:
+        edit()
+        net.converge()
+    for row in rows:
+        assert a.fib(af).lookup(row.prefix[0])
+        assert a.route_status(af, row.key) == ('INSTALLED', None)
+    root = net.state
+    net.converge()
+    assert net.state is root
+
+
+def test_rib_snapshots_submit_only_pending_changed_rows(monkeypatch):
+    from dataclasses import replace
+
+    import netsim.model.routing as routing
+    from netsim.model.addressing import IPV4, IPV6
+
+    net = Network()
+    a = net.add_device('A')
+    b = net.add_device('B')
+    r1 = a.add_route('192.0.2.1/32', ['blackhole'])
+    r2 = a.add_route('192.0.2.2/32', ['blackhole'])
+    v6 = a.add_route('2001:db8::1/128', ['blackhole'])
+    other = b.add_route('198.51.100.1/32', ['blackhole'])
+    original = routing.rib_apply
+    calls = []
+
+    def apply(rib, **kw):
+        calls.append((rib.af, kw.get('add', ()), kw.get('delete', ())))
+        return original(rib, **kw)
+
+    monkeypatch.setattr(routing, 'rib_apply', apply)
+    with net.batch():
+        changed = replace(r1, metric=5)
+        a.rib_client().add_routes((changed, r2))
+        first = net.state
+        assert calls == [(IPV4, (changed,), ())]
+        calls.clear()
+        assert a.rib(IPV4) is first.devices['A'].ribs[IPV4]
+        assert net.state.devices['A'].ribs[IPV6] is first.devices['A'].ribs[IPV6]
+        assert calls == []
+        a.rib_client().delete_routes((r2.key,))
+        second = net.state
+        assert calls == [(IPV4, (), (r2.key,))]
+        calls.clear()
+        b.rib_client().add_routes((replace(other, metric=7),))
+        _ = b.node
+        assert calls == [(IPV4, (replace(other, metric=7),), ())]
+        calls.clear()
+        _ = net.state
+        a.rib_client(af=IPV6).sync((v6,))
+        _ = net.state
+        assert calls == []
+    assert calls == []
+    assert len(first.devices['A'].ribs[IPV4]) == 2
+    assert len(second.devices['A'].ribs[IPV4]) == 1
+    assert first.devices['A'].ribs[IPV4].rows(r1.prefix) == (changed,)
+
+
+def test_rib_snapshot_add_delete_does_not_enumerate_existing_rows(monkeypatch):
+    from netsim.model.routing import RibState
+    from netsim.model.state import PMap
+
+    net = Network()
+    a = net.add_device('A')
+    existing = a.add_route('192.0.2.1/32', ['blackhole'])
+    shards = a.rib(4).shards
+    values = PMap.values
+    calls = []
+    rows_of = RibState.rows_of
+
+    def checked_values(mapping):
+        assert mapping is not shards, 'batch snapshot scans every RIB shard'
+        return values(mapping)
+
+    def checked_rows_of(rib, client):
+        calls.append(client)
+        return rows_of(rib, client)
+
+    monkeypatch.setattr(PMap, 'values', checked_values)
+    monkeypatch.setattr(RibState, 'rows_of', checked_rows_of)
+    with net.batch():
+        added = a.add_route('192.0.2.2/32', ['blackhole'])
+        a.rib_client().delete_routes((existing.key,))
+        snapshot = net.state
+    assert snapshot.devices['A'].ribs[4].rows(added.prefix) == (added,)
+    # The routing kernel builds the touched client's index once; the batch
+    # folding layer must not enumerate clients for ordinary add/delete calls.
+    assert len(calls) == 1
+
+
+def test_route_snapshot_reverts_preserve_canonical_root():
+    from dataclasses import replace
+
+    net = Network()
+    a = net.add_device('A')
+    row = a.add_route('192.0.2.1/32', ['blackhole'])
+    old = net.state
+    with net.batch():
+        a.rib_client().add_routes((replace(row, metric=9),))
+        changed = net.state
+        a.rib_client().add_routes((row,))
+        restored = net.state
+    assert net.state is old
+    assert restored.devices['A'].ribs[4] is old.devices['A'].ribs[4]
+    assert changed.devices['A'].ribs[4].rows(row.prefix)[0].metric == 9
+
+
+@pytest.mark.parametrize('snapshot', [False, True])
+def test_new_route_add_delete_batch_preserves_absent_rib(snapshot):
+    net = Network()
+    a = net.add_device('A')
+    old = net.state
+    with net.batch():
+        row = a.add_route('192.0.2.1/32', ['blackhole'])
+        if snapshot:
+            assert net.state.devices['A'].ribs[4].rows(row.prefix) == (row,)
+        a.rib_client().delete_routes((row.key,))
+    assert net.state is old
+
+
+@pytest.mark.parametrize('snapshot', [False, True])
+def test_route_sync_fold_order_across_clients_matches_sequential(snapshot):
+    from dataclasses import replace
+    from random import Random
+
+    from netsim.model.contracts import IGP, STATIC
+    from netsim.model.routing import BLACKHOLE, Nexthop, Route
+
+    rows = tuple(
+        Route((0xC0000200 + i, 32), 4, client, 1, (Nexthop(special=BLACKHOLE),))
+        for client in (STATIC, IGP)
+        for i in range(12)
+    )
+    net = Network()
+    net.add_device('A')
+    for client in (STATIC, IGP):
+        net['A'].rib_client(client).add_routes(
+            rows[:12] if client == STATIC else rows[12:]
+        )
+    expected = net.fork()
+    rng = Random(29)
+    with net.batch():
+        for _ in range(100):
+            client = rng.choice((STATIC, IGP))
+            candidates = [r for r in rows if r.source == client]
+            selected = tuple(
+                replace(r, metric=rng.randrange(3))
+                for r in rng.choices(candidates, k=rng.randrange(8))
+            )
+            operation = rng.choice(('add_routes', 'delete_routes', 'sync'))
+            payload = (
+                tuple(r.key for r in selected)
+                if operation == 'delete_routes'
+                else selected
+            )
+            for network in (net, expected):
+                getattr(network['A'].rib_client(client), operation)(payload)
+            if snapshot:
+                assert tree_equal(net.state, expected.state)
+    assert tree_equal(net.state, expected.state)
+
+
+def test_repeated_staged_converge_and_later_withdrawal():
+    net = Network()
+    a = net.add_device('A')
+    net.converge()
+    with net.batch():
+        first = a.add_route('192.0.2.1/32', ['blackhole'])
+        net.converge()
+        a.add_route('192.0.2.2/32', ['blackhole'])
+        net.converge()
+        a.rib_client().delete_routes((first.key,))
+    net.converge()
+    assert a.fib(4).lookup(first.prefix[0]) is None
+    assert a.fib(4).lookup(first.prefix[0] + 1) is not None
