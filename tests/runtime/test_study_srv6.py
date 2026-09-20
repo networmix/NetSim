@@ -8,11 +8,11 @@ from netsim.adapters.ngraph import from_scenario
 from netsim.model import srv6 as sr
 from netsim.runtime.failures import FailureSet
 from netsim.study import Study, StudyResult, _policy_rows
-from tests.adapters.test_ngraph_srv6 import scenario
+from tests.adapters.test_ngraph_srv6 import bundle_scenario
 
 
 def network():
-    net, ids, _ = from_scenario(scenario(), srv6=True, capacity_unit=1e6)
+    net, ids, _ = from_scenario(bundle_scenario(), srv6=True, capacity_unit=1e6)
     return net, ids[0]
 
 

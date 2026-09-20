@@ -386,19 +386,13 @@ def _check_supported(td: Any, where: str, *, srv6: bool = False) -> None:
     if policy is not None:
         key = getattr(policy, 'name', policy)
         value = getattr(policy, 'value', policy)
-        pinned_te = (
-            paths
-            and srv6
-            and (
-                key in ('TE_WCMP_UNLIM', 'TE_ECMP_UP_TO_256_LSP', 'TE_ECMP_16_LSP')
-                or value in (3, 4, 5)
+        if (isinstance(key, str) and key.startswith('TE_')) or value in (3, 4, 5):
+            raise ValueError(
+                f'{where}: flow_policy {key!r} is not supported in strict mode: '
+                'TE admission semantics and payload/wire capacity mapping are '
+                'not implemented, including for static_paths'
             )
-        )
-        if (
-            not pinned_te
-            and key not in SUPPORTED_FLOW_POLICIES
-            and value not in SUPPORTED_FLOW_POLICIES
-        ):
+        if key not in SUPPORTED_FLOW_POLICIES and value not in SUPPORTED_FLOW_POLICIES:
             raise ValueError(
                 f'{where}: flow_policy {key!r} is not supported (only shortest-path ECMP)'
             )
@@ -420,8 +414,9 @@ def _populate_demands(
     the sources that can reach a target in each iteration, NetSim keeps each
     source's share fixed (a cut-off source drops its share). With ``strict``
     unsupported options raise. With srv6=True, one explicit pairwise path
-    (including TE presets) becomes a DROP-fallback SR policy; unpinned TE,
-    group modes and capacity-aware multi-path pins remain unsupported."""
+    becomes a DROP-fallback SR policy. TE admission semantics, group modes
+    and capacity-aware multi-path pins remain unsupported. Bundle-member pins
+    need an explicit attrs.netsim.allow_bundle_pins=True approximation opt-in."""
     ids: list[str] = []
     used = _used_ipv4(net)
     for set_name in sorted(demand_sets):
@@ -517,13 +512,20 @@ def _allocate_srv6(net: Network, seed: int) -> None:
 
 
 def _path_interfaces(
-    network: Any, net: Network, path: Any, source: str, target: str
+    network: Any,
+    net: Network,
+    path: Any,
+    source: str,
+    target: str,
+    *,
+    allow_bundle_pins: bool = False,
 ) -> tuple[sr.AdjSeg, ...]:
     """Resolve NetGraph StaticPath nodes/links without importing NetGraph-Core.
 
     Node hops select the cheapest enabled link, then the link id, matching
-    NetGraph's build_static_path_bundles. LAG hops bind the imported bundle.
-    Explicit member-link pins are rejected: a bundle would change their meaning.
+    NetGraph's build_static_path_bundles. Both forms pin a single member.
+    Mapping that member to a LAG changes capacity and failure semantics, so it
+    requires the per-demand attrs.netsim.allow_bundle_pins=True opt-in.
     """
     if isinstance(path, dict):
         if path.keys() - {'nodes', 'links'}:
@@ -573,20 +575,19 @@ def _path_interfaces(
         link = network.links[lid]
         if link.disabled:
             raise ValueError(f'static_paths: disabled link {lid!r}')
-        if links and _attrs(link).get('lag') is not None:
-            raise ValueError(
-                f'static_paths: member-link pin {lid!r} cannot represent a bundle'
-            )
         imported = net.link(net.ngraph_link_ids[lid]).node
         if current not in (imported.a[0], imported.b[0]):
             raise ValueError(f'static_paths: link {lid!r} does not leave {current!r}')
         endpoint = imported.a if imported.a[0] == current else imported.b
         iface = net.device(current)[endpoint[1]].node
-        result.append(
-            sr.AdjSeg(
-                current, getattr(iface.config, 'aggregate_id', None) or endpoint[1]
+        bundle = getattr(iface.config, 'aggregate_id', None)
+        if bundle is not None and not allow_bundle_pins:
+            raise ValueError(
+                f'static_paths: member-link pin {lid!r} selects bundle {bundle!r}; '
+                'set attrs.netsim.allow_bundle_pins=True to opt into bundle '
+                'capacity and failure semantics'
             )
-        )
+        result.append(sr.AdjSeg(current, bundle or endpoint[1]))
         current = imported.other(endpoint)[0]
         if current in visited:
             raise ValueError('static_paths: path must be simple (no repeated nodes)')
@@ -619,8 +620,20 @@ def _pinned_demand(
     source, target = sources[0], targets[0]
     if network.nodes[source].disabled or network.nodes[target].disabled:
         raise ValueError('static_paths: source and target must be enabled')
+    allow_bundle_pins = _attrs(td).get('allow_bundle_pins', False)
+    if type(allow_bundle_pins) is not bool:
+        raise ValueError(
+            'static_paths: attrs.netsim.allow_bundle_pins must be a boolean'
+        )
     segments = (
-        *_path_interfaces(network, net, td.static_paths[0], source, target),
+        *_path_interfaces(
+            network,
+            net,
+            td.static_paths[0],
+            source,
+            target,
+            allow_bundle_pins=allow_bundle_pins,
+        ),
         sr.TermSeg(target),
     )
     endpoint = net.device(target)['lo0'].node.config.ipv6[0][0]
