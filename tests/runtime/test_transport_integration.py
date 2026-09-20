@@ -654,3 +654,25 @@ def test_reset_at_old_timeout_deadline_wins_over_late_incarnation_event():
     sim.run_until(0.625)
     assert sim.state.transport.connections[1].reason == c.RESET
     assert [(e.connection, e.reason) for e in down(sim, 'R2')] == [(1, c.RESET)]
+
+
+@pytest.mark.parametrize('operation', ['send', 'close', 'abort'])
+def test_reset_dispatch_rejects_peer_operations_before_transport_cleanup(operation):
+    output = (
+        send_output('same round')
+        if operation == 'send'
+        else c.AgentOutput(sessions=(c.SessionOp(operation, connection=1),))
+    )
+    sim = session(b_actions=(('operate', output),))
+    sim.run_until(0.125)
+    sim.reset_agent('R1', 'wire')
+    assert sim.state.transport.connections[1].state == c.ESTABLISHED
+    # Peer AGENT publication precedes TRANSPORT's deferred DOWN/RESET. Its
+    # old connection can no longer accept operations or replace RESET.
+    command(sim, 'operate', 'R2')
+    assert [(e.connection, e.reason) for e in down(sim, 'R2')] == [(1, c.RESET)]
+    (rejection,) = observed(sim, 'R2', c.Rejection)
+    assert rejection.reason == 'NOT_ESTABLISHED'
+    assert rejection.generation == sim.agents.generation('R2', 'wire')
+    sim.run_until(0.5)
+    assert not observed(sim, 'R1', c.Delivery)

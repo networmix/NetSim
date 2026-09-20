@@ -723,7 +723,14 @@ class TransportRuntime:
         assert op.connection is not None
         conn = transport.connections.get(op.connection)
         direction = self._direction(conn, device, agent, generation)
-        if conn is None or direction is None or conn.state == c.DOWN:
+        # Reset dispatch retires the runtime immediately; the immutable
+        # connection may await DOWN/RESET in the later TRANSPORT band.
+        if (
+            conn is None
+            or direction is None
+            or conn.state == c.DOWN
+            or conn.id not in self._sessions
+        ):
             return self._reject(
                 device, agent, generation, 'NOT_ESTABLISHED', connection=op.connection
             )
@@ -964,6 +971,7 @@ class TransportRuntime:
             or conn.state != c.ESTABLISHED
             or conn.draining
             or side is None
+            or conn.id not in self._sessions
         ):
             return self._reject(
                 device,
