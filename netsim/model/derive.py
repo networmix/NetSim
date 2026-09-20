@@ -709,6 +709,10 @@ class DeviceContext:
     def interface_exists(self, name: str) -> bool:
         return name in self.dev.interfaces
 
+    def interface_generation(self, name: str) -> int | None:
+        node = self.dev.interfaces.get(name)
+        return node.generation if node is not None else None
+
     def l3_usable(self, name: str, af: int) -> bool:
         node = self.dev.interfaces.get(name)
         return node is not None and l3_usable(node, af)
@@ -728,6 +732,8 @@ class DeviceContext:
 def derive_fib(
     state: NetworkState, targets: Iterable[tuple[str, int]] | None = None
 ) -> NetworkState:
+    from netsim.model import nht
+
     if targets is None:
         targets = [(d, af) for d, _ in state.devices.sorted_items() for af in AFS]
     targets = tuple(sorted(targets))
@@ -751,7 +757,10 @@ def derive_fib(
             and prev_outcome is not None
             and prev_outcome.processed_epoch == epoch
         ):
-            continue  # inputs unchanged since the last resolution: nothing to do
+            if dev.nht is not None and dev.nht.registrations:
+                refreshed = nht.refresh(_with_device(state, device, dev), device, af)
+                devices.set(device, refreshed.devices[device])
+            continue  # inputs unchanged; new registrations may still need answers
         if device in validated:
             dev = dataclasses.replace(dev, srv6_policies=validated[device])
         ctx = DeviceContext(_with_device(state, device, dev), device)
@@ -798,6 +807,9 @@ def derive_fib(
             new_dev = dataclasses.replace(
                 new_dev, srv6_policies=canon(dev.srv6_policies, table)
             )
+        if new_dev.nht is not None and new_dev.nht.registrations:
+            refreshed = nht.refresh(_with_device(state, device, new_dev), device, af)
+            new_dev = refreshed.devices[device]
         if new_dev != devices[device]:
             devices.set(device, new_dev)
     new_devices = devices.build()
@@ -825,10 +837,13 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
     if consumer_index is not new.srv6_consumers:
         new = dataclasses.replace(new, srv6_consumers=consumer_index)
     devices = new.devices.builder()
+    refresh_nht: list[str] = []
     changes = diff_pmap(old.devices, new.devices, by_identity=True)
     consumers = srv6.consumers_affected(old, new)
     for name in sorted(set(changes.added + changes.changed) | consumers):
         dev = new.devices[name]
+        if dev.config.srdb_source is not None:
+            srv6.agent_srdb_view(dev)
         index = _interface_index(dev)
         if index is not dev.interface_index:
             dev = dataclasses.replace(dev, interface_index=index)
@@ -864,6 +879,8 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
                 epochs = epochs.set(af, old_epoch + 1)
         if epochs is not dev.resolver_input_epoch:
             devices.set(name, dataclasses.replace(dev, resolver_input_epoch=epochs))
+            if dev.nht is not None and dev.nht.registrations:
+                refresh_nht.append(name)
     built = devices.build()
     result = new if built is new.devices else dataclasses.replace(new, devices=built)
     # Validation is observable immediately; the FIB kind alone programs actions.
@@ -882,11 +899,16 @@ def bump_epochs(old: NetworkState, new: NetworkState) -> NetworkState:
         if table is not dev.srv6_policies:
             updates.set(name, dataclasses.replace(dev, srv6_policies=table))
     built = updates.build()
-    return (
-        result
-        if built is result.devices
-        else dataclasses.replace(result, devices=built)
-    )
+    if built is not result.devices:
+        result = dataclasses.replace(result, devices=built)
+    # NHT observes RIB inputs immediately even when FIB programming is delayed.
+    # A change confined to nht never enters all_changed/any_rib_changed above.
+    if refresh_nht:
+        from netsim.model import nht
+
+        for name in refresh_nht:
+            result = nht.refresh(result, name)
+    return result
 
 
 # ---------------------------------------------------------------------------
