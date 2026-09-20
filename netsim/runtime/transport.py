@@ -562,7 +562,7 @@ class TransportRuntime:
             cid = next(iter(self._closed_ready))
             del self._closed_ready[cid]
             self._compact_ids.add(cid)
-            pending.add(cid)
+            pending.add(('compact', cid))
         if pending:
             self.sim.pipeline.mark(self._kind, pending, self.sim.env.now)
 
@@ -760,6 +760,14 @@ class TransportRuntime:
         if transport is None:
             return state
         connections = transport.connections
+        # Compaction is an explicit derivation input, not a mutable flag
+        # consulted while deriving ordinary connection reachability.
+        for cid in sorted(
+            e[1] for e in entities if isinstance(e, tuple) and e[0] == 'compact'
+        ):
+            old = connections.get(cid)
+            if old is not None and old.state == c.DOWN:
+                connections = connections.remove(cid)
         ids = (
             sorted(connections)
             if '*' in entities
@@ -768,12 +776,10 @@ class TransportRuntime:
         for cid in ids:
             old = connections.get(cid)
             if old is not None:
-                if old.state == c.DOWN and cid in self._compact_ids:
-                    connections = connections.remove(cid)
-                    continue
                 new = self._derive(state, old)
                 if new is not old:
                     connections = connections.set(cid, new)
+        self._index(transport)
         listeners = transport.listeners
         keys = set(listeners) if '*' in entities or 0 in entities else set()
         for entity in entities:

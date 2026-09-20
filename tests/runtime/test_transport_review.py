@@ -396,3 +396,24 @@ def test_data_drop_is_counted_even_when_sender_control_allowance_is_exhausted():
     assert sim.transport.budget()['inflight_datagrams'] == 0
     assert sim.transport.budget()['datagrams_dropped'] == 1
     assert sim.transport.budget()['inbox_rejections'] == 2
+
+
+def test_listener_cleanup_uses_the_supplied_snapshot():
+    from netsim.runtime.transport import _key
+    from tests.runtime.test_transport_integration import local
+
+    sim = session()
+    original = sim.state
+    ep = local(sim.network, 'R1', 'e1')
+    node = original.devices['R1'].interfaces['e1']
+    obsolete = c.Listener('R1', 'wire', ep, -1, 'e1', node.generation)
+    snapshot = replace(
+        original,
+        transport=replace(
+            original.transport,
+            listeners=original.transport.listeners.set(_key('R1', ep), obsolete),
+        ),
+    )
+    derived = sim.transport.kind().run(snapshot, 0, [('listeners', 'R1')])
+    assert _key('R1', ep) not in derived.transport.listeners
+    assert sim.state is original
