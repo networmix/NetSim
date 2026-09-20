@@ -95,6 +95,40 @@ class TestOperationRecords:
         with pytest.raises(TypeError):
             AgentOutput(srdb_view=[1])
         with pytest.raises(TypeError):
+            AgentOutput(srdb_view='invalid')  # only a typed view or None
+        assert AgentOutput(srdb_view=c.SrDbView()).srdb_view.version == 0
+        # A nested mutable value is the runtime's admission check (transitive
+        # validation once per newly admitted state), not the record's.
+        assert AgentOutput(state=([1],)).state == ([1],)
+
+    def test_stats_entries_are_name_number_pairs(self):
+        for bad in ((('bad-shape',),), (('x', 'y'),), (('x', True),), ('x',)):
+            with pytest.raises(TypeError):
+                AgentOutput(stats=bad)
+        assert AgentOutput(stats=(('runs', 1), ('bytes', 2.5))).stats[1] == (
+            'bytes',
+            2.5,
+        )
+
+    def test_agent_node_compares_opaque_values_by_identity(self):
+        calls = []
+
+        class Opaque:
+            __netsim_immutable__ = True
+
+            def __eq__(self, other):
+                calls.append(1)
+                return True
+
+            __hash__ = object.__hash__
+
+        a = AgentNode('x', 1, REF, state=Opaque())
+        same = dataclasses.replace(a)
+        fresh = dataclasses.replace(a, state=Opaque())
+        assert a == same and a != fresh
+        assert calls == []  # the plugin's __eq__ is never consulted
+        assert dataclasses.replace(a, runs=1) != a
+        with pytest.raises(TypeError):
             Datagram('eth1', payload=[1, 2])
         with pytest.raises(TypeError):
             c.Message(1, payload=bytearray(b'x'))

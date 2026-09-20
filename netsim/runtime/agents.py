@@ -505,7 +505,6 @@ class AgentRuntime:
                     node.generation,
                     counters.get('messages', 0),
                     counters.get('bytes', 0),
-                    conn.a_to_b_reachable if a else conn.b_to_a_reachable,
                 )
         rng = random.Random()
         if node.rng is None:

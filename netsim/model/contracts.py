@@ -208,6 +208,29 @@ class AgentNode:
     runs: int = 0
     """Published runs of this generation."""
 
+    def __eq__(self, other: object) -> bool:
+        """Opaque values compare by identity, never structurally: a plugin's
+        ``__eq__`` is never consulted by the tree, and a fresh equal-valued
+        state is a change (identity is the canonicalization contract)."""
+        if other is self:
+            return True
+        if not isinstance(other, AgentNode):
+            return NotImplemented
+        return (
+            self.state is other.state
+            and self.srdb_view is other.srdb_view
+            and self.name == other.name
+            and self.generation == other.generation
+            and self.client == other.client
+            and self.config == other.config
+            and self.rng == other.rng
+            and self.initialized == other.initialized
+            and self.receipt == other.receipt
+            and self.runs == other.runs
+        )
+
+    __hash__ = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Context projections (what an agent may see of its device)
@@ -309,7 +332,12 @@ class SidResultView:
 
 @record
 class ConnectionView:
-    """The agent-visible state of one of its connections."""
+    """The agent-visible state of one of its connections.
+
+    Path reachability (derived by the TRANSPORT kind from global forwarding)
+    is deliberately absent: an agent learns about a broken path only through
+    session events and timeouts, never ahead of detection.
+    """
 
     id: int
     state: str
@@ -322,8 +350,6 @@ class ConnectionView:
     """Local endpoint incarnation; late events of an older one are no-ops."""
     queued_messages: int = 0
     queued_bytes: int = 0
-    reachable: bool = True
-    """Path reachability derived by the TRANSPORT kind, separate from state."""
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +448,37 @@ class Rejection:
 
 
 InboxEntry = Delivery | TimerFired | SessionEvent | Rejection
+
+
+# ---------------------------------------------------------------------------
+# SR-DB view advertised by an agent (policy validation with srdb_source)
+# ---------------------------------------------------------------------------
+
+
+@record
+class RemoteSid:
+    """A claim about a SID learned by protocol, never read from the oracle."""
+
+    sid: int
+    length: int
+    behavior: int
+    flavors: int = 0
+    structure: Any = None
+    owner: str | None = None
+    """Router id or advertised node name of the SID's owner."""
+    adjacency_up: bool = True
+    peer: str | None = None
+    """For adjacency SIDs: the advertised peer identity."""
+    interface: str | None = None
+    """Advertised interface name for symbolic AdjSeg resolution."""
+
+
+@record
+class SrDbView:
+    sids: tuple[RemoteSid, ...] = ()
+    locators: tuple[tuple[str, tuple[int, int]], ...] = ()
+    """``(owner, prefix)`` pairs."""
+    version: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +667,9 @@ class TimerOp:
             _check_duration('delay', self.delay, positive=True)
 
 
+_MUTABLE_TOP = (list, dict, set, bytearray, memoryview)
+
+
 @record
 class AgentOutput:
     """What one run returns. ``state`` and ``srdb_view`` are the new values
@@ -633,8 +693,22 @@ class AgentOutput:
         families = [op.af for op in self.route_ops]
         if len(families) != len(set(families)):
             raise ValueError('at most one RouteOp per address family')
-        validate_immutable(self.state, 'AgentOutput.state')
-        validate_immutable(self.srdb_view, 'AgentOutput.srdb_view')
+        # The state is opaque and may be large: only a mutable container at
+        # the top is rejected here; the runtime validates a newly admitted
+        # state transitively once (a state returned by identity is trusted).
+        if isinstance(self.state, _MUTABLE_TOP):
+            raise TypeError(f'mutable {type(self.state).__name__} as agent state')
+        if self.srdb_view is not None and not isinstance(self.srdb_view, SrDbView):
+            raise TypeError('srdb_view must be an SrDbView or None')
+        for entry in self.stats:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or isinstance(entry[1], bool)
+                or not isinstance(entry[1], (int, float))
+            ):
+                raise TypeError(f'stats entries are (name, number): {entry!r}')
 
     def is_noop(self) -> bool:
         return not (
@@ -746,37 +820,6 @@ class TransportState:
     """Keyed by ``(device, af, address, scope, port)``."""
     connections: PMap[int, ConnectionState] = field(default_factory=empty_pmap)
     next_connection: int = 1
-    version: int = 0
-
-
-# ---------------------------------------------------------------------------
-# SR-DB view advertised by an agent (policy validation with srdb_source)
-# ---------------------------------------------------------------------------
-
-
-@record
-class RemoteSid:
-    """A claim about a SID learned by protocol, never read from the oracle."""
-
-    sid: int
-    length: int
-    behavior: int
-    flavors: int = 0
-    structure: Any = None
-    owner: str | None = None
-    """Router id or advertised node name of the SID's owner."""
-    adjacency_up: bool = True
-    peer: str | None = None
-    """For adjacency SIDs: the advertised peer identity."""
-    interface: str | None = None
-    """Advertised interface name for symbolic AdjSeg resolution."""
-
-
-@record
-class SrDbView:
-    sids: tuple[RemoteSid, ...] = ()
-    locators: tuple[tuple[str, tuple[int, int]], ...] = ()
-    """``(owner, prefix)`` pairs."""
     version: int = 0
 
 
