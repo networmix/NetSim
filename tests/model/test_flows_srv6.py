@@ -33,7 +33,13 @@ def test_every_template_field_separates_classes():
     template = PacketTemplate(4, 1, 2)
     demand = flows.Demand('d', 'R1', 2, 4, 100e6, template=template)
     for field in fields(template):
-        changed = replace(template, **{field.name: getattr(template, field.name) + 1})
+        if field.name == 'srh':
+            value = SRH((3,), 0, 0)
+        elif field.name == 'inner':
+            value = PacketTemplate(4, 2, 3)
+        else:
+            value = getattr(template, field.name) + 1
+        changed = replace(template, **{field.name: value})
         assert replace(demand, template=changed).class_key != demand.class_key, (
             field.name
         )

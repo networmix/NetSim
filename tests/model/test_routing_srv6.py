@@ -5,13 +5,11 @@ from dataclasses import replace
 import pytest
 
 from netsim.model import forwarding as fw
-from netsim.model.contracts import ClientId, ClientProfile
 from netsim.model.derive import DeviceContext
 from netsim.model.routing import (
     SRV6_LOCAL_NH,
     Nexthop,
     ResolutionPolicy,
-    Route,
     resolve_fib,
 )
 from netsim.model.srv6 import (
@@ -181,12 +179,7 @@ def test_srv6_rebuild_reuses_unchanged_fibs():
 
 def test_unknown_local_cover_maps_to_sid_unknown_only_for_srv6_client():
     net, routers, _ = path_network(compressed=True)
-    client = ClientId('srv6-local')
-    net.register_client(ClientProfile(client, 1))
-    cover = Route(
-        (address('5f00:0:e000::'), 35), 6, client, 1, (Nexthop.unreachable(),)
-    )
-    routers['R2'].rib_client(client, 6).add_routes((cover,))
+    routers['R2'].add_locator('sr', structure=F3216_GIB)
     net.converge()
     from tests.model.test_forwarding_srv6 import outer_packet
 

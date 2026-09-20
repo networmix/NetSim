@@ -714,3 +714,108 @@ def test_sr_member_unavailable_precedes_mtu_without_changing_plain_ip(monkeypatc
     assert fw.forward_ip(view, p, None, ORIGINATED).reason == fw.EGRESS_DOWN
     plain = replace(p, dst=address('10.99.0.1'))
     assert fw.forward_ip(view, plain, None, ORIGINATED).reason == fw.MTU_EXCEEDED
+
+
+def srdb_path_network(*, compressed):
+    """Use G1's public SR-DB API to produce the same acceptance path."""
+    from netsim.model.contracts import STATIC
+
+    net, routers, encap = path_network(compressed=compressed)
+    for name, router in routers.items():
+        rows = tuple(
+            row
+            for row in router.rib(6).rows_of(STATIC)
+            if row.nexthops[0].special == SRV6_LOCAL_NH
+        )
+        if not rows:
+            continue
+        router.rib_client(STATIC, 6).delete_routes(row.key for row in rows)
+        if compressed:
+            router.add_locator('sr', structure=F3216_GIB, node_id=int(name[1:]))
+        else:
+            sid = rows[0].nexthops[0].behavior
+            router.add_locator(
+                'sr', f'{IPv6Address(sid.sid >> 64 << 64)}/64', structure=sid.structure
+            )
+        for row in rows:
+            sid = row.nexthops[0].behavior
+            router.add_local_sid(
+                sid.behavior,
+                structure=sid.structure,
+                flavors=sid.flavors,
+                sid=sid.sid,
+                interface=sid.interface,
+                nexthop=sid.nexthop,
+            )
+    net.converge()
+    return net, routers, encap
+
+
+@pytest.mark.parametrize('compressed', [False, True])
+@pytest.mark.parametrize('af', [4, 6])
+def test_public_srdb_rows_drive_trace_and_timed_send(compressed, af):
+    from netsim.model.contracts import SRV6_LOCAL
+
+    net, routers, encap = srdb_path_network(compressed=compressed)
+    assert net.validate() == []
+    for router in routers.values():
+        if router.node.srv6_sids is None:
+            continue
+        for row in router.rib(6).rows_of(SRV6_LOCAL):
+            entry = router.fib(6).lookup(row.prefix[0])
+            if row.distinguisher == ('unknown',):
+                assert row.nexthops[0] == Nexthop.unreachable()
+            else:
+                assert entry.action == fw.SRV6_LOCAL
+                assert entry.sid == row.nexthops[0].behavior
+                assert entry.prefix[1] == entry.sid.structure.installed_length
+    packet = inner_packet(af)
+    result = net.trace('R1', packet)
+    assert result.outcome == fw.DELIVER and result.path == ('R1', 'R2', 'R4')
+    assert [hop.packet.hop_limit for hop in result.hops[:2]] == (
+        [63, 62] if compressed else [64, 63]
+    )
+    assert result == interpreted_trace(net, packet, encap)
+    sim = Simulation(Environment(), net)
+    proc = sim.send('R1', packet)
+    sim.env.run()
+    assert proc.value == result
+
+
+def test_public_srdb_withdrawal_keeps_unknown_cover_and_restore_recovers():
+    net, routers, _ = srdb_path_network(compressed=True)
+    sid = address('5f00:0:e002::')
+    link = net.links['R2:toR4--R4:toR2']
+    link.fail()
+    net.converge()
+    assert not routers['R2'].node.srv6_sids.sids[sid].adjacency_up
+    result = net.trace('R1', inner_packet())
+    assert (result.path, result.reason) == (('R1', 'R2'), 'SID_UNKNOWN')
+    link.restore()
+    net.converge()
+    assert routers['R2'].node.srv6_sids.sids[sid].adjacency_up
+    assert net.trace('R1', inner_packet()).outcome == fw.DELIVER
+
+
+@pytest.mark.parametrize('compressed,wire', [(False, 109.8e6), (True, 107.4e6)])
+def test_public_srdb_hash_placement_uses_actual_transmitted_headers(compressed, wire):
+    from netsim.model import flows
+
+    net, _, _ = srdb_path_network(compressed=compressed)
+    net.add_demand(
+        'sr',
+        'R1',
+        '10.0.0.4',
+        100e6,
+        mode=flows.HASH,
+        flows=32,
+        template=PacketTemplate(4, address('10.0.0.1'), address('10.0.0.4')),
+    )
+    net.converge()
+    report = net.placement
+    assert report.delivered_total == pytest.approx(100e6)
+    for link_id, device in (('R1:toR2--R2:toR1', 'R1'), ('R2:toR4--R4:toR2', 'R2')):
+        edge = net.links[link_id].edge(device)
+        assert report.offered[edge] == pytest.approx(wire)
+        assert report.carried[edge] == pytest.approx(wire)
+    assert not report.dropped_by_reason
