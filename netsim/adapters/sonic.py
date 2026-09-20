@@ -554,6 +554,19 @@ def _encode(net: Network) -> dict[str, Any]:
     devices: dict[str, Any] = {}
     meta = getattr(net, 'netsim_sonic', {})
     for name, dev in net.state.devices.sorted_items():
+        # Version 1 has no table for these forwarding-relevant device settings.
+        # Check the live tree before restoring source spelling or writing a file.
+        for field, default in (
+            ('enabled', True),
+            ('srv6_hop_limit', 64),
+            ('srv6_source', None),
+        ):
+            value = getattr(dev.config, field)
+            if value != default:
+                raise SchemaError(
+                    f'$.devices.{name}: unsupported device setting {field}={value!r}; '
+                    f'version 1 requires {default!r}'
+                )
         tables: dict[str, dict[str, Any]] = {
             key: {}
             for key in (

@@ -358,8 +358,11 @@ composite prefixes. Dump reads current model configuration; changed rows are
 serialized from that configuration. Import spelling/list metadata is copied
 on fork. Configurations with native features outside this subset (such as
 bundles, unnumbered interfaces or symbolic segments) cannot be dumped through
-this adapter. APPL_DB output is keyed by device, then `SRV6_SID_LIST_TABLE`,
-then list name, with comma-separated **forwarding-order** wire SIDs. Explicit
+this adapter. Version 1 also requires device `enabled=True`,
+`srv6_hop_limit=64`, and `srv6_source=None`; export rejects other values with
+the device and field in the error before writing any output. Restoring these
+defaults makes the device exportable again. APPL_DB output is keyed by device,
+then `SRV6_SID_LIST_TABLE`, then list name, with comma-separated **forwarding-order** wire SIDs. Explicit
 list metadata enables compression; addresses without metadata stay literal.
 APPL_DB export does not certify policy reachability or installation.
 
@@ -369,14 +372,25 @@ one F3216 GIB locator, uN and terminal uDT46 per device. GIB allocation uses a
 gets one uA, with bundles represented by their PortChannel. A pairwise demand
 with exactly one explicit `StaticPath(nodes=...)` or `StaticPath(links=...)`
 becomes one candidate containing an `AdjSeg` for every hop and a target
-`TermSeg`; `Demand.steer` selects it and fallback is DROP. The `TE_WCMP_UNLIM`,
-`TE_ECMP_UP_TO_256_LSP`, and `TE_ECMP_16_LSP` presets are accepted with that
-pin. Node hops choose the cheapest enabled link, breaking ties by link ID;
-explicit member-link pins into bundles are rejected. Multi-route pins,
-unpinned TE, non-pairwise pins, broad selectors, loops and disconnected hops
-are rejected in the strict subset. `strict=False` retains the legacy opt-out
-for other demand options; explicit paths translated with SR still validate.
-`NetSimStudy` accepts the same `srv6: true` setting.
+`TermSeg`; `Demand.steer` selects it and fallback is DROP. Strict mode rejects
+`TE_WCMP_UNLIM`, `TE_ECMP_UP_TO_256_LSP`, and `TE_ECMP_16_LSP`, even with a pin:
+the adapter does not reproduce their capacity admission or translate payload
+capacity into wire capacity. For example, Core admits 100 on a 100-capacity
+pin offered 200; NetSim's default UNCONSTRAINED model delivers 200. The legacy
+`strict=False` escape hatch accepts the routing translation without promising
+Core admission semantics; it does not change the capacity model.
+
+Node hops choose the cheapest enabled link, breaking ties by link ID. Both
+node-form and link-form paths pin that individual link in Core. If its imported
+interface is a bundle member, NetSim rejects the pin, including under
+`strict=False`. To deliberately approximate it with the whole bundle, set
+`TrafficDemand.attrs={"netsim": {"allow_bundle_pins": True}}`. This boolean
+opt-in applies to both path forms and is also honored by `demands_from` and
+`NetSimStudy`; it does not enable TE presets in strict mode. The approximation
+shares traffic across members and can survive failure of the selected member
+when `min_links` remains satisfied, whereas the Core pin drops. Multi-route
+pins, non-pairwise pins, broad selectors, loops and disconnected hops remain
+unsupported. `NetSimStudy` accepts the same `srv6: true` setting.
 
 Study results expose each failure snapshot's `data.netsim.policies` and a
 step-level `data.netsim.policy_iterations` list in `to_ngraph()`. Each policy
