@@ -16,7 +16,7 @@ from fractions import Fraction
 from math import lcm
 from typing import Any, Iterator, Protocol
 
-from netsim.model.addressing import IPV4, IPV6, mask_for
+from netsim.model.addressing import IPV4, IPV6, MacAddress, is_link_local_v6, mask_for
 from netsim.model.contracts import CONNECTED, LOCAL, ClientId, ClientProfile
 from netsim.model.forwarding import (
     CROSS_CONNECT,
@@ -627,6 +627,18 @@ class _Resolver:
                     return ()
                 return (_Leg(nh.interface, None, mac, Fraction(1)),)
             mac = ctx.neighbor_mac(nh.interface, nh.address)
+            if (
+                mac is None
+                and af == IPV4
+                and nh.af == IPV6
+                and is_link_local_v6(nh.address)
+            ):
+                # RFC 8950 on IPv4-only links: L3 already exposes the scoped
+                # physical peer MAC, even without IPv6 forwarding/ND entries.
+                # Only that peer's exact EUI-64 identity may resolve this way.
+                peer = ctx.peer_mac(nh.interface)
+                if peer is not None and MacAddress(peer).link_local_int() == nh.address:
+                    mac = peer
             if mac is None:
                 return ()
             return (_Leg(nh.interface, nh.address, mac, Fraction(1), af=nh.af or af),)

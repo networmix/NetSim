@@ -151,6 +151,10 @@ class _AgentKind(Kind):
 class AgentRuntime:
     def __init__(self, sim: Simulation) -> None:
         self.sim = sim
+        self.active: tuple[str, str] | None = None
+        """The (device, agent) executing a plugin callback, else None.
+        Projection construction and output publication are outside this scope;
+        locality harnesses can guard model access during the callback only."""
         self.subscriptions = SubscriptionIndex()
         self._live: dict[tuple[str, str], int] = {}
         self._inboxes: dict[tuple[str, str, int], deque[c.InboxEntry]] = {}
@@ -678,9 +682,14 @@ class AgentRuntime:
             try:
                 ctx = self._context(state, device, name, node, capture, now)
                 plugin = self.sim.network.agents[device, name]
-                output = c.check_output(
-                    plugin.on_run(ctx) if node.initialized else plugin.on_init(ctx)
-                )
+                self.active = device, name
+                try:
+                    output = (
+                        plugin.on_run(ctx) if node.initialized else plugin.on_init(ctx)
+                    )
+                finally:
+                    self.active = None
+                output = c.check_output(output)
                 validate_immutable(output, 'AgentOutput')
                 for timer in output.timers:
                     if timer.delay is not None:
