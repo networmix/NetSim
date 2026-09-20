@@ -1643,16 +1643,29 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                 if reason:
                     reasons.append((pi, li, reason))
                     continue
-                wire = compress(encoded)
-                reachable, deps = resolve_first_entry(
-                    DeviceContext(state, device), settings, Srv6Encap(wire)
-                )
-                for af, address in deps.lookups:
-                    validator.query(device, 'first-lookup', (af, address), reachable)
-                for prefix in deps.prefixes:
-                    validator.query(device, 'prefix', prefix, 'QUERIED')
-                for interface in deps.interfaces:
-                    validator.query(device, 'interface', interface, 'QUERIED')
+                try:
+                    wire = compress(encoded)
+                    reachable, deps = resolve_first_entry(
+                        DeviceContext(state, device), settings, Srv6Encap(wire)
+                    )
+                    for af, address in deps.lookups:
+                        validator.query(
+                            device, 'first-lookup', (af, address), reachable
+                        )
+                    for prefix in deps.prefixes:
+                        validator.query(device, 'prefix', prefix, 'QUERIED')
+                    for interface in deps.interfaces:
+                        validator.query(device, 'interface', interface, 'QUERIED')
+                    strict_reason = validator.strict(
+                        segment_list.segments, wire, policy
+                    )
+                except ValueError as error:
+                    # Packet validation uses ValueError(reason), e.g. an SRH
+                    # beyond RFC 8754 §2's Hdr Ext Len limit. Invalid wire
+                    # programs reject this list even with strict checks off;
+                    # they must not abort publication of unrelated tree edits.
+                    reasons.append((pi, li, f'ENCAP_INVALID: {error}'))
+                    continue
                 if reachable:
                     first.append((pi, li))
                     # RFC 9256 §5.1: first-SID path resolution is mandatory
@@ -1660,7 +1673,6 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                     basic.append((pi, li))
                 else:
                     reasons.append((pi, li, FIRST_SID_UNRESOLVABLE))
-                strict_reason = validator.strict(segment_list.segments, wire, policy)
                 if strict_reason:
                     reasons.append((pi, li, strict_reason))
                 else:

@@ -5,6 +5,7 @@ from ipaddress import IPv6Address
 
 import pytest
 
+from netsim.model import flows
 from netsim.model import forwarding as fw
 from netsim.model import srv6 as sr
 from netsim.model.contracts import STATIC
@@ -88,6 +89,107 @@ def unmatched_steering(dev):
     p = sr.SrPolicy(STATIC, 99, A('2001:db8::dead'))
     dev.policy_client().add(p)
     dev.policy_client().set_steering([sr.SteeringRule('unmatched', p.key, dscp=63)])
+
+
+@pytest.mark.parametrize('future', [False, True])
+@pytest.mark.parametrize('strict', [False, True])
+def test_oversized_list_is_invalid_without_aborting_publication(future, strict):
+    net, routers = diamond(compressed=False)
+    routers['R1'].configure(
+        resolution_policy=ResolutionPolicy(validate_all_sids=strict)
+    )
+    good = sr.SegmentList((sr.TermSeg('R4'),))
+    bad = sr.SegmentList(
+        (sr.NodeSeg('future' if future else 'R2'),) * 128 + (sr.TermSeg('R4'),)
+    )
+    p = policy(routers, lists=(good, bad))
+    net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
+    net.converge()
+    if future:
+        assert (0, 1, sr.SYMBOLIC_UNRESOLVABLE) in state_of(routers, p).reasons
+        dev = net.add_device('future')
+        dev.add_loopback('lo', ipv6=['2001:db8::99/128'])
+        dev.add_locator('sr', prefix='2001:db8:99::/64')
+        # Resolving the previously missing symbol must not roll back its SID.
+        sid = dev.add_local_sid(sr.END, structure=sr.UNCOMPRESSED)
+        assert sid.sid in dev.node.srv6_sids.sids
+        net.converge()
+    status = state_of(routers, p)
+    assert status.status == sr.POLICY_UP
+    assert status.basic_valid == status.first_valid == status.strict_valid == ((0, 0),)
+    assert len(status.valid_lists) == 1 and status.valid_lists[0][:2] == (0, 0)
+    assert (0, 1, 'ENCAP_INVALID: SRH_MALFORMED') in status.reasons
+    assert any(d[-1] == 'ENCAP_INVALID: SRH_MALFORMED' for d in status.dependencies)
+    assert net.placement.delivered_total == 100e6
+    routers['R3'].add_loopback('unrelated', ipv4=['192.0.2.1/32'])
+    net.converge()
+    assert 'unrelated' in routers['R3'].node.interfaces
+    assert net.placement.delivered_total == 100e6
+    root = net.state
+    net.converge()
+    assert net.state is root
+
+
+@pytest.mark.parametrize('af', [4, 6])
+@pytest.mark.parametrize('interpreted', [False, True])
+@pytest.mark.parametrize('encap', [False, True])
+def test_fluid_fanin_shares_source_independent_tail(
+    monkeypatch, af, interpreted, encap
+):
+    # S distinct source loopbacks feed one L-node tail. Each shared forwarding
+    # state is expanded once, even when an unmatched rule invokes the interpreter.
+    net = Network()
+    sources, length = 64, 64
+    src = [net.add_device(f's{i:02}') for i in range(sources)]
+    tail = [net.add_device(f't{i:02}') for i in range(length)]
+    for i, dev in enumerate(src + tail, 1):
+        dev.add_loopback('lo', ipv4=[f'10.0.0.{i}/32'], ipv6=[f'2001:db8::{i:x}/128'])
+    dst = '10.0.0.128' if af == 4 else '2001:db8::80'
+    prefix = f'{dst}/{32 if af == 4 else 128}'
+    sid = None
+    if encap:
+        tail[-1].add_locator('sr', prefix='2001:db8:100::/64')
+        sid = tail[-1].add_local_sid(sr.END_DT46, structure=sr.UNCOMPRESSED)
+    ingress, shared = [], []
+    for dev, peer in [(d, tail[0]) for d in src] + list(
+        zip(tail, tail[1:], strict=False)
+    ):
+        link = net.add_p2p(dev, 'out', peer, dev.name, unnumbered=True, speed=1e9)
+        (ingress if dev.name.startswith('s') else shared).append(link.edge(dev.name))
+        nh = (
+            Nexthop(srv6=sr.Srv6Encap((sid.sid,)))
+            if sid and dev in src
+            else Nexthop.via('out')
+        )
+        dev.add_route(prefix, [nh])
+        if sid:
+            dev.add_route(f'{IPv6Address(sid.sid)}/128', [Nexthop.via('out')])
+    if interpreted:
+        unmatched_steering(tail[length // 2])
+    for dev in src:
+        net.add_demand(dev.name, dev.name, dst, 1e6)
+    net.converge()
+    original = flows._forward_edges
+    expanded = []
+
+    def count(*args, **kw):
+        expanded.append(args[1])
+        return original(*args, **kw)
+
+    monkeypatch.setattr(flows, '_forward_edges', count)
+    report = flows.derive_placement(replace(net.state, placement=None)).placement
+    assert report.delivered_total == sources * 1e6
+    factor = (1000 + 14 + (20 if af == 4 else 40) + (40 if encap else 0)) / 1000
+    assert [report.offered[e] for e in ingress] == pytest.approx(
+        [1e6 * factor] * sources
+    )
+    assert [report.offered[e] for e in shared] == pytest.approx(
+        [sources * 1e6 * factor] * (length - 1)
+    )
+    assert report.offered == report.carried
+    assert len(expanded) == sources + length
+    result = next(iter(report.classes.values()))
+    assert len(result.transmissions) == sources + length - 1
 
 
 @pytest.mark.parametrize('device', ['A', 'B', 'D'])
