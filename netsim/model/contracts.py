@@ -53,6 +53,8 @@ class ClientProfile:
     protocol_origin: int = 30
     """RFC 9256 §2.6: configuration/CLI 30, BGP SR-TE 20, PCEP 10."""
     originator: tuple[int, int] = (0, 0)
+    link_state: bool = False
+    """This client's route metrics are IGP costs usable by NHT."""
 
 
 STATIC = ClientId('static', 0)
@@ -645,6 +647,9 @@ class NhtResult:
 
     eligible: bool
     input_epoch: int
+    """Epoch that produced this semantic answer. A registration may reuse it
+    after an equivalent refresh; NhtTable.input_epochs tracks the latest check.
+    A direct nht.resolve query always carries its caller's current epoch."""
     via_prefix: tuple[int, int] | None = None
     via_source: ClientId | None = None
     cost: int | None = None
@@ -656,6 +661,8 @@ class NhtResult:
     queries: tuple[tuple[int, int, bool], ...] = ()
     """``(af, address, found)`` lookups performed, failed ones included."""
     reason: str | None = None
+    interfaces: tuple[str, ...] = ()
+    """Consulted interfaces, including failed adjacency resolution."""
 
 
 @record
@@ -664,6 +671,9 @@ class NhtTable:
 
     registrations: PMap[NhtKey, NhtResult | None] = field(default_factory=empty_pmap)
     version: int = 0
+    input_epochs: PMap[int, int] = field(default_factory=empty_pmap)
+    """Latest resolver input epoch checked for each registered address family.
+    Kept outside NhtResult so epoch-only updates preserve notification identity."""
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +744,8 @@ class RemoteSid:
     adjacency_up: bool = True
     peer: str | None = None
     """For adjacency SIDs: the advertised peer identity."""
+    interface: str | None = None
+    """Advertised interface name for symbolic AdjSeg resolution."""
 
 
 @record

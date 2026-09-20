@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING, Any, Iterable
 
-from netsim.model import srv6
+from netsim.model import nht, srv6
 from netsim.model.addressing import (
     IPV4,
     IPV6,
@@ -16,7 +16,14 @@ from netsim.model.addressing import (
     prefix_to_int,
     to_int,
 )
-from netsim.model.contracts import STATIC, STATIC_PROFILE, ClientId
+from netsim.model.contracts import (
+    STATIC,
+    STATIC_PROFILE,
+    ClientId,
+    LookupView,
+    NhtKey,
+    NhtResult,
+)
 from netsim.model.forwarding import Fib
 from netsim.model.interfaces import (
     AdminState,
@@ -128,6 +135,7 @@ class Device(_Handle):
             if 'enabled' in fields and fields['enabled'] != cfg.enabled:
                 fields['enabled_since'] = now
             new_cfg = dataclasses.replace(cfg, **fields)
+            srv6.agent_srdb_view(dataclasses.replace(dev, config=new_cfg))
             if not 1 <= new_cfg.srv6_hop_limit <= 255:
                 raise ValueError('invalid SRv6 hop limit')
             if new_cfg.srv6_source is not None:
@@ -361,6 +369,10 @@ class Device(_Handle):
     def fib(self, af: int) -> Fib | None:
         return self.node.fibs.get(af)
 
+    def nht_client(self, client: ClientId = STATIC) -> NhtClient:
+        self._sr_client(client)
+        return NhtClient(self, client)
+
     def rib_client(
         self, client: ClientId = STATIC, af: int = IPV4, distance: int | None = None
     ) -> RibClient:
@@ -572,6 +584,63 @@ def parse_nexthop(spec: Any) -> Nexthop:
     raise TypeError(f'cannot parse next-hop {spec!r}')
 
 
+class NhtClient:
+    """One owner's registrations, prospective answers and installed forwarding."""
+
+    def __init__(self, device: Device, client: ClientId) -> None:
+        self.device = device
+        self.client = client
+
+    def _check(self, key: NhtKey) -> None:
+        _ = self.device.node
+        if key.owner != self.client:
+            raise ValueError('NHT key does not belong to this client')
+
+    def register(self, key: NhtKey) -> None:
+        self._check(key)
+
+        def apply(state: NetworkState) -> NetworkState:
+            self.device._node_in(state)
+            return nht.refresh(
+                nht.register(state, self.device.name, key), self.device.name
+            )
+
+        self.device.network.update(apply, ('nht_register', self.device.name))
+
+    def unregister(self, key: NhtKey) -> None:
+        self._check(key)
+        self.device.network.update(
+            lambda state: nht.unregister(state, self.device.name, key),
+            ('nht_unregister', self.device.name),
+        )
+
+    def result(self, key: NhtKey) -> NhtResult | None:
+        self._check(key)
+        table = self.device.node.nht
+        return table.registrations.get(key) if table is not None else None
+
+    def resolve(
+        self, key: NhtKey, *, exclude_rows: frozenset[RowKey] = frozenset()
+    ) -> NhtResult:
+        from netsim.model.derive import DeviceContext
+        from netsim.model.routing import ResolutionPolicy
+
+        self._check(key)
+        state = self.device.network.state
+        dev = self.device.node
+        return nht.resolve(
+            DeviceContext(state, self.device.name),
+            dev.config.resolution_policy or ResolutionPolicy(),
+            key,
+            exclude_rows=exclude_rows,
+            input_epoch=dev.resolver_input_epoch.get(key.af, 0),
+        )
+
+    def installed(self, key: NhtKey) -> LookupView:
+        self._check(key)
+        return nht.installed(self.device.network.state, self.device.name, key)
+
+
 class RibClient:
     """The one door for a client's rows in one device and address family."""
 
@@ -596,7 +665,12 @@ class RibClient:
 
     def _apply(self, origin: str, **kw: Any) -> Any:
         self._owner._check_valid()
-        if self.network._edits is not None:
+        profile = self.network.profiles.get(self.client)
+        if profile is not None and profile.link_state:
+            kw['profile'] = profile
+        if self.network._edits is not None and not (
+            profile is not None and profile.link_state
+        ):
             edits = self.network._edits
             self._owner._node_in(edits)
             edits.rib_ops.setdefault(self.device, {}).setdefault(self.af, []).append(kw)
@@ -808,6 +882,7 @@ __all__ = [
     'Interface',
     'Link',
     'RibClient',
+    'NhtClient',
     'StaleHandleError',
     'parse_nexthop',
     'EthernetNode',

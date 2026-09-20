@@ -94,6 +94,10 @@ def test_timed_pipeline_schedules_both_families_and_honors_delay():
 )
 def test_sr_config_is_both_family_fib_and_placement_input(field, value):
     net, head, *_ = topology()
+    if field == 'srdb_source':
+        from tests.model.test_agent_contract import Minimal
+
+        net.add_agent(head, Minimal(), name='test')
     net.add_demand('d', 'head', '10.0.0.1', 100)
     net.converge()
     before = net.state
