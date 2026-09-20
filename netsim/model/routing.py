@@ -11,13 +11,13 @@ substitution for connected routes and exact weight flattening.
 
 from __future__ import annotations
 
-from dataclasses import field
+from dataclasses import field, replace
 from fractions import Fraction
 from math import lcm
 from typing import Any, Iterator, Protocol
 
 from netsim.model.addressing import IPV4, IPV6, mask_for
-from netsim.model.contracts import ClientId
+from netsim.model.contracts import CONNECTED, LOCAL, ClientId, ClientProfile
 from netsim.model.forwarding import (
     CROSS_CONNECT,
     DECAP_LOOKUP,
@@ -180,6 +180,9 @@ class RibState:
     )
     clients: PMap[ClientId, PMap[RowKey, Route]] = field(default_factory=empty_pmap)
 
+    link_state_sources: frozenset[ClientId] = field(default_factory=frozenset)
+    """Immutable metric provenance copied from client profiles by rib_apply."""
+
     @classmethod
     def empty(cls, af: int) -> RibState:
         return cls(af=af, prefixes=PrefixTable(32 if af == IPV4 else 128).freeze())
@@ -228,6 +231,7 @@ def rib_apply(
     add: tuple[Route, ...] = (),
     delete: tuple[RowKey, ...] = (),
     sync: tuple[ClientId, tuple[Route, ...]] | None = None,
+    profile: ClientProfile | None = None,
 ) -> RibState:
     """Pure RIB mutation; returns the same object when nothing changed.
 
@@ -291,8 +295,19 @@ def rib_apply(
         drop(key)
     for r in add:
         put(r)
+    sources = rib.link_state_sources
+    if profile is not None:
+        sources = (
+            sources | {profile.client}
+            if profile.link_state
+            else sources - {profile.client}
+        )
     if not prefix_rows:
-        return rib
+        return (
+            rib
+            if sources == rib.link_state_sources
+            else replace(rib, link_state_sources=frozenset(sources))
+        )
     sb = rib.shards.builder()
     for plen, b in shard_builders.items():
         new = b.build()
@@ -328,7 +343,9 @@ def rib_apply(
             cb.set(client, rows)
         else:
             cb.remove(client)
-    return RibState(rib.af, rib.version + 1, sb.build(), prefixes, cb.build())
+    return RibState(
+        rib.af, rib.version + 1, sb.build(), prefixes, cb.build(), frozenset(sources)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +470,9 @@ class _Resolver:
     def _resolve_prefix(
         self, af: int, prefix: Prefix
     ) -> tuple[FibEntry | None, tuple[_Leg, ...]]:
-        rib = self.ctx.rib(af)
         self.frames[-1].prefixes.add((af, prefix[0], prefix[1]))
         rejected: list[tuple[RowKey, str]] = []
-        for group in rib.best_groups(prefix):
+        for group in self._groups(af, prefix):
             entry, legs, reason = self._resolve_group(af, prefix, group)
             if entry is not None:
                 for r in group:
@@ -471,6 +487,18 @@ class _Resolver:
         for k, why in rejected:
             self.row_outcomes[k] = RowOutcome(k, NOT_INSTALLED, why)
         return None, ()
+
+    def _groups(self, af: int, prefix: Prefix) -> Iterator[tuple[Route, ...]]:
+        return self.ctx.rib(af).best_groups(prefix)
+
+    def _lookup(
+        self, af: int, address: int
+    ) -> Iterator[tuple[int, int, tuple[Route, ...]]]:
+        return self.ctx.rib(af).prefixes.lookup_iter(
+            address,
+            min_len=0 if self.policy.resolve_via_default else 1,
+            exclude=lambda net, plen: (af, (net, plen)) in self.stack,
+        )
 
     def _resolve_group(
         self, af: int, prefix: Prefix, group: tuple[Route, ...]
@@ -624,13 +652,7 @@ class _Resolver:
             return ()
         visited.add((address, sl))
         self.frames[-1].lookups.add((IPV6, address))
-        rib = self.ctx.rib(IPV6)
-        min_len = 0 if self.policy.resolve_via_default else 1
-        for net, plen, _ in rib.prefixes.lookup_iter(
-            address,
-            min_len=min_len,
-            exclude=lambda net, plen: (IPV6, (net, plen)) in self.stack,
-        ):
+        for net, plen, _ in self._lookup(IPV6, address):
             entry, legs = self.resolve_prefix(IPV6, (net, plen))
             if entry is None:
                 if self.policy.lpm_fallthrough:
@@ -684,17 +706,8 @@ class _Resolver:
         return tuple(out)
 
     def _resolve_recursive(self, af: int, address: int) -> tuple[_Leg, ...]:
-        rib = self.ctx.rib(af)
         self.frames[-1].lookups.add((af, address))
-        min_len = 0 if self.policy.resolve_via_default else 1
-        stack = self.stack
-
-        def excluded(net: int, plen: int) -> bool:
-            return (af, (net, plen)) in stack
-
-        for net, plen, _ in rib.prefixes.lookup_iter(
-            address, exclude=excluded, min_len=min_len
-        ):
+        for net, plen, _ in self._lookup(af, address):
             entry, legs = self.resolve_prefix(af, (net, plen))
             if entry is None:
                 if self.policy.lpm_fallthrough:
@@ -946,3 +959,159 @@ def resolve_underlay_query(
         if entry is not None:
             return entry, _group_from_legs(legs, policy.max_ecmp_paths), frame.freeze()
     return None, (), frame.freeze()
+
+
+@record
+class CandidateResolution:
+    """Prospective RIB resolution, independent of installed forwarding."""
+
+    entry: FibEntry | None
+    legs: tuple[Adjacency, ...]
+    rows: tuple[Route, ...]
+    queries: tuple[tuple[int, int, bool], ...]
+    interfaces: tuple[str, ...]
+    reason: str | None = None
+    excluded_prefix: Prefix | None = None
+
+
+class _CandidateResolver(_Resolver):
+    """A per-query exclusion overlay using the normal forwarding resolver.
+
+    Neither the RIB nor its prefix index is copied. Only rows at matching
+    prefixes are inspected. No memo is reused across gray-stack contexts.
+    """
+
+    def __init__(
+        self,
+        ctx: ResolutionContext,
+        policy: ResolutionPolicy,
+        exclude_rows: frozenset[RowKey],
+        connected_only: bool,
+    ) -> None:
+        super().__init__(ctx, policy)
+        self.exclude_rows = exclude_rows
+        self.connected_only = connected_only
+        self.queries: list[tuple[int, int, bool]] = []
+        self.selected: list[Route] = []
+        self.loop = False
+        self.too_deep = False
+        self.excluded_prefix: Prefix | None = None
+
+    def allowed(self, row: Route) -> bool:
+        return row.key not in self.exclude_rows and (
+            not self.connected_only
+            or row.source in (CONNECTED, LOCAL)
+            or all(nh.interface is not None for nh in row.nexthops)
+        )
+
+    def _groups(self, af: int, prefix: Prefix) -> Iterator[tuple[Route, ...]]:
+        for group in super()._groups(af, prefix):
+            kept = tuple(row for row in group if self.allowed(row))
+            if kept:
+                yield kept
+
+    def _lookup(
+        self, af: int, address: int
+    ) -> Iterator[tuple[int, int, tuple[Route, ...]]]:
+        index = len(self.queries)
+        self.queries.append((af, address, False))
+        for net, plen, rows in self.ctx.rib(af).prefixes.lookup_iter(
+            address, min_len=0 if self.policy.resolve_via_default else 1
+        ):
+            if not any(self.allowed(row) for row in rows):
+                if index == 0 and any(row.key in self.exclude_rows for row in rows):
+                    if self.excluded_prefix is None:
+                        self.excluded_prefix = net, plen
+                continue
+            self.queries[index] = af, address, True
+            if (af, (net, plen)) in self.stack:
+                self.loop = True
+                continue
+            yield net, plen, rows
+
+    def resolve_prefix(self, af: int, prefix: Prefix):
+        self.memo.clear()
+        self.memo_deps.clear()
+        if len(self.stack) >= self.policy.max_recursion_depth:
+            self.too_deep = True
+        return super().resolve_prefix(af, prefix)
+
+    def _resolve_nexthop(self, af: int, nh: Nexthop) -> tuple[_Leg, ...]:
+        start = len(self.selected)
+        legs = super()._resolve_nexthop(af, nh)
+        if not legs:
+            del self.selected[start:]
+        return legs
+
+    def _resolve_group(self, af: int, prefix: Prefix, group: tuple[Route, ...]):
+        start = len(self.selected)
+        entry, legs, reason = super()._resolve_group(af, prefix, group)
+        if entry is None:
+            del self.selected[start:]
+        else:
+            self.selected.extend(group)
+        return entry, legs, reason
+
+
+def resolve_candidate(
+    ctx: ResolutionContext,
+    policy: ResolutionPolicy,
+    af: int,
+    address: int,
+    *,
+    exclude_rows: frozenset[RowKey] = frozenset(),
+    connected_only: bool = False,
+    interface: str | None = None,
+) -> CandidateResolution:
+    """Resolve a prospective next hop through a non-copying RIB overlay.
+
+    The caller excludes the candidate's own row as well as withdrawn rows.
+    A self-covering candidate with no alternative reports SELF_COVERED and
+    its excluded prefix. Recursive gray-stack hits report LOOP_DETECTED.
+    Scoped IPv6 link-local queries use the same adjacency resolver directly.
+    """
+    resolver = _CandidateResolver(ctx, policy, exclude_rows, connected_only)
+    frame = _Frame()
+    resolver.frames.append(frame)
+    entry = None
+    legs: tuple[_Leg, ...] = ()
+    if af == IPV6 and address >> 118 == 0x3FA and interface is not None:
+        legs = resolver._resolve_nexthop(af, Nexthop.via(interface, address, af))
+    else:
+        for net, plen, _ in resolver._lookup(af, address):
+            candidate, candidate_legs = resolver.resolve_prefix(af, (net, plen))
+            if candidate is None:
+                if policy.lpm_fallthrough:
+                    continue
+                break
+            if candidate.action == FORWARD:
+                candidate_legs = resolver._substitute(af, address, candidate_legs)
+                if interface is not None:
+                    candidate_legs = tuple(
+                        leg for leg in candidate_legs if leg.interface == interface
+                    )
+                if candidate_legs:
+                    entry, legs = candidate, candidate_legs
+            elif candidate.action == RECEIVE:
+                entry = candidate
+            break
+    reason = None
+    if entry is None and not legs:
+        reason = (
+            LOOP_DETECTED
+            if resolver.loop
+            else TOO_DEEP
+            if resolver.too_deep
+            else 'SELF_COVERED'
+            if resolver.excluded_prefix is not None
+            else UNRESOLVED
+        )
+    return CandidateResolution(
+        entry,
+        _group_from_legs(legs, policy.max_ecmp_paths),
+        tuple(resolver.selected),
+        tuple(resolver.queries),
+        tuple(sorted(frame.interfaces)),
+        reason,
+        resolver.excluded_prefix,
+    )

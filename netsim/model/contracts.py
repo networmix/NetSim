@@ -53,6 +53,8 @@ class ClientProfile:
     protocol_origin: int = 30
     """RFC 9256 §2.6: configuration/CLI 30, BGP SR-TE 20, PCEP 10."""
     originator: tuple[int, int] = (0, 0)
+    link_state: bool = False
+    """This client's route metrics are IGP costs usable by NHT."""
 
 
 STATIC = ClientId('static', 0)
@@ -126,8 +128,12 @@ class AgentConfig:
     run_delay: float = 1e-3
     """Batching latency between a cause and the run (finite, non-negative;
     zero is permitted and guarded by ``max_rounds_per_timestamp``)."""
-    processing_delay: float = 0.0
-    """Added to every datagram and message delivery this agent sends."""
+    processing_delay: float = 1e-3
+    """Added to every datagram and message delivery this agent sends. The
+    default of one millisecond keeps deliveries strictly in the future even
+    over zero-delay links (the engine never delivers a message at the time
+    it was sent); a zero value is valid only with positive link delays and
+    the transport rejects a send whose delivery would not advance the clock."""
     inbox_limit: int = 10_000
     """Maximum captured plus uncaptured inbox entries; overflow is an explicit
     rejection of the delivery (never silent truncation)."""
@@ -171,6 +177,8 @@ class RunReceipt:
     reason: str | None = None
     inbox_consumed: int = 0
     """Length of the captured inbox prefix this run consumed."""
+    causes_count: int = 0
+    ops_count: int = 0
 
 
 RECEIPT_PUBLISHED = 'PUBLISHED'
@@ -241,6 +249,10 @@ class InterfaceView:
     """Active members of a PortChannel."""
     bandwidth: float | None = None
     link: LinkView | None = None
+    generation: int = 0
+    """Interface incarnation for scoped NHT registrations."""
+    config: Any = None
+    """Immutable local interface configuration; no carrier or peer state."""
 
 
 @record
@@ -355,6 +367,7 @@ class Delivery:
     port: int = 0
     seq: int = 0
     """Per-direction sequence number for session messages."""
+    generation: int | None = None
 
     def __post_init__(self) -> None:
         if (self.interface is None) == (self.connection is None):
@@ -365,6 +378,7 @@ class Delivery:
 class TimerFired:
     time: float
     name: str
+    generation: int | None = None
 
 
 # Session event states and reasons.
@@ -391,6 +405,7 @@ class SessionEvent:
     local: Endpoint | None = None
     remote: Endpoint | None = None
     initiator: bool = False
+    generation: int | None = None
 
 
 @record
@@ -403,6 +418,7 @@ class Rejection:
     connection: int | None = None
     interface: str | None = None
     detail: Any = None
+    generation: int | None = None
 
 
 InboxEntry = Delivery | TimerFired | SessionEvent | Rejection
@@ -645,6 +661,9 @@ class NhtResult:
 
     eligible: bool
     input_epoch: int
+    """Epoch that produced this semantic answer. A registration may reuse it
+    after an equivalent refresh; NhtTable.input_epochs tracks the latest check.
+    A direct nht.resolve query always carries its caller's current epoch."""
     via_prefix: tuple[int, int] | None = None
     via_source: ClientId | None = None
     cost: int | None = None
@@ -656,6 +675,8 @@ class NhtResult:
     queries: tuple[tuple[int, int, bool], ...] = ()
     """``(af, address, found)`` lookups performed, failed ones included."""
     reason: str | None = None
+    interfaces: tuple[str, ...] = ()
+    """Consulted interfaces, including failed adjacency resolution."""
 
 
 @record
@@ -664,6 +685,9 @@ class NhtTable:
 
     registrations: PMap[NhtKey, NhtResult | None] = field(default_factory=empty_pmap)
     version: int = 0
+    input_epochs: PMap[int, int] = field(default_factory=empty_pmap)
+    """Latest resolver input epoch checked for each registered address family.
+    Kept outside NhtResult so epoch-only updates preserve notification identity."""
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +720,14 @@ class ConnectionState:
     b_to_a_reachable: bool = False
     deps: tuple[str, ...] = ()
     """Devices visited by the previous path derivation (both directions)."""
+    a_interface: str | None = None
+    b_interface: str | None = None
+    a_interface_generation: int = 0
+    b_interface_generation: int = 0
+    a_to_b_delay: float = 0.0
+    b_to_a_delay: float = 0.0
+    draining: bool = False
+    """Close requested; accepted messages drain before DOWN/CLOSED."""
 
 
 @record
@@ -704,6 +736,8 @@ class Listener:
     agent: str
     endpoint: Endpoint
     generation: int
+    interface: str | None = None
+    interface_generation: int = 0
 
 
 @record
@@ -734,6 +768,8 @@ class RemoteSid:
     adjacency_up: bool = True
     peer: str | None = None
     """For adjacency SIDs: the advertised peer identity."""
+    interface: str | None = None
+    """Advertised interface name for symbolic AdjSeg resolution."""
 
 
 @record

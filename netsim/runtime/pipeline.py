@@ -91,6 +91,8 @@ class Kind:
         run: Callable[[NetworkState, float, list[Any]], NetworkState],
         affected: Callable[[StateDelta, NetworkState], set[Any]],
         delay: Callable[[NetworkState, Any], float] | None = None,
+        *,
+        after_run: Callable[[float, list[Any]], None] | None = None,
     ) -> None:
         self.offset = offset
         self.priority = core.DEFERRED + offset
@@ -99,6 +101,8 @@ class Kind:
         self.run = run
         self.affected = affected
         self.delay = delay
+        # AGENT publication hook: also called when an observer raises after commit.
+        self.after_run = after_run
         self.pending: dict[Any, tuple[float, int]] = {}
         """entity → (deadline, ticket), authoritative over the lazy heap."""
         self._heap: list[tuple[float, int, Any]] = []
@@ -293,9 +297,16 @@ class Pipeline:
         self.last_origins.append((kind.name, now, gen))
         self.last_origins = self.last_origins[-8:]
         try:
-            self.network.update(
-                lambda state: kind.run(state, now, due), ('kind', kind.name, gen)
-            )
+            try:
+                self.network.update(
+                    lambda state: kind.run(state, now, due), ('kind', kind.name, gen)
+                )
+            except Exception as observer_error:
+                if published_failure(observer_error) and kind.after_run is not None:
+                    kind.after_run(now, due)
+                raise
+            if kind.after_run is not None:
+                kind.after_run(now, due)
         except Exception as error:
             if published_failure(error):
                 # Published: the claimed work is consumed exactly once; an
@@ -349,7 +360,21 @@ class Pipeline:
                             if pending[0] < now:
                                 kind._enqueue(e, now)
                 kind.retryable = {}
-                self._ensure_event(kind, now, self._generation_for(now))
+                if (
+                    kind.offset == derive.AGENT
+                    and kind.after_run is not None
+                    and self.round_open(now)
+                    and kind.offset in self.ran_this_round
+                ):
+                    # Partial publication consumed this round's AGENT slot.
+                    # Retry only after ROUND_END, preserving one delta per band.
+                    self.successor.setdefault(kind.offset, set()).update(
+                        entity
+                        for entity, (deadline, _) in kind.pending.items()
+                        if deadline <= now
+                    )
+                else:
+                    self._ensure_event(kind, now, self._generation_for(now))
 
     def has_pending_now(self) -> bool:
         return self.env.peek() == self.env.now
@@ -684,6 +709,8 @@ def dirty_everything(pipeline: Pipeline, state: NetworkState, now: float) -> Non
             entities = set(state.devices)
         elif kind.offset == derive.FIB:
             entities = {(d, af) for d in state.devices for af in derive.AFS}
+        elif kind.offset == derive.AGENT:
+            continue  # agents are not derivations of the tree: nothing to redo
         else:
             entities = {'*'}
         pipeline.mark(kind, entities, now, state)

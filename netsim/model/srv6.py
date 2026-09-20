@@ -16,11 +16,11 @@ from dataclasses import field, replace
 from ipaddress import IPv6Address, IPv6Network, summarize_address_range
 from typing import TYPE_CHECKING, Any, Iterable
 
-from netsim.model.contracts import STATIC, ClientId
+from netsim.model.contracts import STATIC, ClientId, RemoteSid, SrDbView
 from netsim.model.state import PMap, canon, empty_pmap, record
 
 if TYPE_CHECKING:
-    from netsim.model.state import NetworkState
+    from netsim.model.state import DeviceState, NetworkState
 
 # ---------------------------------------------------------------------------
 # Behaviours, flavors, headend behaviours (small ints on the hot path)
@@ -1090,6 +1090,10 @@ def validate(state: NetworkState) -> list[str]:
         for _, loc in dev.srv6_sids.locators.sorted_items()
     ]
     for name, dev in state.devices.sorted_items():
+        try:
+            agent_srdb_view(dev)
+        except ValueError as exc:
+            problems.append(f'{name}: {exc}')
         if not 1 <= dev.config.srv6_hop_limit <= 255:
             problems.append(f'{name}: invalid SRv6 hop limit')
         if dev.config.srv6_source is not None:
@@ -1247,8 +1251,20 @@ def consumers_affected(old: NetworkState, new: NetworkState) -> set[str]:
 
     delta = diff_pmap(old.devices, new.devices, by_identity=True)
     changed = bool(delta.added or delta.removed or old.links != new.links)
+    view_consumers: set[str] = set()
     for name in delta.changed:
         a, b = old.devices[name], new.devices[name]
+        if b.config.srdb_source is not None:
+            agent_srdb_view(b)  # reject unsupported sources, including on updates
+            agent_name = b.config.srdb_source[1]
+            old_agent = a.agents.get(agent_name)
+            if (
+                old_agent is None
+                or old_agent.srdb_view is not b.agents[agent_name].srdb_view
+                or a.config.srdb_source != b.config.srdb_source
+            ):
+                if b.srv6_policies is not None:
+                    view_consumers.add(name)
         if (
             a.srv6_sids != b.srv6_sids
             or a.interfaces != b.interfaces
@@ -1261,8 +1277,8 @@ def consumers_affected(old: NetworkState, new: NetworkState) -> set[str]:
         if policy_inputs(pa) != policy_inputs(pb):
             changed = True
     if not changed:
-        return set()
-    return set(consumer_index(old, new))
+        return view_consumers
+    return set(consumer_index(old, new)) | view_consumers
 
 
 def consumer_index(old: NetworkState, new: NetworkState) -> frozenset[str]:
@@ -1326,6 +1342,9 @@ def policy_programs(table: Srv6Policies | None) -> PMap[tuple[int, int], PolicyP
 
 class _PolicyValidator:
     """One immutable snapshot for all queries; caches are invocation-local."""
+
+    unknown_reason = PATH_UNREACHABLE
+    symbolic_reason = SYMBOLIC_UNRESOLVABLE
 
     def __init__(self, state: NetworkState, head: str) -> None:
         self.state = state
@@ -1498,7 +1517,7 @@ class _PolicyValidator:
                 found = self.literal(address, current)
                 owner, sid = found if found else ('', None)
             if sid is None:
-                return PATH_UNREACHABLE
+                return self.unknown_reason
             if symbolic:
                 address = sid.sid
             self.query(owner, 'sid-oper', sid.sid, sid.adjacency_up)
@@ -1564,7 +1583,7 @@ class _PolicyValidator:
             seen.add(key)
             found = self.literal(packet.dst, current)
             if found is None:
-                return PATH_UNREACHABLE
+                return self.unknown_reason
             owner, sid = found
             if is_csid(sid.structure) and sid.structure.lnl == 0 and current != owner:
                 self.query(current, 'local-scope', packet.dst, f'WRONG_OWNER:{owner}')
@@ -1593,6 +1612,175 @@ class _PolicyValidator:
                 current = peer
 
 
+def agent_srdb_view(dev: DeviceState) -> SrDbView | None:
+    """Validate the source explicitly. None is the only oracle mode.
+
+    A registered agent that has not advertised a view yet has an empty view.
+    Missing agents, malformed views and unsupported modes are errors, never
+    requests to use oracle state.
+    """
+    source = dev.config.srdb_source
+    if source is None:
+        return None
+    if (
+        not isinstance(source, tuple)
+        or len(source) != 2
+        or source[0] != 'agent'
+        or not isinstance(source[1], str)
+    ):
+        raise ValueError(f'unsupported srdb_source: {source!r}')
+    agent = dev.agents.get(source[1])
+    if agent is None:
+        raise ValueError(f'srdb_source refers to missing agent {source[1]!r}')
+    view = agent.srdb_view
+    if view is None:
+        return SrDbView()
+    if not isinstance(view, SrDbView):
+        raise ValueError('srdb_source agent must advertise SrDbView')
+    return view
+
+
+class _AgentPolicyValidator(_PolicyValidator):
+    """Learned ownership/behavior/reachability, not an end-to-end oracle proof.
+
+    Remote state is never accessed. Local first-entry resolution is still
+    required separately; subsequent reachability and endpoint ownership use
+    advertised locator/host prefixes. Stale claims intentionally stay valid.
+    """
+
+    unknown_reason = 'SID_UNKNOWN_IN_VIEW'
+    symbolic_reason = 'SID_UNKNOWN_IN_VIEW'
+
+    def __init__(self, state: NetworkState, head: str, view: SrDbView) -> None:
+        super().__init__(state, head)
+        self.view = view
+        self.claims: dict[tuple[str, int, int], RemoteSid] = {}
+        self.sids: list[tuple[str, LocalSid]] = []
+        for claim in sorted(view.sids, key=lambda c: (c.sid, c.length, c.owner or '')):
+            if claim.owner is None:
+                continue
+            key = claim.owner, claim.sid, claim.length
+            if key in self.claims and self.claims[key] != claim:
+                raise ValueError('conflicting SID claims in srdb_source view')
+            self.claims[key] = claim
+            self.sids.append(
+                (
+                    claim.owner,
+                    LocalSid(
+                        claim.sid,
+                        claim.length,
+                        claim.behavior,
+                        claim.flavors,
+                        claim.structure or UNCOMPRESSED,
+                        interface=claim.interface
+                        or (
+                            f'sid:{claim.sid}/{claim.length}'
+                            if claim.behavior == END_X
+                            else None
+                        ),
+                        adjacency_up=claim.adjacency_up,
+                    ),
+                )
+            )
+        # The headend's own SR-DB is local knowledge, not remote discovery.
+        dev = state.devices[head]
+        if dev.srv6_sids is not None:
+            self.sids = [(owner, sid) for owner, sid in self.sids if owner != head]
+            self.sids.extend((head, sid) for sid in dev.srv6_sids.sids.values())
+
+    def symbolic(self, segment: AdjSeg | NodeSeg | TermSeg) -> LocalSid | None:
+        matches = [
+            sid
+            for owner, sid in self.sids
+            if owner == segment.device
+            and (
+                isinstance(segment, AdjSeg)
+                and sid.behavior == END_X
+                and sid.interface == segment.interface
+                or isinstance(segment, NodeSeg)
+                and sid.behavior == END
+                or isinstance(segment, TermSeg)
+                and sid.behavior == segment.behavior
+            )
+        ]
+        sid = min(matches, key=lambda s: s.sid) if matches else None
+        self.query(
+            segment.device, 'view-symbolic', segment, sid.sid if sid else 'UNKNOWN'
+        )
+        return sid
+
+    def literal(self, address: int, current: str) -> tuple[str, LocalSid] | None:
+        matches = [
+            (owner, sid)
+            for owner, sid in self.sids
+            if contains((sid.sid, sid.length), address)
+        ]
+        matches.sort(
+            key=lambda pair: (-pair[1].length, pair[0] != current, pair[0], pair[1].sid)
+        )
+        found = matches[0] if matches else None
+        self.query(current, 'view-sid', address, found[0] if found else 'UNKNOWN')
+        return found
+
+    def peer(self, device: str, interface: str) -> str | None:
+        # Even local adjacencies need an advertised peer identity. The local
+        # interface/neighbor resolver provides MACs, not protocol router names.
+        peers = {
+            claim.peer
+            for (owner, _, _), claim in self.claims.items()
+            if owner == device
+            and claim.behavior == END_X
+            and (claim.interface or f'sid:{claim.sid}/{claim.length}') == interface
+            and claim.adjacency_up
+            and claim.peer is not None
+        }
+        result = min(peers) if len(peers) == 1 else None
+        self.query(device, 'view-adjacency', interface, result or 'UNKNOWN')
+        return result
+
+    def reaches(
+        self, current: str, owner: str, address: int, sid: LocalSid
+    ) -> str | None:
+        if not sid.adjacency_up:
+            return 'ADJACENCY_DOWN_IN_VIEW'
+        if owner == self.head:
+            # Only local RIB state may corroborate a local behavior.
+            from netsim.model import forwarding as fw
+
+            entry, _ = self.forwarding(self.head, address)
+            return (
+                None
+                if entry and entry.action == fw.SRV6_LOCAL and entry.sid == sid
+                else PATH_UNREACHABLE
+            )
+        known = (
+            is_csid(sid.structure)
+            and sid.structure.lnl == 0
+            and current == owner
+            or any(
+                node == owner and contains(prefix, address)
+                for node, prefix in self.view.locators
+            )
+        )
+        self.query(owner, 'view-locator', address, 'ADVERTISED' if known else 'UNKNOWN')
+        return None if known else 'LOCATOR_UNKNOWN_IN_VIEW'
+
+    def endpoint_owned(self, owner: str, policy: SrPolicy) -> bool:
+        if owner == self.head:
+            return super().endpoint_owned(owner, policy)
+        owned = any(
+            node == owner and contains(prefix, policy.endpoint)
+            for node, prefix in self.view.locators
+        )
+        self.query(owner, 'view-endpoint', policy.endpoint, owned)
+        return owned
+
+    def forwarding(self, device: str, address: int):
+        if device != self.head:
+            raise ValueError('agent SR validation cannot query a remote RIB')
+        return super().forwarding(device, address)
+
+
 def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | None:
     """RFC 9256 section 5.1 layers, then NetSim's stronger end-to-end profile.
 
@@ -1604,6 +1792,7 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
     from netsim.model.srv6_compress import compress
 
     dev = state.devices[device]
+    view = agent_srdb_view(dev)
     table = dev.srv6_policies
     if table is None:
         return None
@@ -1613,7 +1802,11 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
         if key not in table.policies:
             states.remove(key)
     for key, policy in table.policies.sorted_items():
-        validator = _PolicyValidator(state, device)
+        validator = (
+            _PolicyValidator(state, device)
+            if view is None
+            else _AgentPolicyValidator(state, device, view)
+        )
         basic, first, strict, reasons, valid = [], [], [], [], []
         for pi, path in enumerate(policy.candidate_paths):
             for li, segment_list in enumerate(path.segment_lists):
@@ -1629,7 +1822,7 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                     if isinstance(segment, (AdjSeg, NodeSeg, TermSeg)):
                         sid = validator.symbolic(segment)
                         if sid is None:
-                            reason = reason or SYMBOLIC_UNRESOLVABLE
+                            reason = reason or validator.symbolic_reason
                         else:
                             encoded.append((sid.sid, sid.structure, sid.flavors))
                     elif isinstance(segment, LiteralSid):
@@ -1678,7 +1871,8 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                 else:
                     strict.append((pi, li))
                 if reachable and (
-                    strict_reason is None or not settings.validate_all_sids
+                    strict_reason is None
+                    or (view is None and not settings.validate_all_sids)
                 ):
                     valid.append((pi, li, wire))
         for pi, li, reason in reasons:
