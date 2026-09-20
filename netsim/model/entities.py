@@ -43,7 +43,7 @@ from netsim.model.routing import (
 from netsim.model.state import DeviceState, NetworkState
 
 if TYPE_CHECKING:
-    from netsim.model.network import Network
+    from netsim.model.network import Network, _Edits
 
 
 class StaleHandleError(LookupError):
@@ -51,12 +51,14 @@ class StaleHandleError(LookupError):
 
 
 class _Handle:
-    __slots__ = ('network', 'key', 'generation', '__dict__')
+    __slots__ = ('network', 'key', 'generation', '_valid', '_incarnation', '__dict__')
 
     def __init__(self, network: Network, key: tuple, generation: int) -> None:
         self.network = network
         self.key = key
         self.generation = generation
+        self._valid = True
+        self._incarnation = network._handle_incarnation
 
     def __eq__(self, other: object) -> bool:
         return (
@@ -64,10 +66,15 @@ class _Handle:
             and other.network is self.network
             and other.key == self.key
             and other.generation == self.generation
+            and other._incarnation == self._incarnation
         )
 
     def __hash__(self) -> int:
-        return hash((id(self.network), self.key, self.generation))
+        return hash((id(self.network), self.key, self.generation, self._incarnation))
+
+    def _check_valid(self) -> None:
+        if not self._valid:
+            raise StaleHandleError(self.key)
 
     def __repr__(self) -> str:
         return f'{type(self).__name__}{self.key}'
@@ -95,15 +102,17 @@ class Device(_Handle):
 
     @property
     def node(self) -> DeviceState:
-        dev = self.network.state.devices.get(self.name)
+        self._check_valid()
+        dev = self.network._device_node(self.name)
         if dev is None or dev.generation != self.generation:
             raise StaleHandleError(self.name)
-        return dev
+        edits = self.network._edits
+        return edits.device_snapshot(self.name) if edits is not None else dev
 
     @property
     def exists(self) -> bool:
-        dev = self.network.state.devices.get(self.name)
-        return dev is not None and dev.generation == self.generation
+        dev = self.network._device_node(self.name)
+        return self._valid and dev is not None and dev.generation == self.generation
 
     @property
     def enabled(self) -> bool:
@@ -112,20 +121,20 @@ class Device(_Handle):
     def configure(self, **fields: Any) -> None:
         now = self.network.clock()
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
             dev = self._node_in(state)
             cfg = dev.config
             if 'enabled' in fields and fields['enabled'] != cfg.enabled:
                 fields['enabled_since'] = now
-            return _set_device(
-                state,
+            state.devices.set(
                 self.name,
                 dataclasses.replace(dev, config=dataclasses.replace(cfg, **fields)),
             )
 
-        self.network.update(fn, ('configure', self.name))
+        self.network._edit(fn, ('configure', self.name))
 
-    def _node_in(self, state: NetworkState) -> DeviceState:
+    def _node_in(self, state: NetworkState | _Edits) -> DeviceState:
+        self._check_valid()
         dev = state.devices.get(self.name)
         if dev is None or dev.generation != self.generation:
             raise StaleHandleError(self.name)
@@ -221,7 +230,11 @@ class Device(_Handle):
         return po
 
     def interface(self, name: str) -> Interface:
-        node = self.node.interfaces.get(name)
+        self._check_valid()
+        dev = self.network._device_node(self.name)
+        if dev is None or dev.generation != self.generation:
+            raise StaleHandleError(self.name)
+        node = self.network._interface_node(self.name, name)
         if node is None:
             raise KeyError(f'{self.name} has no interface {name!r}')
         return self.network._handle(Interface, (self.name, name), node.generation)
@@ -244,6 +257,7 @@ class Device(_Handle):
     def rib_client(
         self, client: ClientId = STATIC, af: int = IPV4, distance: int | None = None
     ) -> RibClient:
+        self._check_valid()
         d = STATIC_PROFILE.distance if distance is None else distance
         if client != STATIC:
             profile = self.network.profiles.get(client)
@@ -319,6 +333,7 @@ class RibClient:
         self.client = client
         self.af = af
         self.distance = distance
+        self._owner = network.device(device)
 
     def _check(self, rows: Iterable[Route]) -> tuple[Route, ...]:
         rows = tuple(rows)
@@ -330,8 +345,16 @@ class RibClient:
         return rows
 
     def _apply(self, origin: str, **kw: Any) -> Any:
+        self._owner._check_valid()
+        if self.network._edits is not None:
+            edits = self.network._edits
+            self._owner._node_in(edits)
+            edits.rib_ops.setdefault(self.device, {}).setdefault(self.af, []).append(kw)
+            self.network._batch_ops += 1
+            return None
+
         def fn(state: NetworkState) -> NetworkState:
-            dev = state.devices[self.device]
+            dev = self._owner._node_in(state)
             rib = dev.ribs.get(self.af) or RibState.empty(self.af)
             new = rib_apply(rib, **kw)
             if new is rib:
@@ -354,7 +377,7 @@ class RibClient:
         return self._apply('sync', sync=(self.client, self._check(rows)))
 
     def get_routes(self) -> tuple[tuple[Route, tuple[str, str | None]], ...]:
-        dev = self.network.state.devices[self.device]
+        dev = self._owner.node
         rib = dev.ribs.get(self.af) or RibState.empty(self.af)
         return tuple(
             (
@@ -380,17 +403,16 @@ class Interface(_Handle):
 
     @property
     def node(self):
-        dev = self.network.state.devices.get(self.device)
-        node = dev.interfaces.get(self.name) if dev is not None else None
+        self._check_valid()
+        node = self.network._interface_node(self.device, self.name)
         if node is None or node.generation != self.generation:
             raise StaleHandleError(self.key)
         return node
 
     @property
     def exists(self) -> bool:
-        dev = self.network.state.devices.get(self.device)
-        node = dev.interfaces.get(self.name) if dev is not None else None
-        return node is not None and node.generation == self.generation
+        node = self.network._interface_node(self.device, self.name)
+        return self._valid and node is not None and node.generation == self.generation
 
     @property
     def config(self):
@@ -418,9 +440,10 @@ class Interface(_Handle):
         if 'ipv6' in fields:
             fields['ipv6'] = _addresses(fields['ipv6'], IPV6)
 
-        def fn(state: NetworkState) -> NetworkState:
-            dev = state.devices[self.device]
-            node = dev.interfaces.get(self.name)
+        def fn(state: _Edits) -> None:
+            self._check_valid()
+            interfaces = state.interfaces(self.device)
+            node = interfaces.get(self.name)
             if node is None or node.generation != self.generation:
                 raise StaleHandleError(self.key)
             cfg = node.config
@@ -431,19 +454,10 @@ class Interface(_Handle):
                 state, self.device, self.name, node, new_cfg
             )
             if new_cfg == cfg:
-                return state
-            return _set_device(
-                state,
-                self.device,
-                dataclasses.replace(
-                    dev,
-                    interfaces=dev.interfaces.set(
-                        self.name, dataclasses.replace(node, config=new_cfg)
-                    ),
-                ),
-            )
+                return
+            interfaces.set(self.name, dataclasses.replace(node, config=new_cfg))
 
-        self.network.update(fn, ('configure', self.device, self.name))
+        self.network._edit(fn, ('configure', self.device, self.name))
 
     def admin_down(self) -> None:
         self.configure(admin=AdminState.DOWN)
@@ -463,15 +477,16 @@ class Link(_Handle):
 
     @property
     def node(self) -> LinkNode:
-        link = self.network.state.links.get(self.id)
+        self._check_valid()
+        link = self.network._link_node(self.id)
         if link is None or link.generation != self.generation:
             raise StaleHandleError(self.id)
         return link
 
     @property
     def exists(self) -> bool:
-        link = self.network.state.links.get(self.id)
-        return link is not None and link.generation == self.generation
+        link = self.network._link_node(self.id)
+        return self._valid and link is not None and link.generation == self.generation
 
     @property
     def state(self) -> int:
@@ -480,20 +495,18 @@ class Link(_Handle):
     def _set_state(self, new_state: int) -> None:
         now = self.network.clock()
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
+            self._check_valid()
             link = state.links.get(self.id)
             if link is None or link.generation != self.generation:
                 raise StaleHandleError(self.id)
             if link.oper.state == new_state:
-                return state
-            return dataclasses.replace(
-                state,
-                links=state.links.set(
-                    self.id, dataclasses.replace(link, oper=LinkOper(new_state, now))
-                ),
+                return
+            state.links.set(
+                self.id, dataclasses.replace(link, oper=LinkOper(new_state, now))
             )
 
-        self.network.update(
+        self.network._edit(
             fn, ('link', self.id, 'fail' if new_state == LINK_FAILED else 'restore')
         )
 
@@ -507,19 +520,17 @@ class Link(_Handle):
         """Change link config fields (``capacity`` override, ``delay``,
         ``risk_groups``); validated like the rest of the tree."""
 
-        def fn(state: NetworkState) -> NetworkState:
+        def fn(state: _Edits) -> None:
+            self._check_valid()
             link = state.links.get(self.id)
             if link is None or link.generation != self.generation:
                 raise StaleHandleError(self.id)
             cfg = dataclasses.replace(link.config, **fields)
             if cfg == link.config:
-                return state
-            return dataclasses.replace(
-                state,
-                links=state.links.set(self.id, dataclasses.replace(link, config=cfg)),
-            )
+                return
+            state.links.set(self.id, dataclasses.replace(link, config=cfg))
 
-        self.network.update(fn, ('link', self.id, 'configure'))
+        self.network._edit(fn, ('link', self.id, 'configure'))
 
     def edge(self, device: str) -> int:
         link = self.node

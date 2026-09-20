@@ -1,0 +1,248 @@
+{
+  "date": "2026-09-20T15:13:14.939714+00:00",
+  "base": "c2d658e67e62a8df1fe99aa3cae5a1f9f3656630",
+  "runs": [
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        0.0776464578229934,
+        0.07745374995283782,
+        0.07834400003775954
+      ],
+      "median_s": 0.0776464578229934,
+      "devices": 1000,
+      "links": 0,
+      "demands": 0,
+      "commits": 1000
+    },
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        1.6925594590138644,
+        1.702829749789089,
+        1.7017695831600577
+      ],
+      "median_s": 1.7017695831600577,
+      "devices": 5000,
+      "links": 0,
+      "demands": 0,
+      "commits": 5000
+    },
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        6.7739261670503765,
+        6.835352709051222,
+        6.777861166978255
+      ],
+      "median_s": 6.777861166978255,
+      "devices": 10000,
+      "links": 0,
+      "demands": 0,
+      "commits": 10000
+    },
+    {
+      "label": "A1",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "scenario",
+      "samples_s": [
+        0.15325279207900167,
+        0.1520122920628637,
+        0.15252437512390316
+      ],
+      "median_s": 0.15252437512390316,
+      "devices": 127,
+      "links": 756,
+      "demands": 6,
+      "commits": 2528
+    },
+    {
+      "label": "B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        0.008725416846573353,
+        0.008561082882806659,
+        0.008495875168591738
+      ],
+      "median_s": 0.008561082882806659,
+      "devices": 1000,
+      "links": 0,
+      "demands": 0,
+      "commits": 1
+    },
+    {
+      "label": "B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        0.044922915985807776,
+        0.0457548329140991,
+        0.046142375096678734
+      ],
+      "median_s": 0.0457548329140991,
+      "devices": 5000,
+      "links": 0,
+      "demands": 0,
+      "commits": 1
+    },
+    {
+      "label": "B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        0.09004783304408193,
+        0.09296866599470377,
+        0.09424470784142613
+      ],
+      "median_s": 0.09296866599470377,
+      "devices": 10000,
+      "links": 0,
+      "demands": 0,
+      "commits": 1
+    },
+    {
+      "label": "B",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "scenario",
+      "samples_s": [
+        0.026553916977718472,
+        0.026560042053461075,
+        0.026646082988008857
+      ],
+      "median_s": 0.026560042053461075,
+      "devices": 127,
+      "links": 756,
+      "demands": 6,
+      "commits": 1
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        0.08150408300571144,
+        0.07791108288802207,
+        0.07776458305306733
+      ],
+      "median_s": 0.07791108288802207,
+      "devices": 1000,
+      "links": 0,
+      "demands": 0,
+      "commits": 1000
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        1.7063185418955982,
+        1.7057865420356393,
+        1.7016009581275284
+      ],
+      "median_s": 1.7057865420356393,
+      "devices": 5000,
+      "links": 0,
+      "demands": 0,
+      "commits": 5000
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "devices",
+      "samples_s": [
+        6.928714459063485,
+        6.929714957950637,
+        6.962332374881953
+      ],
+      "median_s": 6.929714957950637,
+      "devices": 10000,
+      "links": 0,
+      "demands": 0,
+      "commits": 10000
+    },
+    {
+      "label": "A2",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "scenario",
+      "samples_s": [
+        0.15702445898205042,
+        0.15499299997463822,
+        0.15444795903749764
+      ],
+      "median_s": 0.15499299997463822,
+      "devices": 127,
+      "links": 756,
+      "demands": 6,
+      "commits": 2528
+    }
+  ],
+  "fingerprint_comparison": [
+    {
+      "label": "old",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/tmp/netsim-t2-baseline-c2d658e/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "scenario",
+      "samples_s": [
+        0.15689266612753272
+      ],
+      "median_s": 0.15689266612753272,
+      "devices": 127,
+      "links": 756,
+      "demands": 6,
+      "commits": 2528,
+      "tree_sha256": "fa91265f12ad09e4468c062135f5db25ab9f4b7f00933aa49070d6c36371ff84",
+      "fibs_sha256": "875d0fc58856fcc648cf64e5fb355e1a30d3d3dad915a49b423592033d9ee3b5",
+      "placement_sha256": "0f4cec99ec7e48d0a3d1e35cc1fe5152affb8e2c3d1cd7192f3c05feaaa1384b"
+    },
+    {
+      "label": "new",
+      "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+      "network_source": "/Users/networmix/.superset/worktrees/NetSim/scale/t2-batch/netsim/model/network.py",
+      "platform": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+      "workload": "scenario",
+      "samples_s": [
+        0.026816375087946653
+      ],
+      "median_s": 0.026816375087946653,
+      "devices": 127,
+      "links": 756,
+      "demands": 6,
+      "commits": 1,
+      "tree_sha256": "fa91265f12ad09e4468c062135f5db25ab9f4b7f00933aa49070d6c36371ff84",
+      "fibs_sha256": "875d0fc58856fcc648cf64e5fb355e1a30d3d3dad915a49b423592033d9ee3b5",
+      "placement_sha256": "0f4cec99ec7e48d0a3d1e35cc1fe5152affb8e2c3d1cd7192f3c05feaaa1384b"
+    }
+  ]
+}
