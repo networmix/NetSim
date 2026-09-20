@@ -909,6 +909,8 @@ class Timeline:
         """Set by ``Simulation`` around the initial convergence (origins ``init``)."""
         self._seq = 0
         self.round_of: Callable[[float], int] = lambda t: 0
+        self.on_record: list[Callable[[Record, list[Event]], None]] = []
+        """Streaming observers, called before retention eviction; do not mutate inputs."""
 
     # -- ingestion --------------------------------------------------------------
 
@@ -933,6 +935,8 @@ class Timeline:
             Record(self._seq, time, round_, origin, len(events), delta.new.version)
         )
         self.events.extend(events)
+        for observe in self.on_record:
+            observe(self.records[-1], events)
         self._trim()
         self.deltas.append((self._seq, delta))
         if self.roots and self.roots[-1][0] == time:
@@ -988,6 +992,8 @@ class Timeline:
             )
             self.records.append(Record(self._seq, time, 0, origin, 1, root.version))
             self.events.append(ev)
+            for observe in self.on_record:
+                observe(self.records[-1], [ev])
 
     # -- queries ----------------------------------------------------------------
 

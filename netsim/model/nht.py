@@ -12,6 +12,7 @@ refresh before publication; remove_client implements reset(purge=True).
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import overload
 
 from netsim.model.addressing import IPV4, IPV6, mask_for
 from netsim.model.contracts import (
@@ -22,13 +23,103 @@ from netsim.model.contracts import (
     NhtResult,
     NhtTable,
 )
+from netsim.model.forwarding import Fib, NeighborTable
+from netsim.model.interfaces import l3_usable
 from netsim.model.routing import (
     ResolutionContext,
     ResolutionPolicy,
+    ResolverOutcome,
+    RibState,
     RowKey,
     resolve_candidate,
 )
-from netsim.model.state import NetworkState, StateDelta, diff_pmap
+from netsim.model.srv6 import Srv6Policies
+from netsim.model.state import (
+    DeviceConfig,
+    DeviceState,
+    NetworkState,
+    PMap,
+    StateDelta,
+    diff_pmap,
+    record,
+)
+
+
+@record
+class LocalInterface:
+    """Only effective resolution inputs; no raw carrier or link endpoints."""
+
+    generation: int
+    ipv4_usable: bool
+    ipv6_usable: bool
+
+
+@record
+class LocalContext:
+    """Detached immutable ResolutionContext and installed-forwarding snapshot.
+
+    Contains selected local inputs, never a Device, DeviceState, NetworkState,
+    model view or live callback. Local compiled policies are retained so a
+    prospective query uses the same policy-bearing next hops as the resolver.
+    """
+
+    interfaces: PMap[str, LocalInterface]
+    ribs: PMap[int, RibState]
+    neighbors: NeighborTable | None
+    config: DeviceConfig
+    fibs: PMap[int, Fib]
+    resolver_outcomes: PMap[int, ResolverOutcome]
+    resolver_input_epoch: PMap[int, int]
+    srv6_policies: Srv6Policies | None
+
+    def interface_exists(self, name: str) -> bool:
+        return name in self.interfaces
+
+    def interface_generation(self, name: str) -> int | None:
+        node = self.interfaces.get(name)
+        return node.generation if node is not None else None
+
+    def l3_usable(self, name: str, af: int) -> bool:
+        node = self.interfaces.get(name)
+        return node is not None and (
+            node.ipv4_usable if af == IPV4 else node.ipv6_usable
+        )
+
+    def neighbor_mac(self, interface: str, address: int) -> int | None:
+        return self.neighbors.mac(interface, address) if self.neighbors else None
+
+    def peer_mac(self, interface: str) -> int | None:
+        return self.neighbors.peer_mac(interface) if self.neighbors else None
+
+    def rib(self, af: int) -> RibState:
+        return self.ribs.get(af) or RibState.empty(af)
+
+
+def local_context(dev: DeviceState) -> LocalContext:
+    """Build a ResolutionContext using only this device's immutable subtree.
+
+    A runtime may capture it before a callback, then expose prospective
+    ``resolve(ctx, policy, key, exclude_rows=..., input_epoch=...)`` and separate
+    ``installed(ctx, key)`` answers without keeping a root or device handle.
+    """
+    return LocalContext(
+        PMap(
+            (
+                name,
+                LocalInterface(
+                    node.generation, l3_usable(node, IPV4), l3_usable(node, IPV6)
+                ),
+            )
+            for name, node in dev.interfaces.items()
+        ),
+        dev.ribs,
+        dev.neighbors,
+        dev.config,
+        dev.fibs,
+        dev.resolver_outcomes,
+        dev.resolver_input_epoch,
+        dev.srv6_policies,
+    )
 
 
 def _validate_key(key: NhtKey) -> None:
@@ -55,7 +146,8 @@ def resolve(
     A self-covering candidate (only its own excluded prefix covers the queried
     address) returns eligible=False, via_prefix=candidate.prefix, SELF_COVERED.
     Default-route permission comes exclusively from key. Metrics are never
-    added across recursion levels or different clients.
+    added across recursion levels or different clients. Unlike registration,
+    a one-shot query with no interface_generation uses the current scope.
     """
     _validate_key(key)
     if key.interface_generation is not None:
@@ -116,12 +208,19 @@ def resolve(
     )
 
 
-def register(state: NetworkState, device: str, key: NhtKey) -> NetworkState:
+def registration_key(dev: DeviceState, key: NhtKey) -> NhtKey:
+    """Validate and bind a registration request to the current scope incarnation.
+
+    Callers may retain this canonical key; register uses it as the table key
+    and NhtClient.register returns it. Unscoped keys are returned unchanged.
+    """
     _validate_key(key)
-    dev = state.devices[device]
-    table = dev.nht or NhtTable()
-    if key in table.registrations:
-        return state
+    if (
+        key.interface_generation is not None
+        and dev.nht is not None
+        and key in dev.nht.registrations
+    ):
+        return key  # An existing explicit registration remains an identity no-op.
     if key.interface is not None:
         interface = dev.interfaces.get(key.interface)
         if interface is None or (
@@ -129,6 +228,51 @@ def register(state: NetworkState, device: str, key: NhtKey) -> NetworkState:
             and interface.generation != key.interface_generation
         ):
             raise ValueError('NHT interface scope is missing or stale')
+        if key.interface_generation is None:
+            return replace(key, interface_generation=interface.generation)
+    return key
+
+
+def registered_key(dev: DeviceState, key: NhtKey) -> NhtKey:
+    """Find a retained registration without rebinding to the current interface.
+
+    For compatibility, result/unregister accept the original unbound request
+    when exactly one incarnation matches. With multiple matching generations,
+    callers must use the canonical key returned by register (or in ctx.nht).
+    Explicit keys use an O(1) lookup and work after interface removal.
+    """
+    table = dev.nht
+    if (
+        table is None
+        or key in table.registrations
+        or key.interface is None
+        or key.interface_generation is not None
+    ):
+        return key
+    matches = [
+        registered
+        for registered in table.registrations
+        if replace(registered, interface_generation=None) == key
+    ]
+    if len(matches) > 1:
+        raise ValueError('ambiguous NHT scope; use a generation-bound key')
+    return matches[0] if matches else key
+
+
+def register(state: NetworkState, device: str, key: NhtKey) -> NetworkState:
+    """Store a generation-bound key; preserve the state-returning mutation API.
+
+    Recreating an interface never retargets a stored registration. Explicitly
+    unregister the old key and register again to replace its scope incarnation.
+    """
+    _validate_key(key)
+    dev = state.devices[device]
+    table = dev.nht or NhtTable()
+    if key in table.registrations:
+        return state
+    key = registration_key(dev, key)
+    if key in table.registrations:
+        return state
     return _put(
         state,
         device,
@@ -142,6 +286,7 @@ def register(state: NetworkState, device: str, key: NhtKey) -> NetworkState:
 
 def unregister(state: NetworkState, device: str, key: NhtKey) -> NetworkState:
     dev = state.devices[device]
+    key = registered_key(dev, key)
     table = dev.nht
     if table is None or key not in table.registrations:
         return state
@@ -185,13 +330,11 @@ def refresh(state: NetworkState, device: str, af: int | None = None) -> NetworkS
     This can run before delayed programming: it does not consume the FIB's
     processed epoch. Calls on a device without registrations are identity no-ops.
     """
-    from netsim.model.derive import DeviceContext
-
     dev = state.devices[device]
     table = dev.nht
     if table is None or not table.registrations:
         return state
-    ctx = DeviceContext(state, device)
+    ctx = local_context(dev)
     policy = dev.config.resolution_policy or ResolutionPolicy()
     registrations = table.registrations.builder()
     epochs = table.input_epochs
@@ -222,10 +365,29 @@ def refresh(state: NetworkState, device: str, af: int | None = None) -> NetworkS
     )
 
 
-def installed(state: NetworkState, device: str, key: NhtKey) -> LookupView:
-    """Installed forwarding and its processed epoch; never a prospective proof."""
+@overload
+def installed(state: LocalContext, device: NhtKey) -> LookupView: ...
+
+
+@overload
+def installed(state: NetworkState, device: str, key: NhtKey) -> LookupView: ...
+
+
+def installed(
+    state: LocalContext | NetworkState, device: NhtKey | str, key: NhtKey | None = None
+) -> LookupView:
+    """Installed forwarding and its processed epoch; never a prospective proof.
+
+    Prefer ``installed(local_context(dev), key)`` for detached queries. The
+    original ``installed(state, device, key)`` form remains supported.
+    """
+    if isinstance(state, NetworkState):
+        assert isinstance(device, str) and key is not None
+        dev = local_context(state.devices[device])
+    else:
+        assert isinstance(device, NhtKey) and key is None
+        dev, key = state, device
     _validate_key(key)
-    dev = state.devices[device]
     fib = dev.fibs.get(key.af)
     outcome = dev.resolver_outcomes.get(key.af)
     processed = outcome.processed_epoch if outcome is not None else 0

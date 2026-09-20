@@ -918,7 +918,11 @@ else:
         addressing: str = 'unnumbered'
         srv6: bool = False
         capacity_unit: float = 1e9
-        horizon: float = 100.0
+        horizon: float | None = None
+        warmup: float = 0.0
+        event_budget: int | None = None
+        stability: str | None = None
+        quiet: float = 0.0
         rate: float = 1.0
         duration: Any = 1.0
         keep: dict[str, Any] | None = None
@@ -959,7 +963,15 @@ else:
                 capacity_unit=self.capacity_unit,
                 keep=keep,
             )
+            windows = {
+                'warmup': self.warmup,
+                'event_budget': self.event_budget,
+                'stability': self.stability,
+                'quiet': self.quiet,
+            }
             options = {
+                **windows,
+                'horizon': self.horizon,
                 't0': self.t0,
                 'settle': self.settle,
                 'restore': self.restore,
@@ -987,7 +999,9 @@ else:
                     )
                 else:
                     source = Process(study.failure_parameters, seed=seed)
-                result = study.process(source, self.horizon)
+                result = study.process(
+                    source, 100.0 if self.horizon is None else self.horizon, **windows
+                )
             elif self.mode == 'replay':
                 document = (
                     self.results_json
