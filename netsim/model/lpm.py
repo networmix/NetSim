@@ -37,19 +37,28 @@ class FrozenPrefixTable(Generic[V]):
         self._init(bits, {plen: dict(t) for plen, t in tables.items()}, masks)
 
     def _init(
-        self, bits: int, tables: dict[int, dict[int, V]], masks: tuple[int, ...]
+        self,
+        bits: int,
+        tables: dict[int, Mapping[int, V]],
+        masks: tuple[int, ...],
     ) -> None:
         self._bits = bits
         self._masks = masks
-        self._tables: dict[int, dict[int, V]] = tables
+        self._tables = tables
         self._lengths: tuple[int, ...] = tuple(sorted(tables, reverse=True))
         self._count = sum(len(t) for t in tables.values())
 
     @classmethod
     def _owned(
-        cls, bits: int, tables: dict[int, dict[int, V]], masks: tuple[int, ...]
+        cls,
+        bits: int,
+        tables: dict[int, Mapping[int, V]],
+        masks: tuple[int, ...],
     ) -> FrozenPrefixTable[V]:
-        """Wrap dicts the caller hands over (``freeze`` already copied them)."""
+        """Own fresh dicts, or share immutable PMaps for incremental RIB edits.
+
+        ``freeze`` has already copied the mutable builder's dicts.
+        """
         self = cls.__new__(cls)
         self._init(bits, tables, masks)
         return self
@@ -67,7 +76,26 @@ class FrozenPrefixTable(Generic[V]):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, FrozenPrefixTable):
-            return self._bits == other._bits and self._tables == other._tables
+            if self._bits != other._bits:
+                return False
+            if self._tables == other._tables:
+                return True
+            if self._tables.keys() != other._tables.keys():
+                return False
+            for plen, table in self._tables.items():
+                peer = other._tables[plen]
+                if table is peer or table == peer:
+                    continue
+                # PMap deliberately only compares equal to another PMap.
+                # Prefix tables compare by content even across storage layouts.
+                if isinstance(table, dict) == isinstance(peer, dict):
+                    return False
+                if len(table) != len(peer) or any(
+                    net not in peer or value != peer[net]
+                    for net, value in table.items()
+                ):
+                    return False
+            return True
         return NotImplemented
 
     __hash__ = None  # type: ignore[assignment]
@@ -156,6 +184,7 @@ class PrefixTable(FrozenPrefixTable[V]):
         if table is None:
             table = self._tables[plen] = {}
             self._lengths = tuple(sorted(self._tables, reverse=True))
+        assert isinstance(table, dict)  # mutable builders never own persistent shards
         if net not in table:
             self._count += 1
         table[net] = value
@@ -164,6 +193,7 @@ class PrefixTable(FrozenPrefixTable[V]):
         table = self._tables.get(plen)
         if table is None or net not in table:
             raise KeyError((net, plen))
+        assert isinstance(table, dict)
         value = table.pop(net)
         self._count -= 1
         if not table:

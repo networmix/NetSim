@@ -155,8 +155,9 @@ class Route:
 class RibState:
     """Rows sharded by prefix length, indexed by prefix and source client.
 
-    Prefix tuples are ranked for resolution; client tuples are sorted by
-    row key. Both indexes share the immutable rows in ``shards``.
+    Prefix tuples are ranked for resolution. Client rows and per-length
+    prefix indexes use persistent maps so small edits copy only touched
+    map shards. Both indexes share the immutable rows in ``shards``.
     """
 
     af: int
@@ -165,7 +166,7 @@ class RibState:
     prefixes: FrozenPrefixTable[tuple[Route, ...]] = field(
         default_factory=lambda: PrefixTable(32).freeze()
     )
-    clients: PMap[ClientId, tuple[Route, ...]] = field(default_factory=empty_pmap)
+    clients: PMap[ClientId, PMap[RowKey, Route]] = field(default_factory=empty_pmap)
 
     @classmethod
     def empty(cls, af: int) -> RibState:
@@ -176,7 +177,9 @@ class RibState:
         return self.prefixes.get(*prefix, ())
 
     def rows_of(self, client: ClientId) -> tuple[Route, ...]:
-        return self.clients.get(client, ())
+        """Materialize one client's rows in key order; mutations need no sort."""
+        rows = self.clients.get(client)
+        return () if rows is None else tuple(r for _, r in rows.sorted_items())
 
     def candidates(self, prefix: Prefix) -> tuple[Route, ...]:
         return self.rows(prefix)
@@ -223,7 +226,7 @@ def rib_apply(
     """
     shard_builders: dict[int, PMapBuilder[RowKey, Route]] = {}
     prefix_rows: dict[Prefix, dict[RowKey, Route]] = {}
-    client_rows: dict[ClientId, dict[RowKey, Route]] = {}
+    client_builders: dict[ClientId, PMapBuilder[RowKey, Route]] = {}
 
     def shard(plen: int) -> PMapBuilder[RowKey, Route]:
         b = shard_builders.get(plen)
@@ -237,11 +240,11 @@ def rib_apply(
             rows = prefix_rows[prefix] = {r.key: r for r in rib.rows(prefix)}
         return rows
 
-    def by_client(client: ClientId) -> dict[RowKey, Route]:
-        rows = client_rows.get(client)
-        if rows is None:
-            rows = client_rows[client] = {r.key: r for r in rib.rows_of(client)}
-        return rows
+    def by_client(client: ClientId) -> PMapBuilder[RowKey, Route]:
+        b = client_builders.get(client)
+        if b is None:
+            b = client_builders[client] = rib.clients.get(client, PMap()).builder()
+        return b
 
     def put(route: Route) -> None:
         if route.af != rib.af:
@@ -253,21 +256,21 @@ def rib_apply(
             return
         b.set(key, route)
         by_prefix(route.prefix)[key] = route
-        by_client(route.source)[key] = route
+        by_client(route.source).set(key, route)
 
     def drop(key: RowKey) -> None:
         b = shard(key[1])
         if key in b:
             b.remove(key)
             del by_prefix((key[0], key[1]))[key]
-            del by_client(key[2])[key]
+            by_client(key[2]).remove(key)
 
     if sync is not None:
         client, rows = sync
         wanted = {r.key: r for r in rows}
-        for r in rib.rows_of(client):
-            if r.key not in wanted:
-                drop(r.key)
+        for key in rib.clients.get(client, PMap()):
+            if key not in wanted:
+                drop(key)
         for r in rows:
             if r.source != client:
                 raise ValueError('sync rows must belong to the syncing client')
@@ -285,27 +288,32 @@ def rib_apply(
             sb.remove(plen)
         else:
             sb.set(plen, new)
-    # Copy each affected length once. Unchanged length dicts belong to a
-    # frozen snapshot and are only shared read-only; the fresh outer dict
-    # and edited inner dicts are handed over without a second freeze copy.
+    # The outer length table is bounded by the address width. Each inner
+    # index is a PMap: edit its touched shards, not the complete length table.
     tables = dict(rib.prefixes._tables)
-    lengths: set[int] = set()
+    prefix_builders: dict[int, PMapBuilder[int, tuple[Route, ...]]] = {}
     for (net, plen), rows in prefix_rows.items():
-        if plen not in lengths:
-            tables[plen] = dict(tables.get(plen, {}))
-            lengths.add(plen)
+        b = prefix_builders.get(plen)
+        if b is None:
+            table = tables.get(plen)
+            base = table if isinstance(table, PMap) else PMap(table)
+            b = prefix_builders[plen] = base.builder()
         if rows:
-            tables[plen][net] = tuple(sorted(rows.values(), key=_rank))
+            b.set(net, tuple(sorted(rows.values(), key=_rank)))
         else:
-            tables[plen].pop(net, None)
-    for plen in lengths:
-        if not tables[plen]:
-            del tables[plen]
+            b.remove(net)
+    for plen, b in prefix_builders.items():
+        table = b.build()
+        if table:
+            tables[plen] = table
+        else:
+            tables.pop(plen, None)
     prefixes = FrozenPrefixTable._owned(rib.prefixes.bits, tables, rib.prefixes._masks)
     cb = rib.clients.builder()
-    for client, rows in client_rows.items():
+    for client, b in client_builders.items():
+        rows = b.build()
         if rows:
-            cb.set(client, tuple(rows[k] for k in sorted(rows)))
+            cb.set(client, rows)
         else:
             cb.remove(client)
     return RibState(rib.af, rib.version + 1, sb.build(), prefixes, cb.build())
