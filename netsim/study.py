@@ -627,6 +627,33 @@ class Study:
         sim._study_observation = _StudyObservation(sim, start)  # type: ignore[attr-defined]
         return sim
 
+    def _baseline(
+        self, start: float, warmup: float, event_budget: int | None
+    ) -> tuple[dict[str, Any], float, int]:
+        """Export fault-free preparation, retaining no runtime in the result.
+
+        Oracle baselines need only the already converged tree. Agent baselines
+        get their own preparation budget, equal to an iteration's allowance.
+        Complete means the requested schedule finished, not protocol convergence.
+        """
+        if not self.network.agents:
+            return self._record(self.network, FailureSet()), 0.0, 0
+        sim = self._simulation(start=start, warmup=warmup)
+        runner = _Runner(sim, event_budget)
+        seconds, warmed = self._warmup(sim, runner, warmup)
+        if not runner.exhausted:
+            runner.until(start)
+        record = self._record(sim.network, FailureSet())
+        record['data']['netsim'].update(
+            baseline_complete=not runner.exhausted,
+            preparation_status='budget_exceeded' if runner.exhausted else 'complete',
+            preparation_end=sim.env.now,
+            preparation_deadline=start,
+            engine_events=runner.events,
+            warmup_events=warmed,
+        )
+        return record, seconds, warmed
+
     def _record(self, network: Network, failures: FailureSet) -> dict[str, Any]:
         report = network.placement
         flows = []
@@ -838,6 +865,10 @@ class Study:
         generations and retains client rows until sync (reset_agent(purge=False)).
         A model fork is not a warm protocol restart. Wall warm-up cost lives in
         result.costs; deterministic warmup_events also appears in iteration metrics.
+        The agent baseline uses a separate fault-free runtime through t0 with
+        the same preparation budget; its warm-up is included in result.costs.
+        baseline.data.netsim.baseline_complete is false if preparation exhausts
+        that budget. Oracle baselines use the converged tree without a runtime.
 
         Stability is checked over the *final* quiet interval of each full
         observation window; liveness events do not restart it. None selects
@@ -871,8 +902,9 @@ class Study:
                 + (old.occurrence_count if old else 0),
             )
         records = []
-        warmup_seconds = 0.0
-        warmup_events = 0
+        baseline, warmup_seconds, warmup_events = self._baseline(
+            t0, warmup, event_budget
+        )
         for draw in unique.values():
             sim = (
                 self._simulation(start=t0, warmup=warmup)
@@ -988,7 +1020,7 @@ class Study:
             record['data']['netsim'].update(extras)
             records.append(record)
         return StudyResult(
-            self._record(self.network, FailureSet()),
+            baseline,
             records,
             {
                 'mode': 'iterations',
@@ -1046,12 +1078,17 @@ class Study:
         Schedule/Process times remain relative to zero. Report terminal-window
         stability; future failures/repairs are never drained past the deadline.
         Costs are separate from deterministic exports, as for iterations().
+        Agent baseline preparation ends at zero, before any scheduled faults,
+        with its own event budget and warm-up cost, as for iterations().
         """
         _nonnegative(horizon, 'horizon')
         if horizon == 0:
             raise ValueError('horizon must be > 0')
         kind = _window_options(warmup, event_budget, stability, quiet)
         _future(0.0, quiet, 'quiet')
+        baseline, baseline_seconds, baseline_events = self._baseline(
+            0.0, warmup, event_budget
+        )
         sim = self._simulation(warmup=warmup) if warmup else self._simulation()
         runner = _Runner(sim, event_budget)
         seconds, warmed = self._warmup(sim, runner, warmup)
@@ -1084,7 +1121,7 @@ class Study:
         terminal = self._record(sim.network, failures)
         terminal['data']['netsim'].update(extras)
         return StudyResult(
-            self._record(self.network, FailureSet()),
+            baseline,
             [terminal],
             {
                 'mode': 'process',
@@ -1094,7 +1131,10 @@ class Study:
                 'loss_unit': 'bits',
             },
             extras,
-            costs={'warmup_seconds': seconds, 'warmup_events': warmed},
+            costs={
+                'warmup_seconds': baseline_seconds + seconds,
+                'warmup_events': baseline_events + warmed,
+            },
         )
 
     def replay(

@@ -68,6 +68,8 @@ under the selected predicate, not full demand delivery.
 `StudyResult.costs` reports aggregate wall `warmup_seconds` and `warmup_events`;
 per-iteration deterministic warmup_events also appear in metrics. Wall costs
 are deliberately excluded from rows()/to_ngraph(), preserving exact repeatability.
+For agent studies, these aggregate costs also include the separate fault-free
+baseline preparation described in the C5R update below.
 
 ## Streaming and ownership
 
@@ -322,3 +324,72 @@ restart. No further C5 code changes were needed. Final merged-state checks:
   **95.29%** coverage, 20.25 s pytest time.
 - Real NetGraph adapter and window tests: **174 passed**, 1.70 s.
 - `git diff --check`: pass.
+
+## C5R: prepared agent baseline (review round 2, finding 2)
+
+Review base `a2370a0` exported the synchronously converged configuration as the
+baseline, although synchronous convergence cannot run agents. Replayed the
+review's `probe_study_baseline.py` before editing: both iterations and process
+exported **baseline total_placed=0**, **no-fault total_placed=2000**, and
+`converged`, with 104 warm-up events. New regression tests failed on that code
+(17 failures, two oracle-path checks passed).
+
+Agent study calls now prepare one additional **fresh, fault-free runtime**
+from the same frozen configuration as their iterations. Preparation runs
+[-warmup, 0] and then through `t0` for iterations (through zero for process),
+including events at the preparation deadline. The exported record is captured
+before any faults; only that detached record is returned, with no baseline
+runtime or root retained in StudyResult. Initialized agents are restarted by
+Simulation, preserving main's generation and non-purging rules. An empty draw
+set still prepares the requested agent baseline. Oracle baselines continue to
+export the synchronously converged tree without constructing a baseline runtime.
+
+The preparation has its own `event_budget` allowance, equal to each iteration's
+allowance and independent of the iteration's dispatch count. The aggregate
+`costs.warmup_seconds` and `costs.warmup_events` include baseline warm-up once
+plus each iteration's warm-up. As before, work during [0, t0] is preparation,
+not part of the negative-time warm-up cost. No wall time enters deterministic
+exports.
+
+Agent baseline records add these fields under `baseline.data.netsim`:
+
+- `baseline_complete`: whether the requested preparation schedule finished.
+- `preparation_status`: `complete` or `budget_exceeded`.
+- `preparation_end` and `preparation_deadline`: actual and requested simulated
+  endpoints, exposing partial preparation even when the partial placed total
+  is zero.
+- `engine_events` and `warmup_events`: dispatched preparation and warm-up counts.
+
+Completeness does **not** claim protocol convergence. With no warm-up and t0=0,
+the complete requested baseline can still precede routing startup; later
+observation output is never substituted for it. Consuming exactly the budget is
+allowed if no further event is due by the preparation deadline. Exhausting
+baseline preparation neither raises nor spends an iteration's budget.
+
+Regression coverage includes both entry points with cold input, partially
+initialized input (t=0.03125) and fully initialized input (t=0.5); equal placed
+totals and repeatable exports after warm-up; unchanged caller roots/runtimes;
+pre-failure t0 work without warm-up; empty draws; immediate faults; incomplete
+preparation; exact budgets and separately accounted wall costs. Existing runtime
+count assertions now include the baseline runtime. Oracle no-extra-runtime and
+existing export fingerprint tests remain unchanged in behavior.
+
+The review reproducer after the fix reports **baseline=2000**, **no-fault=2000**,
+`converged`, and **208 aggregate warm-up events** in each mode (104 for baseline
+plus 104 for the observation runtime). Merged main `7d51a18` during the fix,
+preserving its `validate_admitted` implementation and agent admission call sites.
+No shared contract additions, runtime implementation edits, dependencies or new
+performance claims are part of C5R. Earlier timing tables remain historical.
+
+C5R verification (with main `7d51a18`):
+
+- `make check-ci`: format, Ruff and pyright pass; **1,613 passed, 14 skipped**,
+  **95.29%** coverage, 38.86 s pytest time.
+- `make check-ft`: format, Ruff and pyright pass; **1,613 passed, 14 skipped**,
+  **95.29%** coverage, 33.58 s pytest time; GIL-disabled interpreter confirmed.
+- `PYTHONPATH=. /Users/networmix/ws/NetGraph/venv/bin/python -m pytest
+  tests/adapters tests/runtime/test_study_windows.py -q -p no:cacheprovider
+  -o addopts=''`: **197 passed**, 3.20 s.
+- Review reproducer: baseline/no-fault totals 2,000/2,000 and warm-up events 208
+  in both entry points on both interpreters.
+- `git diff --check`: passed.
