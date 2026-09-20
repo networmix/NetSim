@@ -23,6 +23,8 @@ Integration decisions:
 - Datagram ports cover both supported AFs. IPv6 without a configured address
   uses the interface's EUI-64 link-local address; IPv4 without a source address
   rejects with NO_SOURCE. Bundle selection is documented in channels.py.
+  Datagram.link_local explicitly selects the scoped EUI-64 identity and
+  either L3-usable family for IPv6 control traffic on IPv4-only links.
 - Sequence numbers start at zero independently in each direction. Admission
   accounts Message.size (modeled bytes), including in-flight messages. Inbox
   backpressure retains accepted messages until delivery or explicit timeout.
@@ -43,6 +45,7 @@ from netsim import core
 from netsim.model import contracts as c
 from netsim.model import derive
 from netsim.model import forwarding as fw
+from netsim.model.addressing import MacAddress
 from netsim.model.network import _View
 from netsim.model.packets import IPv4Packet, IPv6Packet, L4Header
 from netsim.model.state import NetworkState, StateDelta, validate_immutable
@@ -122,6 +125,12 @@ def _agent(
 
 def _key(device: str, ep: c.Endpoint) -> tuple[str, int, int, str | None, int]:
     return device, ep.af, ep.address, ep.scope, ep.port
+
+
+def _datagram_family(node: Any, datagram: c.Datagram) -> int:
+    # Explicit link control uses either effective L3 family. Ordinary
+    # datagrams continue to require their own family at send and delivery.
+    return 4 if datagram.link_local and eligible(node, 4) else datagram.af
 
 
 def _tree(state: NetworkState, transport: c.TransportState) -> NetworkState:
@@ -312,7 +321,8 @@ class TransportRuntime:
             return self._reject(
                 device, agent, generation, c.RESET, interface=datagram.interface
             )
-        if node is None or not eligible(node, datagram.af):
+        family = _datagram_family(node, datagram)
+        if node is None or not eligible(node, family):
             return self._reject(
                 device,
                 agent,
@@ -324,7 +334,7 @@ class TransportRuntime:
         wire = None
         reason = 'LINK_DOWN'
         for candidate in candidates:
-            reason = candidate.blocked(state, datagram.af, effective=True)
+            reason = candidate.blocked(state, family, effective=True)
             if reason is None:
                 wire = candidate
                 break
@@ -336,7 +346,11 @@ class TransportRuntime:
                 reason or 'LINK_DOWN',
                 interface=datagram.interface,
             )
-        address = source_address(node, datagram.af)
+        address = (
+            MacAddress(node.mac).link_local_int()
+            if datagram.link_local
+            else source_address(node, datagram.af)
+        )
         if address is None:
             return self._reject(
                 device, agent, generation, 'NO_SOURCE', interface=datagram.interface
@@ -376,7 +390,12 @@ class TransportRuntime:
         state = self.sim.network.state
         if (
             not self._live(*key[:3])
-            or entry.wire.blocked(state, entry.datagram.af, effective=True) is not None
+            or entry.wire.blocked(
+                state,
+                _datagram_family(interface(state, key[0], key[3]), entry.datagram),
+                effective=True,
+            )
+            is not None
         ):
             self._dropped += 1
             return

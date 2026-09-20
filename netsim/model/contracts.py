@@ -539,8 +539,14 @@ class Datagram:
     port: int = 0
     af: int = 6
     size: int = 0
+    link_local: bool = False
+    """Opt-in IPv6 link control: use the interface's scoped EUI-64 sender
+    identity and permit either L3-usable family (including IPv4-only links).
+    The default preserves ordinary per-family datagram source selection."""
 
     def __post_init__(self) -> None:
+        if self.link_local and self.af != 6:
+            raise ValueError('link-local control datagrams require af=6')
         if not 0 <= self.port <= 65535:
             raise ValueError(f'invalid port {self.port}')
         if self.size < 0:
