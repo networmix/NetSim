@@ -95,44 +95,70 @@ def _destinations(state: NetworkState, device: str, af: int) -> list[tuple[int, 
     return sorted(out)
 
 
-def shortest_path_routes(
-    state: NetworkState, device: str, af: int
-) -> tuple[Route, ...]:
-    """ECMP shortest-path rows from *device* to every originated prefix."""
-    if not state.devices[device].config.enabled:
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Topology:
+    """One family's invocation-local SPF inputs, indexed in device-name order."""
+
+    names: tuple[str, ...]
+    graph: tuple[tuple[tuple[str, int, int, int | None, int | None], ...], ...]
+    destinations: tuple[tuple[tuple[int, int], ...], ...]
+
+
+def _topology(state: NetworkState, names: tuple[str, ...], af: int) -> _Topology:
+    destinations = tuple(tuple(_destinations(state, name, af)) for name in names)
+    # Only a globally empty catalogue permits skipping SPF. Addressless devices
+    # can still forward unnumbered traffic for destinations on other devices.
+    if not any(destinations):
+        return _Topology(names, (), destinations)
+    indices = {name: i for i, name in enumerate(names)}
+    graph = tuple(
+        tuple(
+            (iface, indices[peer], metric, addr, paf)
+            for iface, peer, metric, addr, paf in _egresses(state, name, af)
+        )
+        if state.devices[name].config.enabled
+        else ()
+        for name in names
+    )
+    return _Topology(names, graph, destinations)
+
+
+def _routes(topology: _Topology, source: int, af: int) -> tuple[Route, ...]:
+    if not topology.graph:
         return ()
-    graph: dict[str, list[tuple[str, str, int, int | None, int | None]]] = {}
-    for name, dev in state.devices.items():
-        if dev.config.enabled:
-            graph[name] = _egresses(state, name, af)
-    dist: dict[str, int] = {device: 0}
-    first_hops: dict[str, set[tuple[str, int | None, int | None]]] = {device: set()}
-    heap = [(0, device)]
-    done: set[str] = set()
+    # Integer indices avoid per-source string-keyed dictionaries. Name order
+    # preserves the old heap tie-break and route ordering exactly.
+    dist = [-1] * len(topology.names)
+    dist[source] = 0
+    first_hops: list[set[tuple[str, int | None, int | None]]] = [
+        set() for _ in topology.names
+    ]
+    heap = [(0, source)]
+    done = [False] * len(topology.names)
     while heap:
         d, u = heapq.heappop(heap)
-        if u in done:
+        if done[u]:
             continue
-        done.add(u)
-        for iface, v, metric, peer_addr, peer_af in graph.get(u, ()):
+        done[u] = True
+        for iface, v, metric, peer_addr, peer_af in topology.graph[u]:
             nd = d + metric
-            hops = {(iface, peer_addr, peer_af)} if u == device else first_hops[u]
-            if v not in dist or nd < dist[v]:
+            hops = {(iface, peer_addr, peer_af)} if u == source else first_hops[u]
+            if dist[v] < 0 or nd < dist[v]:
                 dist[v] = nd
                 first_hops[v] = set(hops)
                 heapq.heappush(heap, (nd, v))
             elif nd == dist[v]:
                 first_hops[v] |= hops
     rows: list[Route] = []
-    local = set(_destinations(state, device, af))
-    for target in sorted(dist):
-        if target == device:
+    local = set(topology.destinations[source])
+    for target, name in enumerate(topology.names):
+        if target == source:
             continue
         hops = sorted(first_hops[target], key=lambda h: (h[0], h[1] or -1))
         if not hops:
             continue
         nexthops = tuple(Nexthop.via(iface, addr, paf) for iface, addr, paf in hops)
-        for prefix in _destinations(state, target, af):
+        for prefix in topology.destinations[target]:
             if prefix in local:
                 continue
             rows.append(
@@ -143,22 +169,36 @@ def shortest_path_routes(
                     IGP_PROFILE.distance,
                     nexthops,
                     metric=dist[target],
-                    distinguisher=(target,),
+                    distinguisher=(name,),
                 )
             )
     # Several targets may originate the same prefix (anycast): keep distinct rows by distinguisher.
     return tuple(rows)
 
 
+def shortest_path_routes(
+    state: NetworkState, device: str, af: int
+) -> tuple[Route, ...]:
+    """ECMP shortest-path rows from *device* to every originated prefix."""
+    if not state.devices[device].config.enabled:
+        return ()
+    names = tuple(sorted(state.devices))
+    return _routes(_topology(state, names, af), names.index(device), af)
+
+
 def oracle_igp(state: NetworkState, now: float) -> NetworkState:
-    """RouteSource: sync ``igp`` rows on every device for both families."""
+    """Sync ``igp`` rows, reusing SPF inputs only within this invocation."""
+    names = tuple(sorted(state.devices))
+    topologies = tuple((af, _topology(state, names, af)) for af in (IPV4, IPV6))
     devices = state.devices.builder()
-    for name, dev in state.devices.sorted_items():
+    for source, name in enumerate(names):
+        dev = state.devices[name]
         new_dev = dev
         ribs = dev.ribs.builder()
-        for af in (IPV4, IPV6):
+        for af, topology in topologies:
             rib = dev.ribs.get(af) or RibState.empty(af)
-            rows = shortest_path_routes(state, name, af)
+            rows = _routes(topology, source, af) if dev.config.enabled else ()
+            # Empty families must still sync, withdrawing their stale IGP rows.
             new_rib = rib_apply(rib, sync=(IGP, rows))
             if new_rib is not rib:
                 ribs.set(af, new_rib)
