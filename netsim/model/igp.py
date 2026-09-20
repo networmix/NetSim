@@ -92,6 +92,8 @@ def _destinations(state: NetworkState, device: str, af: int) -> list[tuple[int, 
             continue
         for host, plen in node.config.ipv4 if af == IPV4 else node.config.ipv6:
             out.add((host & mask_for(plen, bits), plen))
+    if af == IPV6 and dev.config.enabled and dev.srv6_sids is not None:
+        out.update(loc.prefix for loc in dev.srv6_sids.locators.values())
     return sorted(out)
 
 

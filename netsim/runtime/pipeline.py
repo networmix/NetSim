@@ -16,7 +16,7 @@ from heapq import heapify, heappop, heappush
 from typing import Any, Callable
 
 from netsim import core
-from netsim.model import derive
+from netsim.model import derive, srv6
 from netsim.model.interfaces import EthernetNode, PortChannelNode
 from netsim.model.state import NetworkState, StateDelta
 
@@ -485,7 +485,7 @@ def l3_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
     out: set[Any] = set()
     d = delta.devices()
     for name in d.added + d.changed:
-        if delta.config_changed(name):
+        if delta.config_changed(name) or delta.device_field_changed(name, 'srv6_sids'):
             out.add(name)
         for iface, cfg, oper in delta.interface_changes(name):
             if cfg:
@@ -509,13 +509,21 @@ def igp_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
     if delta.links().keys:
         return {'*'}
     for name in d.added + d.removed + d.changed:
-        if delta.config_changed(name) or delta.interface_changes(name):
+        if (
+            delta.config_changed(name)
+            or delta.interface_changes(name)
+            or delta.device_field_changed(name, 'srv6_sids')
+        ):
             return {'*'}
     return set()
 
 
 def fib_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
-    out: set[tuple[str, int]] = set()
+    out: set[tuple[str, int]] = {
+        (name, af)
+        for name in srv6.consumers_affected(delta.old, state)
+        for af in derive.AFS
+    }
     d = delta.devices()
     for name in d.added + d.changed:
         dev = state.devices.get(name)
@@ -526,6 +534,13 @@ def fib_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
             or delta.interface_changes(name)
             or delta.device_field_changed(name, 'neighbors')
             or delta.device_field_changed(name, 'load_balancers')
+            or delta.device_field_changed(name, 'srv6_sids')
+            or srv6.policy_inputs(
+                delta.old.devices[name].srv6_policies
+                if name in delta.old.devices
+                else None
+            )
+            != srv6.policy_inputs(dev.srv6_policies)
             or delta.ribs(name).keys  # either family: recursion crosses families
         ):
             for af in derive.AFS:
@@ -558,6 +573,8 @@ def placement_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
             or delta.interface_changes(name)
             or delta.fibs(name).keys
             or delta.load_balancers_changed(name)
+            or delta.device_field_changed(name, 'srv6_sids')
+            or delta.device_field_changed(name, 'srv6_policies')
         ):
             return {'*'}
     return set()

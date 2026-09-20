@@ -1,9 +1,8 @@
 """SRv6 data model: the Gate B contract shared by every implementation slice.
 
-Everything here is a frozen record or a small int constant; the algorithms
-(allocation, compression, encapsulation, validation, forwarding) live in
-the modules named in each section and are implemented against these
-records. Standards: RFC 8402 (SR architecture), RFC 8754 (SRH), RFC 8986
+Frozen records, constants and pure SR-DB operations live here. Device handles
+commit validated allocation and ownership changes; L3 derives adjacency state.
+Compression, encapsulation and forwarding use these shared records. Standards: RFC 8402 (SR architecture), RFC 8754 (SRH), RFC 8986
 (network programming), RFC 9256 (SR Policy), RFC 9602 (5f00::/16),
 RFC 9800 (NEXT-C-SID). The authoritative Gate B behaviour set is the one
 in the design (revision 15): H.Encaps and H.Encaps.Red at the headend;
@@ -13,11 +12,15 @@ those three (uN, uA, uDT46). Anything else is rejected at configuration.
 
 from __future__ import annotations
 
-from dataclasses import field
-from typing import Any
+from dataclasses import field, replace
+from ipaddress import IPv6Address, IPv6Network, summarize_address_range
+from typing import TYPE_CHECKING, Any
 
-from netsim.model.contracts import ClientId
-from netsim.model.state import PMap, empty_pmap, record
+from netsim.model.contracts import STATIC, ClientId
+from netsim.model.state import PMap, canon, empty_pmap, record
+
+if TYPE_CHECKING:
+    from netsim.model.state import NetworkState
 
 # ---------------------------------------------------------------------------
 # Behaviours, flavors, headend behaviours (small ints on the hot path)
@@ -174,6 +177,41 @@ class LocalSid:
 
 
 @record
+class SidRanges:
+    """Inclusive 16-bit GIB, LIB and WLIB ranges for one locator block.
+
+    WLIB selects the high 16 bits of a 32-bit function (NetSim F3216 convention).
+    GIB/LIB scope and disjointness follow RFC 9800 §§5.1-5.2.
+    Allocation divides each function pool into four disjoint purpose ranges.
+    """
+
+    gib: tuple[int, int] = GIB_RANGE
+    lib: tuple[int, int] = LIB_RANGE
+    wlib: tuple[int, int] = WLIB_RANGE
+
+    def __post_init__(self) -> None:
+        ranges = (self.gib, self.lib, self.wlib)
+        for lo, hi in ranges:
+            if not 1 <= lo <= hi <= 0xFFFF:
+                raise ValueError('SID ranges must be nonzero inclusive 16-bit ranges')
+        for i, (lo, hi) in enumerate(ranges):
+            for other_lo, other_hi in ranges[i + 1 :]:
+                if lo <= other_hi and other_lo <= hi:
+                    raise ValueError('GIB, LIB and WLIB must be pairwise disjoint')
+
+
+@record
+class SidRequest:
+    """Allocation receipt; current oper state is in Srv6Sids.sids[result.sid]."""
+
+    owner: ClientId
+    request_id: str
+    behavior: int
+    args: tuple[tuple[str, Any], ...]
+    result: LocalSid
+
+
+@record
 class Srv6Sids:
     """A device's SR-DB local part: locators, local SIDs and the allocator."""
 
@@ -181,11 +219,14 @@ class Srv6Sids:
     sids: PMap[int, LocalSid] = field(default_factory=empty_pmap)
     """Keyed by SID value."""
     requests: PMap[str, Any] = field(default_factory=empty_pmap)
-    """Client SID requests by request id (``SidClient.request_sid``)."""
+    """Client-qualified request_key() strings map to SidRequest allocation results."""
     drop_unknown_local: bool = True
     """Cover the LIB and WLIB ranges with UNREACHABLE rows (``SID_UNKNOWN`` drops)."""
     next_function: PMap[str, int] = field(default_factory=empty_pmap)
-    """Allocation cursors per sub-range name (``adjacency``, ``terminal``, ``bsid``, ``client``)."""
+    """Cursors keyed by block, locator, node/function widths and purpose.
+    Purpose is adjacency, terminal, bsid or client; keys are allocator-private.
+    """
+    ranges: PMap[tuple[int, int], SidRanges] = field(default_factory=empty_pmap)
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +334,10 @@ class Srv6Policies:
     """Ordered by longest dst prefix, exact DSCP before wildcard, exact sport before wildcard, id."""
     bsids: PMap[int, tuple[int, int]] = field(default_factory=empty_pmap)
     """Binding SID → policy key (one owner per BSID in Gate B)."""
+    steering_by_client: PMap[ClientId, tuple[SteeringRule, ...]] = field(
+        default_factory=empty_pmap
+    )
+    """Owned rules; steering is their deterministically ordered projection."""
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +445,8 @@ __all__ = [
     'Locator',
     'LocalSid',
     'Srv6Sids',
+    'SidRanges',
+    'SidRequest',
     'LiteralSid',
     'AdjSeg',
     'NodeSeg',
@@ -416,3 +463,780 @@ __all__ = [
     'behavior_name',
     'check_gate_b',
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pure SR-DB operations. Handles commit only fully validated candidate roots.
+# ---------------------------------------------------------------------------
+
+
+def ipv6(value: int | str) -> int:
+    return int(IPv6Address(value))
+
+
+def prefix6(value: str | tuple[int, int]) -> tuple[int, int]:
+    net = IPv6Network(value)
+    return int(net.network_address), net.prefixlen
+
+
+def contains(prefix: tuple[int, int], address: int) -> bool:
+    return address >> (128 - prefix[1]) == prefix[0] >> (128 - prefix[1])
+
+
+def is_csid(structure: SidStructure) -> bool:
+    return structure in (
+        F3216_GIB,
+        F3216_LIB,
+        F3216_WLIB,
+        F3216_TERMINAL,
+        F3216_COMPOSITE,
+    )
+
+
+def flavor_names(flavors: int) -> tuple[str, ...]:
+    return tuple(
+        name
+        for flag, name in (
+            (PSP, 'PSP'),
+            (USP, 'USP'),
+            (USD, 'USD'),
+            (NEXT_CSID, 'NEXT-C-SID'),
+        )
+        if flavors & flag
+    )
+
+
+def require_gate_b(behavior: int, flavors: int = 0, **options: Any) -> None:
+    if 'vrf' in options or 'table' in options:
+        raise ValueError('VRF/table selection is unsupported in Gate B')
+    if options:
+        raise ValueError(f'unsupported SR options: {", ".join(sorted(options))}')
+    reason = check_gate_b(behavior, flavors)
+    if reason is not None:
+        raise ValueError(f'{reason}: {behavior_name(behavior)} {flavor_names(flavors)}')
+
+
+def add_locator(
+    state: NetworkState,
+    device: str,
+    name: str,
+    prefix: str | tuple[int, int] | None,
+    structure: SidStructure,
+    block: str | tuple[int, int],
+    node_id: int | None,
+    ranges: SidRanges,
+) -> tuple[NetworkState, Locator]:
+    from netsim.model.state import check_name
+
+    check_name(name)
+    dev = state.devices[device]
+    db = dev.srv6_sids or Srv6Sids()
+    block = prefix6(block)
+    allocators = state.allocators
+    if node_id is None and (existing := db.locators.get(name)) is not None:
+        node_id = existing.node_id
+    if is_csid(structure):
+        if block[1] != structure.lbl:
+            raise ValueError('NEXT-C-SID block length must match lbl')
+        used = {
+            loc.node_id
+            for d in state.devices.values()
+            if d.srv6_sids is not None
+            for loc in d.srv6_sids.locators.values()
+            if loc.block == block
+        }
+        if node_id is None:
+            node_id = max(
+                ranges.gib[0], allocators.next_srv6_node.get(block, ranges.gib[0])
+            )
+            while node_id in used and node_id <= ranges.gib[1]:
+                node_id += 1
+            if node_id > ranges.gib[1]:
+                raise ValueError('GIB exhausted')
+            allocators = replace(
+                allocators,
+                next_srv6_node=allocators.next_srv6_node.set(block, node_id + 1),
+            )
+        if not ranges.gib[0] <= node_id <= ranges.gib[1]:
+            raise ValueError('node id outside GIB')
+        derived = (block[0] | (node_id << 80), 48)
+        if prefix is not None and prefix6(prefix) != derived:
+            raise ValueError('locator prefix must equal block and node id')
+        loc = Locator(name, derived, structure, block, node_id)
+    else:
+        if prefix is None or node_id is not None:
+            raise ValueError('classic locator needs an explicit prefix and no node id')
+        p = prefix6(prefix)
+        if p[1] != structure.lbl + structure.lnl or structure.fl == 0:
+            raise ValueError(
+                'classic locator length must equal lbl + lnl, with function bits'
+            )
+        # Classic block is the locator block encoded in its explicit prefix.
+        block = (p[0] >> (128 - structure.lbl) << (128 - structure.lbl), structure.lbl)
+        loc = Locator(name, p, structure, block)
+    old = db.locators.get(name)
+    if old is not None:
+        if old == loc and db.ranges.get(block, SidRanges()) == ranges:
+            return state, old
+        raise ValueError(f'locator {name!r} exists')
+    prior = db.ranges.get(block)
+    if prior is not None and prior != ranges:
+        raise ValueError('conflicting ranges for locator block')
+    db = replace(
+        db, locators=db.locators.set(name, loc), ranges=db.ranges.set(block, ranges)
+    )
+    candidate = replace(
+        state,
+        devices=state.devices.set(device, replace(dev, srv6_sids=db)),
+        allocators=allocators,
+    )
+    require_valid(candidate)
+    return candidate, loc
+
+
+def select_locator(
+    db: Srv6Sids, structure: SidStructure, locator: str | None, sid: int | None = None
+) -> Locator:
+    choices = [
+        loc
+        for name, loc in db.locators.sorted_items()
+        if (locator is None or name == locator)
+        and is_csid(loc.structure) == is_csid(structure)
+        and (
+            sid is None
+            or contains(loc.block if is_csid(structure) else loc.prefix, sid)
+        )
+    ]
+    if len(choices) != 1:
+        raise ValueError(
+            'select exactly one matching locator (use locator= for multiple blocks)'
+        )
+    return choices[0]
+
+
+def function_range(
+    structure: SidStructure, ranges: SidRanges, purpose: str
+) -> tuple[int, int]:
+    """Four disjoint, inclusive pools, in adjacency/terminal/bsid/client order."""
+    index = ('adjacency', 'terminal', 'bsid', 'client').index(purpose)
+    if not is_csid(structure):
+        lo, hi = 1, (1 << structure.fl) - 1
+    elif structure.fl == 32:
+        lo, hi = ranges.wlib[0] << 16, (ranges.wlib[1] << 16) | 0xFFFF
+    else:
+        lo, hi = ranges.lib
+    size = hi - lo + 1
+    return lo + size * index // 4, lo + size * (index + 1) // 4 - 1
+
+
+def _sid_value(loc: Locator, structure: SidStructure, function: int) -> int:
+    base = loc.prefix[0] if structure.lnl else loc.block[0]
+    return base | (function << (128 - structure.installed_length))
+
+
+def _allocate_function(
+    db: Srv6Sids,
+    loc: Locator,
+    structure: SidStructure,
+    purpose: str,
+    used: set[int],
+    index: int | None = None,
+) -> tuple[Srv6Sids, int]:
+    low, high = function_range(
+        structure, db.ranges.get(loc.block, SidRanges()), purpose
+    )
+    key = f'{loc.block[0]:032x}/{loc.block[1]}:{loc.prefix[0]:032x}:{structure.lnl}:{structure.fl}:{purpose}'
+    preferred = low + index if index is not None else None
+    if preferred is not None and preferred <= high:
+        value = _sid_value(loc, structure, preferred)
+        if value in used:
+            raise ValueError('SID collision at interface-derived function')
+        return db, value
+    function = max(low, db.next_function.get(key, low))
+    while function <= high and _sid_value(loc, structure, function) in used:
+        function += 1
+    if function > high:
+        raise ValueError(f'{purpose} function pool exhausted')
+    return replace(
+        db, next_function=db.next_function.set(key, function + 1)
+    ), _sid_value(loc, structure, function)
+
+
+def add_local_sid(
+    state: NetworkState,
+    device: str,
+    behavior: int,
+    *,
+    structure: SidStructure,
+    flavors: int = 0,
+    sid: int | str | None = None,
+    interface: str | None = None,
+    nexthop: int | str | None = None,
+    owner: ClientId = STATIC,
+    locator: str | None = None,
+    request_id: str | None = None,
+    **options: Any,
+) -> tuple[NetworkState, LocalSid]:
+    require_gate_b(behavior, flavors, **options)
+    dev = state.devices[device]
+    db = dev.srv6_sids or Srv6Sids()
+    value = ipv6(sid) if sid is not None else None
+    loc = select_locator(db, structure, locator, value)
+    if flavors & NEXT_CSID and (not is_csid(structure) or structure.lnfl == 0):
+        raise ValueError('NEXT-C-SID requires a supported SID structure')
+    if structure == F3216_GIB and behavior != END:
+        raise ValueError('GIB SID must use End')
+    if structure == F3216_TERMINAL and behavior != END_DT46:
+        raise ValueError('terminal structure requires End.DT46')
+    if behavior == END_X:
+        if interface is None or interface not in dev.interfaces:
+            raise ValueError('End.X requires a bound interface')
+        from netsim.model.interfaces import LoopbackNode
+
+        if isinstance(dev.interfaces[interface], LoopbackNode):
+            raise ValueError('End.X requires an adjacency interface')
+    elif interface is not None or nexthop is not None:
+        raise ValueError('only End.X accepts interface/nexthop')
+    if value is None and behavior == END_X:
+        for old in db.sids.values():
+            if (
+                old.behavior == behavior
+                and old.flavors == flavors
+                and old.structure == structure
+                and old.interface == interface
+                and old.nexthop == (ipv6(nexthop) if nexthop is not None else None)
+                and old.owner == owner
+                and old.request_id == request_id
+                and contains(loc.block if is_csid(structure) else loc.prefix, old.sid)
+            ):
+                return state, old
+    used = set(db.sids) | (set(dev.srv6_policies.bsids) if dev.srv6_policies else set())
+    if value is None:
+        if structure == F3216_GIB:
+            value = loc.prefix[0]
+        else:
+            purpose = (
+                'client'
+                if request_id is not None or owner != STATIC
+                else 'adjacency'
+                if behavior == END_X
+                else 'terminal'
+                if behavior == END_DT46
+                else 'client'
+            )
+            index = (
+                dev.interfaces[interface].index
+                if purpose == 'adjacency' and interface is not None
+                else None
+            )
+            db, value = _allocate_function(db, loc, structure, purpose, used, index)
+    row = LocalSid(
+        value,
+        structure.installed_length,
+        behavior,
+        flavors,
+        structure,
+        owner,
+        interface,
+        ipv6(nexthop) if nexthop is not None else None,
+        request_id,
+        behavior != END_X,
+    )
+    old = db.sids.get(value)
+    if old is not None:
+        if replace(row, adjacency_up=old.adjacency_up) == old:
+            return state, old
+        raise ValueError('SID collision')
+    if value in used:
+        raise ValueError('SID collides with BSID')
+    db = replace(db, sids=db.sids.set(value, row))
+    candidate = replace(
+        state, devices=state.devices.set(device, replace(dev, srv6_sids=db))
+    )
+    require_valid(candidate)
+    return candidate, row
+
+
+def remove_local_sid(
+    state: NetworkState, device: str, sid: int | str, owner: ClientId = STATIC
+) -> NetworkState:
+    dev = state.devices[device]
+    db = dev.srv6_sids
+    value = ipv6(sid)
+    if db is None or value not in db.sids:
+        return state
+    row = db.sids[value]
+    if row.owner != owner:
+        raise ValueError('SID belongs to another owner')
+    requests = db.requests
+    for key, request in db.requests.sorted_items():
+        if request.result.sid == value:
+            requests = requests.remove(key)
+    new = replace(db, sids=db.sids.remove(value), requests=requests)
+    return replace(
+        state, devices=state.devices.set(device, replace(dev, srv6_sids=new))
+    )
+
+
+def request_key(client: ClientId, request_id: str) -> str:
+    """Collision-free encoding while retaining the contract's string map keys."""
+    return f'{len(client.name)}:{client.name}:{client.instance}:{request_id}'
+
+
+def request_sid(
+    state: NetworkState,
+    device: str,
+    client: ClientId,
+    request_id: str,
+    behavior: int,
+    args: dict[str, Any],
+) -> tuple[NetworkState, LocalSid]:
+    from netsim.model.state import validate_immutable
+
+    if not request_id:
+        raise ValueError('request id must be nonempty')
+    if 'owner' in args or 'request_id' in args:
+        raise ValueError('request owner and id are supplied by the client')
+    frozen_args = tuple(sorted(args.items()))
+    validate_immutable(frozen_args)
+    key = request_key(client, request_id)
+    db = state.devices[device].srv6_sids
+    old = db.requests.get(key) if db else None
+    if old is not None:
+        if old.behavior != behavior or old.args != frozen_args:
+            raise ValueError('request id already used with different arguments')
+        assert db is not None
+        return state, db.sids[old.result.sid]
+    candidate, row = add_local_sid(
+        state, device, behavior, owner=client, request_id=request_id, **args
+    )
+    dev = candidate.devices[device]
+    assert dev.srv6_sids is not None
+    db = replace(
+        dev.srv6_sids,
+        requests=dev.srv6_sids.requests.set(
+            key, SidRequest(client, request_id, behavior, frozen_args, row)
+        ),
+    )
+    return replace(
+        candidate, devices=candidate.devices.set(device, replace(dev, srv6_sids=db))
+    ), row
+
+
+def check_policy(policy: SrPolicy) -> None:
+    ipv6(policy.endpoint)
+    if policy.color < 0 or policy.fallback not in (FALLBACK_IGP, FALLBACK_DROP):
+        raise ValueError('invalid policy color/fallback')
+    if policy.bsid is not None:
+        ipv6(policy.bsid)
+    keys = set()
+    for path in policy.candidate_paths:
+        key = (path.protocol_origin, path.originator, path.discriminator)
+        if key in keys:
+            raise ValueError('duplicate candidate path key')
+        keys.add(key)
+        for segment_list in path.segment_lists:
+            for segment in segment_list.segments:
+                if isinstance(segment, TermSeg):
+                    require_gate_b(segment.behavior)
+                elif isinstance(segment, LiteralSid):
+                    ipv6(segment.address)
+                    if (
+                        segment.flavors is not None
+                        and segment.flavors & ~GATE_B_FLAVORS
+                    ):
+                        raise ValueError(UNSUPPORTED_FLAVOR)
+                elif isinstance(segment, int):
+                    ipv6(segment)
+                elif not isinstance(segment, (AdjSeg, NodeSeg)):
+                    raise ValueError(
+                        'unsupported segment (SR-MPLS/nested encapsulation/VRF)'
+                    )
+    # Empty/zero-weight lists are stored: RFC 9256 §5.1 validity belongs to
+    # the resolver so a policy can expose DOWN and its per-list reasons.
+
+
+def put_policy(
+    state: NetworkState,
+    device: str,
+    client: ClientId,
+    policy: SrPolicy,
+    *,
+    replace_existing: bool = False,
+    locator: str | None = None,
+) -> NetworkState:
+    check_policy(policy)
+    if policy.owner != client:
+        raise ValueError('policy belongs to another owner')
+    dev = state.devices[device]
+    table = dev.srv6_policies or Srv6Policies()
+    old = table.policies.get(policy.key)
+    if old is not None and old.owner != client:
+        raise ValueError('policy key belongs to another owner')
+    if old is not None and policy.bsid is None:
+        policy = replace(policy, bsid=old.bsid)
+    if old == policy:
+        return state
+    if old is not None and not replace_existing:
+        raise ValueError('policy exists; use replace')
+    # Candidate identities cannot be claimed by two clients on one headend.
+    wanted = {
+        (p.protocol_origin, p.originator, p.discriminator)
+        for p in policy.candidate_paths
+    }
+    for other in table.policies.values():
+        if other.owner != client and any(
+            (p.protocol_origin, p.originator, p.discriminator) in wanted
+            for p in other.candidate_paths
+        ):
+            raise ValueError('candidate key belongs to another owner')
+    db = dev.srv6_sids
+    if policy.bsid is None and db is not None and db.locators:
+        choices = [
+            loc
+            for name, loc in db.locators.sorted_items()
+            if locator is None or name == locator
+        ]
+        if len(choices) != 1:
+            raise ValueError('select exactly one BSID locator')
+        loc = choices[0]
+        structure = F3216_LIB if is_csid(loc.structure) else loc.structure
+        db, bsid = _allocate_function(
+            db, loc, structure, 'bsid', set(db.sids) | set(table.bsids)
+        )
+        policy = replace(policy, bsid=bsid)
+        dev = replace(dev, srv6_sids=db)
+    bsids = table.bsids
+    if old is not None and old.bsid is not None:
+        bsids = bsids.remove(old.bsid)
+    if policy.bsid is not None:
+        if policy.bsid in bsids or (
+            dev.srv6_sids and policy.bsid in dev.srv6_sids.sids
+        ):
+            raise ValueError('BSID collision')
+        bsids = bsids.set(policy.bsid, policy.key)
+    new = replace(table, policies=table.policies.set(policy.key, policy), bsids=bsids)
+    candidate = replace(
+        state, devices=state.devices.set(device, replace(dev, srv6_policies=new))
+    )
+    require_valid(candidate)
+    return candidate
+
+
+def delete_policy(
+    state: NetworkState, device: str, client: ClientId, key: tuple[int, int]
+) -> NetworkState:
+    dev = state.devices[device]
+    table = dev.srv6_policies
+    if table is None or key not in table.policies:
+        return state
+    old = table.policies[key]
+    if old.owner != client:
+        raise ValueError('policy belongs to another owner')
+    by_client = table.steering_by_client
+    for owner, rules in by_client.sorted_items():
+        by_client = by_client.set(owner, tuple(r for r in rules if r.policy != key))
+    new = replace(
+        table,
+        policies=table.policies.remove(key),
+        states=table.states.remove(key),
+        bsids=table.bsids.remove(old.bsid) if old.bsid is not None else table.bsids,
+        steering_by_client=by_client,
+        steering=_steering(by_client),
+    )
+    return replace(
+        state, devices=state.devices.set(device, replace(dev, srv6_policies=new))
+    )
+
+
+def _steering(
+    by_client: PMap[ClientId, tuple[SteeringRule, ...]],
+) -> tuple[SteeringRule, ...]:
+    rows = [
+        (owner, rule) for owner, rules in by_client.sorted_items() for rule in rules
+    ]
+    rows.sort(
+        key=lambda pair: (
+            -(pair[1].dst[1] if pair[1].dst else -1),
+            pair[1].dscp is None,
+            pair[1].sport is None,
+            pair[1].id,
+            pair[0],
+        )
+    )
+    return tuple(rule for _, rule in rows)
+
+
+def set_steering(
+    state: NetworkState, device: str, client: ClientId, rules: tuple[SteeringRule, ...]
+) -> NetworkState:
+    dev = state.devices[device]
+    table = dev.srv6_policies or Srv6Policies()
+    ids = set()
+    for rule in rules:
+        if not rule.id or rule.id in ids:
+            raise ValueError('steering ids must be nonempty and unique per client')
+        ids.add(rule.id)
+        policy = table.policies.get(rule.policy)
+        if policy is None or policy.owner != client:
+            raise ValueError('steering policy must belong to the client')
+        if rule.af not in (None, 4, 6) or (rule.dst is not None and rule.af is None):
+            raise ValueError('steering destination needs an address family')
+        if rule.dst is not None:
+            from netsim.model.addressing import mask_for
+
+            net, length = rule.dst
+            bits = 32 if rule.af == 4 else 128
+            if (
+                not 0 <= length <= bits
+                or not 0 <= net < 1 << bits
+                or net & ~mask_for(length, bits)
+            ):
+                raise ValueError('invalid steering prefix')
+        if rule.dscp is not None and not 0 <= rule.dscp <= 63:
+            raise ValueError('invalid steering DSCP')
+        if rule.sport is not None and not 0 <= rule.sport <= 65535:
+            raise ValueError('invalid steering source port')
+    by_client = (
+        table.steering_by_client.set(client, rules)
+        if rules
+        else table.steering_by_client.remove(client)
+    )
+    new = canon(
+        table,
+        replace(table, steering_by_client=by_client, steering=_steering(by_client)),
+    )
+    if new is table:
+        return state
+    return replace(
+        state, devices=state.devices.set(device, replace(dev, srv6_policies=new))
+    )
+
+
+def unknown_prefixes(db: Srv6Sids) -> tuple[tuple[int, int], ...]:
+    """Exact LIB/WLIB cover, not a summary that could swallow a routed GIB."""
+    if not db.drop_unknown_local:
+        return ()
+    from ipaddress import collapse_addresses
+
+    nets = []
+    blocks = sorted(
+        {loc.block for loc in db.locators.values() if is_csid(loc.structure)}
+    )
+    for block in blocks:
+        ranges = db.ranges.get(block, SidRanges())
+        for low, high in (ranges.lib, ranges.wlib):
+            start = block[0] | low << 80
+            end = block[0] | high << 80 | ((1 << 80) - 1)
+            nets.extend(summarize_address_range(IPv6Address(start), IPv6Address(end)))
+    return tuple(
+        (int(net.network_address), net.prefixlen) for net in collapse_addresses(nets)
+    )
+
+
+def validate(state: NetworkState) -> list[str]:
+    problems: list[str] = []
+    locators = [
+        (name, loc)
+        for name, dev in state.devices.sorted_items()
+        if dev.srv6_sids
+        for _, loc in dev.srv6_sids.locators.sorted_items()
+    ]
+    for name, dev in state.devices.sorted_items():
+        if not 1 <= dev.config.srv6_hop_limit <= 255:
+            problems.append(f'{name}: invalid SRv6 hop limit')
+        if dev.config.srv6_source is not None:
+            try:
+                ipv6(dev.config.srv6_source)
+            except ValueError:
+                problems.append(f'{name}: invalid SRv6 source')
+        db = dev.srv6_sids
+        if db is None:
+            continue
+        for _, loc in db.locators.sorted_items():
+            try:
+                prefix6(loc.prefix)
+                prefix6(loc.block)
+                ranges = db.ranges.get(loc.block, SidRanges())
+                ranges.__post_init__()
+                if is_csid(loc.structure):
+                    if (
+                        loc.block[1] != 32
+                        or loc.node_id is None
+                        or not ranges.gib[0] <= loc.node_id <= ranges.gib[1]
+                    ):
+                        raise ValueError('node id outside GIB or invalid block')
+                    if loc.prefix != (loc.block[0] | loc.node_id << 80, 48):
+                        raise ValueError(
+                            'locator prefix differs from block and node id'
+                        )
+                elif loc.prefix[1] != loc.structure.lbl + loc.structure.lnl:
+                    raise ValueError('invalid classic locator length')
+            except ValueError as exc:
+                problems.append(f'{name}:{loc.name}: {exc}')
+        for value, row in db.sids.sorted_items():
+            reason = check_gate_b(row.behavior, row.flavors)
+            if reason:
+                problems.append(f'{name}: {reason}: {behavior_name(row.behavior)}')
+            if (
+                row.sid != value
+                or not 0 <= value < 1 << 128
+                or row.length != row.structure.installed_length
+                or not 0 < row.length <= 128
+            ):
+                problems.append(f'{name}: invalid SID key/length')
+                continue
+            if value & ((1 << (128 - row.length)) - 1):
+                problems.append(f'{name}: local SID must have zero argument')
+            try:
+                loc = select_locator(db, row.structure, None, value)
+                ranges = db.ranges.get(loc.block, SidRanges())
+                if is_csid(row.structure):
+                    if row.structure == F3216_GIB:
+                        if value != loc.prefix[0] or row.behavior != END:
+                            raise ValueError(
+                                'GIB SID must equal its node prefix and use End'
+                            )
+                    else:
+                        function = value >> (128 - row.length) & (
+                            (1 << row.structure.fl) - 1
+                        )
+                        high = function >> 16 if row.structure.fl == 32 else function
+                        pool = ranges.wlib if row.structure.fl == 32 else ranges.lib
+                        if not pool[0] <= high <= pool[1]:
+                            raise ValueError('local function outside LIB/WLIB')
+                        if row.structure.lnl and not contains(loc.prefix, value):
+                            raise ValueError('composite SID has the wrong node id')
+                    if row.structure == F3216_TERMINAL and row.behavior != END_DT46:
+                        raise ValueError('terminal structure requires End.DT46')
+                elif not contains(loc.prefix, value):
+                    raise ValueError('SID outside classic locator')
+                if row.flavors & NEXT_CSID and not is_csid(row.structure):
+                    raise ValueError('NEXT-C-SID requires supported structure')
+                if row.behavior == END_X and row.interface not in dev.interfaces:
+                    raise ValueError('End.X requires a bound interface')
+                if row.behavior != END_X and (
+                    row.interface is not None or row.nexthop is not None
+                ):
+                    raise ValueError('only End.X accepts interface/nexthop')
+            except ValueError as exc:
+                problems.append(f'{name}: {exc}')
+            for other, loc in locators:
+                if (
+                    other != name
+                    and is_csid(loc.structure)
+                    and row.length <= loc.prefix[1]
+                    and contains((value, row.length), loc.prefix[0])
+                ):
+                    problems.append(f'{name}: local SID covers {other} uN prefix')
+    for i, (name, loc) in enumerate(locators):
+        for other, remote in locators[i + 1 :]:
+            overlap = contains(loc.prefix, remote.prefix[0]) or contains(
+                remote.prefix, loc.prefix[0]
+            )
+            if overlap:
+                problems.append(
+                    f'{name}/{other}: locators overlap (node ids must be unique)'
+                )
+            if loc.block == remote.block:
+                left, right = (
+                    state.devices[name].srv6_sids,
+                    state.devices[other].srv6_sids,
+                )
+                assert left is not None and right is not None
+                if left.ranges.get(loc.block, SidRanges()) != right.ranges.get(
+                    remote.block, SidRanges()
+                ):
+                    problems.append(f'{name}/{other}: conflicting ranges for block')
+            elif contains(loc.block, remote.block[0]) or contains(
+                remote.block, loc.block[0]
+            ):
+                problems.append(f'{name}/{other}: locator blocks overlap')
+        for other, dev in state.devices.sorted_items():
+            for iface, node in dev.interfaces.sorted_items():
+                if any(contains(loc.block, addr) for addr, _ in node.config.ipv6):
+                    problems.append(
+                        f'{name}: locator block covers interface address {other}:{iface}'
+                    )
+    for name, dev in state.devices.sorted_items():
+        table = dev.srv6_policies
+        if table is None:
+            continue
+        expected = {}
+        for key, policy in table.policies.sorted_items():
+            try:
+                check_policy(policy)
+                if key != policy.key:
+                    raise ValueError('policy key mismatch')
+                if policy.bsid is not None:
+                    if policy.bsid in expected or (
+                        dev.srv6_sids and policy.bsid in dev.srv6_sids.sids
+                    ):
+                        raise ValueError('BSID collision')
+                    expected[policy.bsid] = key
+            except ValueError as exc:
+                problems.append(f'{name}: {exc}')
+        if dict(table.bsids.items()) != expected:
+            problems.append(f'{name}: BSID index mismatch')
+    return problems
+
+
+def require_valid(state: NetworkState) -> None:
+    problems = validate(state)
+    if problems:
+        raise ValueError('; '.join(problems))
+
+
+def consumers_affected(old: NetworkState, new: NetworkState) -> set[str]:
+    """Conservatively invalidate every policy consumer for SR/underlay edits.
+
+    Includes failed lookups: a formerly missing SID, interface or route can
+    appear anywhere. Derived policy *states* and FIB outputs are excluded to
+    prevent self-triggering FIB rounds. G3 may record positive and negative
+    SID queries (device, SID), symbolic queries (device, interface/behavior),
+    policy keys and RIB lookups; no dependency is needed to use this fallback.
+    """
+    from netsim.model.state import diff_pmap
+
+    delta = diff_pmap(old.devices, new.devices, by_identity=True)
+    changed = bool(delta.added or delta.removed or old.links != new.links)
+    for name in delta.changed:
+        a, b = old.devices[name], new.devices[name]
+        if (
+            a.srv6_sids != b.srv6_sids
+            or a.interfaces != b.interfaces
+            or a.neighbors != b.neighbors
+            or a.ribs != b.ribs
+            or a.config != b.config
+        ):
+            changed = True
+        pa, pb = a.srv6_policies, b.srv6_policies
+        if policy_inputs(pa) != policy_inputs(pb):
+            changed = True
+    if not changed:
+        return set()
+    return set(consumer_index(old, new))
+
+
+def consumer_index(old: NetworkState, new: NetworkState) -> frozenset[str]:
+    """Update the root index by changed shards; plain-IP edits never scan the tree."""
+    from netsim.model.state import diff_pmap
+
+    delta = diff_pmap(old.devices, new.devices, by_identity=True)
+    consumers = set(old.srv6_consumers)
+    consumers.difference_update(delta.removed)
+    for name in delta.added + delta.changed:
+        table = new.devices[name].srv6_policies
+        if table is not None and table.policies:
+            consumers.add(name)
+        else:
+            consumers.discard(name)
+    return canon(new.srv6_consumers, frozenset(consumers))
+
+
+def policy_inputs(table: Srv6Policies | None) -> tuple[Any, ...]:
+    return (
+        (table.policies, table.steering, table.bsids, table.steering_by_client)
+        if table
+        else ()
+    )

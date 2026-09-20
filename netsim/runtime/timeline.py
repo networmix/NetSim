@@ -24,7 +24,7 @@ from dataclasses import field
 from typing import Any, Callable, Iterable, Iterator
 
 from netsim.model import forwarding as fw
-from netsim.model import routing
+from netsim.model import routing, srv6
 from netsim.model.addressing import IPV4, IPV6, to_address
 from netsim.model.interfaces import (
     EthernetNode,
@@ -33,7 +33,14 @@ from netsim.model.interfaces import (
     StateReason,
 )
 from netsim.model.links import LINK_UP
-from netsim.model.state import FloatArray, NetworkState, StateDelta, diff_pmap, record
+from netsim.model.state import (
+    FloatArray,
+    NetworkState,
+    PMap,
+    StateDelta,
+    diff_pmap,
+    record,
+)
 
 # ---------------------------------------------------------------------------
 # Names for small ints (no shared lookup tables on the extraction path)
@@ -213,6 +220,55 @@ class Event:
                 d[f.name] = getattr(self, f.name)
         d['origin'] = str(self.origin)
         return d
+
+
+@record
+class LocatorEvent(Event):
+    seq: int
+    idx: int
+    time: float
+    round: int
+    origin: Origin
+    device: str
+    action: str
+    name: str
+    prefix: str
+
+
+@record
+class SidEvent(Event):
+    seq: int
+    idx: int
+    time: float
+    round: int
+    origin: Origin
+    device: str
+    action: str
+    sid: str
+    behavior: str
+    flavors: tuple[str, ...]
+    owner: str
+    interface: str | None
+    adjacency_up: bool
+
+
+@record
+class PolicyEvent(Event):
+    seq: int
+    idx: int
+    time: float
+    round: int
+    origin: Origin
+    device: str
+    action: str
+    color: int
+    endpoint: str
+    name: str | None
+    owner: str
+    active_path: int | None
+    status: str
+    reasons: tuple[tuple[int, int, str], ...]
+    programmed_version: int
 
 
 @record
@@ -444,6 +500,7 @@ def extract_events(
     d = delta.devices()
     for name in d.removed:
         emit(DeviceEvent, device=name, action='removed')
+        _srv6_events(emit, old.devices[name], None, name)
     for name in d.added + d.changed:
         odev, ndev = old.devices.get(name), new.devices.get(name)
         if ndev is None:
@@ -462,6 +519,7 @@ def extract_events(
                 action='config',
                 changes=_changes(odev.config, ndev.config),
             )
+        _srv6_events(emit, odev, ndev, name)
         _interface_events(emit, odev, ndev, name, delta)
         _route_events(emit, odev, ndev, name, delta)
         _fib_events(emit, odev, ndev, name, delta)
@@ -498,6 +556,92 @@ def extract_events(
                 report=rep if keep_report else None,
             )
     return out
+
+
+def _srv6_events(emit: Callable[..., None], old: Any, new: Any, name: str) -> None:
+    before = old.srv6_sids if old else None
+    after = new.srv6_sids if new else None
+    if before is not after:
+        locs_old = before.locators if before else PMap()
+        locs_new = after.locators if after else PMap()
+        for key in diff_pmap(locs_old, locs_new).keys:
+            a, b = locs_old.get(key), locs_new.get(key)
+            loc = b if b is not None else a
+            assert loc is not None
+            emit(
+                LocatorEvent,
+                device=name,
+                action='add' if a is None else 'remove' if b is None else 'replace',
+                name=key,
+                prefix=_prefix_str(loc.prefix, IPV6),
+            )
+        sids_old = before.sids if before else PMap()
+        sids_new = after.sids if after else PMap()
+        for key in diff_pmap(sids_old, sids_new).keys:
+            a, b = sids_old.get(key), sids_new.get(key)
+            sid = b if b is not None else a
+            assert sid is not None
+            action = (
+                'add'
+                if a is None
+                else 'remove'
+                if b is None
+                else 'replace'
+                if dataclasses.replace(a, adjacency_up=b.adjacency_up) != b
+                else 'adjacency_up'
+                if b.adjacency_up
+                else 'adjacency_down'
+            )
+            emit(
+                SidEvent,
+                device=name,
+                action=action,
+                sid=str(to_address(key, IPV6)),
+                behavior=srv6.behavior_name(sid.behavior),
+                flavors=srv6.flavor_names(sid.flavors),
+                owner=f'{sid.owner.name}:{sid.owner.instance}',
+                interface=sid.interface,
+                adjacency_up=sid.adjacency_up,
+            )
+    a_table = old.srv6_policies if old else None
+    b_table = new.srv6_policies if new else None
+    if a_table is b_table:
+        return
+    policies_old = a_table.policies if a_table else PMap()
+    policies_new = b_table.policies if b_table else PMap()
+    states_old = a_table.states if a_table else PMap()
+    states_new = b_table.states if b_table else PMap()
+    changed = set(diff_pmap(policies_old, policies_new).keys) | set(
+        diff_pmap(states_old, states_new).keys
+    )
+    for key in sorted(changed):
+        a, b = policies_old.get(key), policies_new.get(key)
+        policy = b if b is not None else a
+        if policy is None:
+            continue
+        state = states_new.get(key) or states_old.get(key) or srv6.PolicyState()
+        action = (
+            'add'
+            if a is None
+            else 'delete'
+            if b is None
+            else 'replace'
+            if a != b
+            else 'state'
+        )
+        emit(
+            PolicyEvent,
+            device=name,
+            action=action,
+            color=key[0],
+            endpoint=str(to_address(key[1], IPV6)),
+            name=policy.name,
+            owner=f'{policy.owner.name}:{policy.owner.instance}',
+            active_path=state.active_path,
+            status=state.status,
+            reasons=state.reasons,
+            programmed_version=state.programmed_version,
+        )
 
 
 def _interface_events(
