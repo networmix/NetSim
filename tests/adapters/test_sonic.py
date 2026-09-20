@@ -433,3 +433,54 @@ def test_dump_rejects_invalid_policy_lists_and_unmodeled_port_settings():
     net['R1']['Ethernet0'].configure(metric=9)
     with pytest.raises(sonic.SchemaError, match='interface settings'):
         sonic.dump(net)
+
+
+@pytest.mark.parametrize(
+    'field,unsupported,default',
+    [
+        ('enabled', False, True),
+        ('srv6_hop_limit', 7, 64),
+        ('srv6_source', 1, None),
+    ],
+)
+@pytest.mark.parametrize('imported', [False, True])
+def test_device_settings_cannot_be_silently_defaulted_on_export(
+    field,
+    unsupported,
+    default,
+    imported,
+    tmp_path,
+):
+    if imported:
+        net = sonic.load(config())
+    else:
+        net = Network()
+        net.add_device('R1')
+    original = sonic.dump(net)
+    assert getattr(sonic.load(original)['R1'].node.config, field) == default
+    net['R1'].configure(**{field: unsupported})
+    before = net.state
+    target = tmp_path / 'config.json'
+    target.write_text('existing file')
+    with pytest.raises(sonic.SchemaError, match=rf'R1.*{field}'):
+        sonic.dump(net, target)
+    assert net.state is before
+    assert target.read_text() == 'existing file'
+    net['R1'].configure(**{field: default})
+    assert sonic.dump(net) == original
+    assert getattr(sonic.load(sonic.dump(net))['R1'].node.config, field) == default
+
+
+@pytest.mark.parametrize(
+    'field,value',
+    [
+        ('enabled', False),
+        ('srv6_hop_limit', 7),
+        ('srv6_source', 1),
+    ],
+)
+def test_device_settings_are_outside_version_one_input_schema(field, value):
+    source = config()
+    source['devices']['R1'][field] = value
+    with pytest.raises(sonic.SchemaError, match=rf'R1.*{field}'):
+        sonic.load(source)
