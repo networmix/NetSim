@@ -535,3 +535,21 @@ class TestReviewRegressions:
         rounds = sorted({r.round for r in sim.timeline.records if r.time == 5})
         assert rounds == [0, 1]
         assert sim.timeline.stage_names(5).count('carrier') == 2
+
+
+def test_event_and_record_budgets_bound_a_long_run():
+    net, R = build_diamond(min_links=2)
+    env = netsim.Environment()
+    sim = Simulation(
+        env, net, keep_events=200, keep_records=50, keep_roots=1, keep_deltas=0
+    )
+    link = net.links[LINK]
+    for k in range(400):
+        sim.at(1 + k, link.fail if k % 2 == 0 else link.restore)
+    sim.run_until(500)
+    tl = sim.timeline
+    assert len(tl.events) <= 200 + max(64, 200 // 8)
+    assert len(tl.records) <= 50 + 64
+    assert tl.dropped_events > 0 and tl.dropped_records > 0
+    assert tl.events[-1].time == tl.records[-1].time  # the newest survive
+    assert tl.records[-1].seq == sim.timeline._seq

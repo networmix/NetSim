@@ -24,6 +24,8 @@ class Simulation:
         keep_roots: int | None = 256,
         keep_deltas: int = 64,
         extract_events: bool = True,
+        keep_events: int | None = None,
+        keep_records: int | None = None,
     ) -> None:
         if getattr(network, '_simulation', None) is not None:
             raise RuntimeError('network is already bound to a Simulation')
@@ -31,7 +33,11 @@ class Simulation:
         self.network = network
         network.clock = lambda: env.now
         self.timeline = Timeline(
-            keep_roots=keep_roots, keep_deltas=keep_deltas, extract=extract_events
+            keep_roots=keep_roots,
+            keep_deltas=keep_deltas,
+            extract=extract_events,
+            keep_events=keep_events,
+            keep_records=keep_records,
         )
         self.stats = Stats()
         self.bus = EventBus(env, network)

@@ -688,8 +688,11 @@ class Timeline:
     """Append-only event log with bounded raw retention.
 
     ``events`` holds every extracted event and ``records`` one entry per
-    commit; ``deltas`` and ``roots`` are bounded deques (defaults keep the
-    last 64 deltas and the last root of the last 256 timestamps).
+    commit, unless ``keep_events`` / ``keep_records`` budgets are set (then
+    the oldest are dropped and counted in ``dropped_events`` /
+    ``dropped_records``); ``deltas`` and ``roots`` are bounded deques
+    (defaults keep the last 64 deltas and the last root of the last 256
+    timestamps).
     """
 
     def __init__(
@@ -700,9 +703,17 @@ class Timeline:
         extract: bool = True,
         keep_reports: bool = False,
         keep_arrays: bool = True,
+        keep_events: int | None = None,
+        keep_records: int | None = None,
     ) -> None:
         self.events: list[Event] = []
         self.records: list[Record] = []
+        self.keep_events = keep_events
+        """Budget for ``events``: the oldest are dropped past it (``None``: unbounded)."""
+        self.keep_records = keep_records
+        """Budget for ``records`` (``None``: unbounded)."""
+        self.dropped_events = 0
+        self.dropped_records = 0
         self.deltas: deque[tuple[int, StateDelta]] = deque(maxlen=keep_deltas)
         self.roots: deque[tuple[float, NetworkState]] = deque(maxlen=keep_roots)
         self.extract = extract
@@ -736,11 +747,28 @@ class Timeline:
             Record(self._seq, time, round_, origin, len(events), delta.new.version)
         )
         self.events.extend(events)
+        self._trim()
         self.deltas.append((self._seq, delta))
         if self.roots and self.roots[-1][0] == time:
             self.roots[-1] = (time, delta.new)
         else:
             self.roots.append((time, delta.new))
+
+    def _trim(self) -> None:
+        """Enforce the budgets; trims in blocks so the cost is amortized O(1)."""
+        for name, keep in (
+            ('events', self.keep_events),
+            ('records', self.keep_records),
+        ):
+            if keep is None:
+                continue
+            seq: list[Any] = getattr(self, name)
+            excess = len(seq) - keep
+            if excess > 0 and excess >= max(64, keep // 8):
+                del seq[:excess]
+                setattr(
+                    self, f'dropped_{name}', getattr(self, f'dropped_{name}') + excess
+                )
 
     def baseline(self, time: float, root: NetworkState) -> None:
         """Record the starting point: the root, and a placement event when
