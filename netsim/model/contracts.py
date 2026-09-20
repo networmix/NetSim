@@ -716,6 +716,14 @@ class ConnectionState:
     b_to_a_reachable: bool = False
     deps: tuple[str, ...] = ()
     """Devices visited by the previous path derivation (both directions)."""
+    a_interface: str | None = None
+    b_interface: str | None = None
+    a_interface_generation: int = 0
+    b_interface_generation: int = 0
+    a_to_b_delay: float = 0.0
+    b_to_a_delay: float = 0.0
+    draining: bool = False
+    """Close requested; accepted messages drain before DOWN/CLOSED."""
 
 
 @record
@@ -724,6 +732,8 @@ class Listener:
     agent: str
     endpoint: Endpoint
     generation: int
+    interface: str | None = None
+    interface_generation: int = 0
 
 
 @record

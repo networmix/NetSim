@@ -308,4 +308,5 @@ class TestRuntimeStubs:
         assert sim.agents.generation('R1', 'nope') is None
         assert sim.agents.budget()['agents'] == 1
         assert sim.agents.budget()['pending_runs'] == 1
-        assert sim.transport.budget() == {}
+        assert sim.transport.budget()['inflight_datagrams'] == 0
+        assert sim.transport.budget()['queued_messages'] == 0
