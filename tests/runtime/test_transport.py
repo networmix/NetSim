@@ -100,12 +100,12 @@ def test_failed_wire_during_carrier_delay_and_inflight_drop():
     sim.at(10, link.fail)
     sim.run_until(10.2)
     assert sim.state.devices['R1'].interfaces['e1'].oper.oper == OperState.UP
-    rejection = send(sim, ga, 'failed')
-    assert rejection.reason == 'LINK_DOWN'
-    assert sim.agents.entries[-1][2] == rejection
+    assert send(sim, ga, 'failed') is None
+    assert not sim.agents.entries
     sim.run_until(11)
     assert not deliveries(sim)
-    assert sim.transport.budget()['datagrams_dropped'] == 1
+    assert sim.transport.budget()['datagrams_dropped'] == 2
+    assert sim.transport.budget()['datagrams_lost_physical'] == 2
 
 
 def test_fifo_with_shorter_later_delay():
@@ -170,11 +170,12 @@ def test_old_datagram_incarnations_are_never_delivered(change):
     assert sim.transport.budget()['datagrams_dropped'] == 1
 
 
-def test_receiver_physical_down_before_derived_oper_is_rejected():
+def test_receiver_physical_down_before_derived_oper_is_silent_loss():
     sim, ga, _ = pair()
     sim.network.devices['R2']['e2'].admin_down()
     assert sim.state.devices['R1'].interfaces['e1'].oper.oper == OperState.UP
-    assert send(sim, ga, 'no').reason == 'RX_DOWN'
+    assert send(sim, ga, 'no') is None
+    assert sim.transport.budget()['datagrams_lost_physical'] == 1
     sim.settle()
     assert send(sim, ga, 'no').reason == 'INTERFACE_DOWN'
 
@@ -187,7 +188,7 @@ def test_missing_port_and_full_inbox_are_counted():
     sim.run_until(0.125)
     assert sim.transport.budget()['datagrams_dropped'] == 2
     assert sim.transport.budget()['inbox_rejections'] == 1
-    assert sim.agents.entries[-1][2].reason == c.OVERFLOW
+    assert sim.agents.entries[-1][2].reason == 'INBOX_FULL'
 
 
 def test_channel_delivery_does_not_iterate_channel_registry():
