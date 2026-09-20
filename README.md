@@ -213,27 +213,6 @@ The design document behind this layer (state tree, rounds, RIB/FIB
 resolution, SRv6 plan, placement semantics) is kept with the project
 plans; Gate A ships plain IP, Gate B adds SRv6, Gate C protocol agents.
 
-## Development
-
-```bash
-make dev          # create venv, install deps, set up pre-commit
-make check        # pre-commit + tests + lint
-make test         # tests with coverage
-make qt           # quick tests (no coverage)
-make lint         # ruff + pyright
-make venv-ft      # free-threaded (no GIL) venv, needs uv or python3.14t
-make check-ft     # lint + tests on the free-threaded venv
-```
-
-## Requirements
-
-- Python 3.11+ (CI runs 3.11 to 3.14 and the free-threaded 3.14t build)
-- No runtime dependencies
-
-## License
-
-MIT
-
 ## Failure and availability studies
 
 `netsim.study.Study` adds transient measurements to the network model. The
@@ -377,3 +356,24 @@ The command requires NetGraph, registers the step before parsing, runs
 `Scenario.from_yaml(text).run()`, and writes the complete NetGraph results
 including all workflow steps. Without `--results`, it writes `results.json` in
 the current directory. Core imports and `netsim --help` work without NetGraph.
+
+## Development
+
+```bash
+make dev          # create venv, install deps, set up pre-commit
+make check        # pre-commit + tests + lint
+make test         # tests with coverage
+make qt           # quick tests (no coverage)
+make lint         # ruff + pyright
+make venv-ft      # free-threaded (no GIL) venv, needs uv or python3.14t
+make check-ft     # lint + tests on the free-threaded venv
+```
+
+## Requirements
+
+- Python 3.11+ (CI runs 3.11 to 3.14 and the free-threaded 3.14t build)
+- No runtime dependencies
+
+## License
+
+MIT
