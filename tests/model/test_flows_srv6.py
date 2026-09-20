@@ -32,14 +32,13 @@ def _chain():
 def test_every_template_field_separates_classes():
     template = PacketTemplate(4, 1, 2)
     demand = flows.Demand('d', 'R1', 2, 4, 100e6, template=template)
-    from netsim.model.packets import SRH
-
     for field in fields(template):
-        current = getattr(template, field.name)
-        if current is None:  # optional header-stack fields (srh, inner)
-            value = SRH((1,), 0, 0) if field.name == 'srh' else PacketTemplate(6, 1, 2)
+        if field.name == 'srh':
+            value = SRH((3,), 0, 0)
+        elif field.name == 'inner':
+            value = PacketTemplate(4, 2, 3)
         else:
-            value = current + 1
+            value = getattr(template, field.name) + 1
         changed = replace(template, **{field.name: value})
         assert replace(demand, template=changed).class_key != demand.class_key, (
             field.name
