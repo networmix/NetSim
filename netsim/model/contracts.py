@@ -128,8 +128,12 @@ class AgentConfig:
     run_delay: float = 1e-3
     """Batching latency between a cause and the run (finite, non-negative;
     zero is permitted and guarded by ``max_rounds_per_timestamp``)."""
-    processing_delay: float = 0.0
-    """Added to every datagram and message delivery this agent sends."""
+    processing_delay: float = 1e-3
+    """Added to every datagram and message delivery this agent sends. The
+    default of one millisecond keeps deliveries strictly in the future even
+    over zero-delay links (the engine never delivers a message at the time
+    it was sent); a zero value is valid only with positive link delays and
+    the transport rejects a send whose delivery would not advance the clock."""
     inbox_limit: int = 10_000
     """Maximum captured plus uncaptured inbox entries; overflow is an explicit
     rejection of the delivery (never silent truncation)."""

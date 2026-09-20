@@ -93,6 +93,9 @@ class Simulation:
         self.pipeline.suspended = True
         self.timeline.initializing = True
         try:
+            # A fresh runtime restarts agents another runtime initialized
+            # (a fork is not a warm protocol restart), then derives the tree.
+            self.agents.restart_all()
             network.converge(env.now)
         finally:
             self.pipeline.suspended = False

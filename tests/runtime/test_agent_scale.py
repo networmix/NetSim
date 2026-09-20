@@ -33,11 +33,7 @@ def idle_fixture(count):
         nodes = {}
         for plugin in plugins:
             nodes[plugin.client.name] = c.AgentNode(
-                plugin.client.name,
-                generation,
-                plugin.client,
-                plugin.config,
-                initialized=True,
+                plugin.client.name, generation, plugin.client, plugin.config
             )
             generation += 1
             net.agents[name, plugin.client.name] = plugin
@@ -51,7 +47,15 @@ def idle_fixture(count):
         Environment(), net, extract_events=False, keep_deltas=0, keep_roots=0
     )
     assert sim.agents.budget()['agents'] == count
+    # A fresh runtime initializes every agent itself (on_init at t=0); the
+    # fixture is idle once those runs are published.
+    sim.settle()
     assert not sim.agents.kind().pending
+    assert all(
+        node.initialized
+        for dev in sim.state.devices.values()
+        for node in dev.agents.values()
+    )
     old = sim.state
     device = old.devices['r00000']
     new = replace(

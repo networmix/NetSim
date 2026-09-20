@@ -184,6 +184,46 @@ class AgentRuntime:
             _future(self.sim.env.now, delay)
         return delay
 
+    def restart_all(self) -> None:
+        """A fresh runtime starts every agent from configuration.
+
+        A ``Network.fork()`` shares agent nodes that another runtime already
+        initialized (state, RNG, receipts) while this runtime has none of
+        their inboxes, timers or sessions: a model fork is not a warm
+        protocol restart (runtime checkpoint and restore are deferred). Every
+        initialized node therefore restarts with a fresh generation before
+        ``bind`` schedules ``on_init``; its routes, policies, SIDs and NHT
+        registrations are retained until the restarted agent's first ``sync``
+        (the ``reset_agent(purge=False)`` rule).
+        """
+        stale = sorted(
+            (device, name)
+            for device, name in self.sim.network.agents
+            if (node := self._node(device, name)) is not None
+            and (node.initialized or node.receipt is not None or node.runs)
+        )
+        if not stale:
+            return
+
+        def apply(state: NetworkState) -> NetworkState:
+            devices = state.devices
+            allocators = state.allocators
+            for device, name in stale:
+                dev = devices[device]
+                node = dev.agents[name]
+                allocators, generation = allocators.take_generation()
+                fresh = c.AgentNode(name, generation, node.client, node.config)
+                devices = devices.set(
+                    device, replace(dev, agents=dev.agents.set(name, fresh))
+                )
+            return replace(state, devices=devices, allocators=allocators)
+
+        self.sim.network.update(apply, ('restart_agents', len(stale)))
+
+    def _node(self, device: str, name: str) -> c.AgentNode | None:
+        dev = self.sim.state.devices.get(device)
+        return dev.agents.get(name) if dev is not None else None
+
     def bind(self) -> None:
         for device, name in sorted(self.sim.network.agents):
             node = self.sim.state.devices[device].agents.get(name)

@@ -22,7 +22,11 @@ from netsim.model.state import NetworkState
 def future(now: float, delay: float) -> float:
     target = float(now + delay)
     if not isfinite(delay) or delay <= 0 or not isfinite(target) or target <= now:
-        raise ValueError('transport delay must produce a strictly future finite time')
+        raise ValueError(
+            f'transport delay {delay!r} at t={now!r} must produce a strictly '
+            'future finite time: give the link a positive delay or the agent '
+            'a positive processing_delay'
+        )
     return target
 
 

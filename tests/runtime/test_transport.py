@@ -39,6 +39,9 @@ def register(net, device, name='ref', **kwargs):
     agent = Minimal()
     agent.client = c.ClientId(name)
     agent.profile = c.ClientProfile(agent.client, distance=115)
+    # These fixtures assert exact wire timings: the link delay alone decides
+    # delivery unless a test asks for a processing delay explicitly.
+    kwargs.setdefault('processing_delay', 0.0)
     agent.config = c.AgentConfig(listen_ports=(179,), **kwargs)
     return net.add_agent(device, agent, name=name).generation
 
