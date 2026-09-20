@@ -1,0 +1,375 @@
+{
+  "baseline": "34c031d",
+  "date": "2026-09-20",
+  "runs": {
+    "final": {
+      "A1": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "/tmp/netsim-t7-scoped-l3/pipeline-old.py",
+          "derive": "/tmp/netsim-t7-scoped-l3/derive-old.py",
+          "workload": "carrier",
+          "legacy_link_lookup": false,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.2070895000360906
+            ],
+            "median_seconds": 0.2070895000360906,
+            "us_per_deadline": 828.3580001443624,
+            "deadline_seconds": [
+              0.1811117499601096
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 500,
+            "seconds": [
+              0.6680253748781979
+            ],
+            "median_seconds": 0.6680253748781979,
+            "us_per_deadline": 1336.0507497563958,
+            "deadline_seconds": [
+              0.5961299578193575
+            ],
+            "records": 1503,
+            "fingerprint": "38418334661c3388e38407461b55c51c49553638b6439626d72d4c1d02dc5c84"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              4.464625249849632
+            ],
+            "median_seconds": 4.464625249849632,
+            "us_per_deadline": 4464.625249849632,
+            "deadline_seconds": [
+              3.509642999852076
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          },
+          {
+            "n": 2000,
+            "seconds": [
+              18.354680082993582
+            ],
+            "median_seconds": 18.354680082993582,
+            "us_per_deadline": 9177.340041496791,
+            "deadline_seconds": [
+              14.377862832974643
+            ],
+            "records": 6003,
+            "fingerprint": "ab4aa0149f049f327649dc11289ddaac046a5f97c24cd463ef0c02b2614f5556"
+          },
+          {
+            "n": 4000,
+            "seconds": [
+              89.77372029214166
+            ],
+            "median_seconds": 89.77372029214166,
+            "us_per_deadline": 22443.430073035415,
+            "deadline_seconds": [
+              68.0550422500819
+            ],
+            "records": 12003,
+            "fingerprint": "e66a344354efcc32f05a5de35842f3eca6f57452a85e47e46d4963650777eefb"
+          }
+        ]
+      },
+      "B": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "working tree",
+          "derive": "working tree",
+          "workload": "carrier",
+          "legacy_link_lookup": false,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.09100233297795057,
+              0.09048295812681317,
+              0.09195208316668868
+            ],
+            "median_seconds": 0.09100233297795057,
+            "us_per_deadline": 364.0093319118023,
+            "deadline_seconds": [
+              0.07041816599667072,
+              0.07023183302953839,
+              0.07146400003693998
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 500,
+            "seconds": [
+              0.20997824985533953,
+              0.20592366601340473,
+              0.2111283338163048
+            ],
+            "median_seconds": 0.20997824985533953,
+            "us_per_deadline": 419.95649971067905,
+            "deadline_seconds": [
+              0.1612907499074936,
+              0.1579291250091046,
+              0.1614562498871237
+            ],
+            "records": 1503,
+            "fingerprint": "38418334661c3388e38407461b55c51c49553638b6439626d72d4c1d02dc5c84"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              0.3625330829527229,
+              0.35686258296482265,
+              0.34921420901082456
+            ],
+            "median_seconds": 0.35686258296482265,
+            "us_per_deadline": 356.86258296482265,
+            "deadline_seconds": [
+              0.26667908299714327,
+              0.27255441597662866,
+              0.2685962920077145
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          },
+          {
+            "n": 2000,
+            "seconds": [
+              0.7041970000136644,
+              0.716801666887477,
+              0.7433897498995066
+            ],
+            "median_seconds": 0.716801666887477,
+            "us_per_deadline": 358.4008334437385,
+            "deadline_seconds": [
+              0.5404997922014445,
+              0.5504887499846518,
+              0.5607042498886585
+            ],
+            "records": 6003,
+            "fingerprint": "ab4aa0149f049f327649dc11289ddaac046a5f97c24cd463ef0c02b2614f5556"
+          },
+          {
+            "n": 4000,
+            "seconds": [
+              1.4726203749887645,
+              1.4603094588965178,
+              1.4530976249370724
+            ],
+            "median_seconds": 1.4603094588965178,
+            "us_per_deadline": 365.07736472412944,
+            "deadline_seconds": [
+              1.1127150000538677,
+              1.1171982090454549,
+              1.1083833328448236
+            ],
+            "records": 12003,
+            "fingerprint": "e66a344354efcc32f05a5de35842f3eca6f57452a85e47e46d4963650777eefb"
+          }
+        ]
+      },
+      "A2": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "/tmp/netsim-t7-scoped-l3/pipeline-old.py",
+          "derive": "/tmp/netsim-t7-scoped-l3/derive-old.py",
+          "workload": "carrier",
+          "legacy_link_lookup": false,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.2186996671371162
+            ],
+            "median_seconds": 0.2186996671371162,
+            "us_per_deadline": 874.7986685484648,
+            "deadline_seconds": [
+              0.19197225011885166
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 500,
+            "seconds": [
+              0.703494707820937
+            ],
+            "median_seconds": 0.703494707820937,
+            "us_per_deadline": 1406.989415641874,
+            "deadline_seconds": [
+              0.6238846669439226
+            ],
+            "records": 1503,
+            "fingerprint": "38418334661c3388e38407461b55c51c49553638b6439626d72d4c1d02dc5c84"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              4.65668970788829
+            ],
+            "median_seconds": 4.65668970788829,
+            "us_per_deadline": 4656.68970788829,
+            "deadline_seconds": [
+              3.6554077498149127
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          },
+          {
+            "n": 2000,
+            "seconds": [
+              18.50495370803401
+            ],
+            "median_seconds": 18.50495370803401,
+            "us_per_deadline": 9252.476854017004,
+            "deadline_seconds": [
+              14.465983542148024
+            ],
+            "records": 6003,
+            "fingerprint": "ab4aa0149f049f327649dc11289ddaac046a5f97c24cd463ef0c02b2614f5556"
+          },
+          {
+            "n": 4000,
+            "seconds": [
+              87.07270795898512
+            ],
+            "median_seconds": 87.07270795898512,
+            "us_per_deadline": 21768.17698974628,
+            "deadline_seconds": [
+              66.18380970903672
+            ],
+            "records": 12003,
+            "fingerprint": "e66a344354efcc32f05a5de35842f3eca6f57452a85e47e46d4963650777eefb"
+          }
+        ]
+      }
+    },
+    "legacy-final": {
+      "A1": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "/tmp/netsim-t7-scoped-l3/pipeline-old.py",
+          "derive": "/tmp/netsim-t7-scoped-l3/derive-old.py",
+          "workload": "carrier",
+          "legacy_link_lookup": true,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.23154512490145862
+            ],
+            "median_seconds": 0.23154512490145862,
+            "us_per_deadline": 926.1804996058345,
+            "deadline_seconds": [
+              0.18743341695517302
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              4.886022333055735
+            ],
+            "median_seconds": 4.886022333055735,
+            "us_per_deadline": 4886.022333055735,
+            "deadline_seconds": [
+              3.502345875138417
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          }
+        ]
+      },
+      "B": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "working tree",
+          "derive": "working tree",
+          "workload": "carrier",
+          "legacy_link_lookup": true,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.10833966685459018
+            ],
+            "median_seconds": 0.10833966685459018,
+            "us_per_deadline": 433.3586674183607,
+            "deadline_seconds": [
+              0.06933087483048439
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              0.7664931670296937
+            ],
+            "median_seconds": 0.7664931670296937,
+            "us_per_deadline": 766.4931670296937,
+            "deadline_seconds": [
+              0.2689346671104431
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          }
+        ]
+      },
+      "A2": {
+        "configuration": {
+          "python": "3.14.5 (main, May 10 2026, 10:21:34) [Clang 21.0.0 (clang-2100.0.123.102)]",
+          "pipeline": "/tmp/netsim-t7-scoped-l3/pipeline-old.py",
+          "derive": "/tmp/netsim-t7-scoped-l3/derive-old.py",
+          "workload": "carrier",
+          "legacy_link_lookup": true,
+          "deadline_only": false
+        },
+        "samples": [
+          {
+            "n": 250,
+            "seconds": [
+              0.22678429214283824
+            ],
+            "median_seconds": 0.22678429214283824,
+            "us_per_deadline": 907.137168571353,
+            "deadline_seconds": [
+              0.18258662498556077
+            ],
+            "records": 753,
+            "fingerprint": "3a03409541081f108817f43c49bda898faa208c51dccb899f5d5a0073a985ee8"
+          },
+          {
+            "n": 1000,
+            "seconds": [
+              4.901140542002395
+            ],
+            "median_seconds": 4.901140542002395,
+            "us_per_deadline": 4901.140542002395,
+            "deadline_seconds": [
+              3.5106166671030223
+            ],
+            "records": 3003,
+            "fingerprint": "4afb800b1c045ba11d6ea23372fa367d038567954bf3ce911bc9bf678bbf67e3"
+          }
+        ]
+      }
+    }
+  }
+}
