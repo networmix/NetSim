@@ -16,6 +16,16 @@ from netsim.runtime.timeline import Timeline
 from netsim.runtime.transport import TransportRuntime
 
 
+class BudgetExceeded(RuntimeError):
+    """The simulation exhausted its cumulative dispatched-event allowance."""
+
+    def __init__(self, budget: int, dispatched: int, time: float) -> None:
+        self.budget, self.dispatched, self.time = budget, dispatched, time
+        super().__init__(
+            f'event budget {budget} exhausted after {dispatched} events at t={time}'
+        )
+
+
 class Simulation:
     def __init__(
         self,
@@ -23,6 +33,7 @@ class Simulation:
         network: Network,
         *,
         settle_delay: float = 0.0,
+        event_budget: int | None = None,
         max_rounds_per_timestamp: int = 10_000,
         keep_roots: int | None = 256,
         keep_deltas: int = 64,
@@ -34,6 +45,14 @@ class Simulation:
     ) -> None:
         if getattr(network, '_simulation', None) is not None:
             raise RuntimeError('network is already bound to a Simulation')
+        if event_budget is not None and (
+            isinstance(event_budget, bool)
+            or not isinstance(event_budget, int)
+            or event_budget < 0
+        ):
+            raise ValueError('event_budget must be a non-negative integer or None')
+        self.event_budget = event_budget
+        self.events_dispatched = 0
         self.env = env
         self.network = network
         network.clock = lambda: env.now
@@ -99,11 +118,22 @@ class Simulation:
 
     # -- control -------------------------------------------------------------
 
+    def _step(self) -> None:
+        if (
+            self.event_budget is not None
+            and self.events_dispatched >= self.event_budget
+        ):
+            raise BudgetExceeded(
+                self.event_budget, self.events_dispatched, self.env.now
+            )
+        self.events_dispatched += 1
+        self.env.step()
+
     def settle(self, max_steps: int = 100_000) -> int:
         """Process every event at the current time; returns the step count."""
         steps = 0
         while self.env.peek() == self.env.now and steps < max_steps:
-            self.env.step()
+            self._step()
             steps += 1
         if steps >= max_steps:
             raise RuntimeError('settle() exceeded max_steps')
@@ -120,7 +150,7 @@ class Simulation:
             priority = self.env.peek_priority()
             if priority is None or priority < core.DEFERRED:
                 break
-            self.env.step()
+            self._step()
             steps += 1
         if steps >= max_steps:
             raise RuntimeError('run_derivations() exceeded max_steps')
@@ -128,11 +158,20 @@ class Simulation:
 
     def run_until(self, time: float) -> None:
         if time > self.env.now:
-            self.env.run(until=time)
+            # The urgent horizon marker also advances an otherwise idle clock.
+            from netsim.runtime.pipeline import StageEvent
+
+            StageEvent(
+                self.env, core.URGENT, time - self.env.now, lambda _: None, -1, time, 0
+            )
+            while self.env.peek() < time:
+                self._step()
+            self._step()  # horizon marker, before NORMAL/DEFERRED work at time
         self.settle()
 
     def run(self) -> None:
-        self.env.run()
+        while self.env.peek() != float('inf'):
+            self._step()
 
     def at(self, time: float, fn: Callable[[], Any]) -> core.Event:
         """Schedule an operation at *time* (a NORMAL event)."""
@@ -253,4 +292,4 @@ class Simulation:
         return env.process(process(), name=f'send:{device}')
 
 
-__all__ = ['Simulation', 'derive']
+__all__ = ['Simulation', 'BudgetExceeded', 'derive']
