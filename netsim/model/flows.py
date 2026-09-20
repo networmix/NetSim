@@ -38,7 +38,14 @@ from netsim.model.packets import (
     PacketTemplate,
     ip_bytes,
 )
-from netsim.model.state import FloatArray, NetworkState, PMap, empty_pmap, record
+from netsim.model.state import (
+    FloatArray,
+    NetworkState,
+    PMap,
+    diff_pmap,
+    empty_pmap,
+    record,
+)
 
 FLUID = 1
 HASH = 2
@@ -781,12 +788,12 @@ def derive_placement(
 def _same_cache(a: PlacementReport, b: PlacementReport) -> bool:
     if len(a.classes) != len(b.classes) or len(a.deps) != len(b.deps):
         return False
-    for k, v in b.classes.items():
-        if a.classes.get(k) is not v:
-            return False
-    for k, t in b.deps.items():
+    if diff_pmap(a.classes, b.classes, by_identity=True):
+        return False
+    for k in diff_pmap(a.deps, b.deps, by_identity=True).keys:
         old = a.deps.get(k)
-        if old is None or not old.same(t):
+        new = b.deps.get(k)
+        if old is None or new is None or not old.same(new):
             return False
     return True
 

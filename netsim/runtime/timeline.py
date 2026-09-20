@@ -33,7 +33,7 @@ from netsim.model.interfaces import (
     StateReason,
 )
 from netsim.model.links import LINK_UP
-from netsim.model.state import FloatArray, NetworkState, StateDelta, record
+from netsim.model.state import FloatArray, NetworkState, StateDelta, diff_pmap, record
 
 # ---------------------------------------------------------------------------
 # Names for small ints (no shared lookup tables on the extraction path)
@@ -591,17 +591,17 @@ def _route_events(
     for af in delta.ribs(name).keys:
         orib = odev.ribs.get(af) if odev is not None else None
         nrib = ndev.ribs.get(af)
-        oshards = orib.shards if orib is not None else {}
-        nshards = nrib.shards if nrib is not None else {}
-        for plen in sorted(set(oshards) | set(nshards)):
-            os_, ns_ = oshards.get(plen), nshards.get(plen)
-            if os_ is ns_:
-                continue
-            okeys = set(os_.keys()) if os_ is not None else set()
-            nkeys = set(ns_.keys()) if ns_ is not None else set()
+        oshards = orib.shards if orib is not None else None
+        nshards = nrib.shards if nrib is not None else None
+        for plen in sorted(diff_pmap(oshards, nshards).keys):
+            os_ = oshards.get(plen) if oshards is not None else None
+            ns_ = nshards.get(plen) if nshards is not None else None
+
+            def row_order(k):
+                return (k[0], k[1], k[2].name, k[2].instance, repr(k[3]))
+
             for key in sorted(
-                okeys | nkeys,
-                key=lambda k: (k[0], k[1], k[2].name, k[2].instance, repr(k[3])),
+                diff_pmap(os_, ns_, sort_key=row_order).keys, key=row_order
             ):
                 orow = os_.get(key) if os_ is not None else None
                 nrow = ns_.get(key) if ns_ is not None else None
