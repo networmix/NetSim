@@ -269,6 +269,10 @@ class PolicyEvent(Event):
     status: str
     reasons: tuple[tuple[int, int, str], ...]
     programmed_version: int
+    basic_valid: tuple[tuple[int, int], ...] = ()
+    strict_valid: tuple[tuple[int, int], ...] = ()
+    first_valid: tuple[tuple[int, int], ...] = ()
+    programming: str = 'PENDING'
 
 
 @record
@@ -641,6 +645,10 @@ def _srv6_events(emit: Callable[..., None], old: Any, new: Any, name: str) -> No
             status=state.status,
             reasons=state.reasons,
             programmed_version=state.programmed_version,
+            basic_valid=state.basic_valid,
+            strict_valid=state.strict_valid,
+            first_valid=state.first_valid,
+            programming=state.programming,
         )
 
 

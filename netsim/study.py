@@ -17,6 +17,7 @@ from typing import Any
 from netsim.core import Environment
 from netsim.model.addressing import to_address
 from netsim.model.network import Network
+from netsim.model.srv6 import policy_status
 from netsim.model.state import StateDelta
 from netsim.runtime.failures import (
     Draws,
@@ -240,6 +241,7 @@ class Study:
                     'data': {'demand_id': name},
                 }
             )
+        policies = policy_status(network.state, capacity_unit=self.capacity_unit)
         total = sum(f['demand'] for f in flows)
         placed = sum(f['placed'] for f in flows)
         return {
@@ -258,7 +260,7 @@ class Study:
                 'dropped_flows': sum(f['dropped'] > 0 for f in flows),
                 'num_flows': len(flows),
             },
-            'data': {},
+            'data': {'policies': policies} if policies else {},
         }
 
     def _metrics(

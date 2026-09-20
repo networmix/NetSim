@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import field
-from typing import Any
+from typing import Any, Callable
 
 from netsim.model.links import (  # noqa: F401  (re-exported drop reasons)
     LINK_DOWN,
@@ -102,6 +102,10 @@ class Fib:
     version: int
     entries: FrozenPrefixTable[FibEntry]
     groups: PMap[int, NexthopGroup] = field(default_factory=empty_pmap)
+    policy_programs: PMap[tuple[int, int], Any] = field(
+        default_factory=empty_pmap, repr=False
+    )
+    steering: tuple[Any, ...] = field(default=(), repr=False)
 
     def lookup(self, addr: int) -> FibEntry | None:
         match = self.entries.lookup(addr)
@@ -167,6 +171,7 @@ from netsim.model.srv6 import (  # noqa: E402
     END,
     END_DT46,
     END_X,
+    FALLBACK_DROP,
     NEXT_CSID,
     PSP,
     SID_UNKNOWN,
@@ -175,6 +180,7 @@ from netsim.model.srv6 import (  # noqa: E402
     UPPER_LAYER_NOT_ALLOWED,
     USD,
     LocalSid,
+    PolicyRef,
     Srv6Encap,
 )
 from netsim.model.srv6_compress import csid_arg, shift_csid  # noqa: E402
@@ -305,14 +311,74 @@ def local_sid(packet: IPPacket, sid: LocalSid | None) -> SidResult:
     return SidResult(CROSS_CONNECT if cross else DECAP_LOOKUP, inner, adjacency)
 
 
+def steering_policy(view: DeviceView, packet: IPPacket) -> PolicyRef | None:
+    """Match the installed ingress table (RFC 9256 section 8.6)."""
+    if isinstance(packet, IPv6Packet) and isinstance(
+        packet.payload, (IPv4Packet, IPv6Packet)
+    ):
+        return None
+    from netsim.model.addressing import mask_for
+
+    fib = view.fib(6)
+    af = 4 if isinstance(packet, IPv4Packet) else 6
+    key = FlowKey.from_packet(packet)
+    for rule in fib.steering if fib else ():
+        if rule.af is not None and rule.af != af:
+            continue
+        if (
+            rule.dst is not None
+            and packet.dst & mask_for(rule.dst[1], 32 if af == 4 else 128)
+            != rule.dst[0]
+        ):
+            continue
+        if rule.dscp is not None and rule.dscp != packet.dscp:
+            continue
+        if rule.sport is not None and rule.sport != key.sport:
+            continue
+        return PolicyRef(*rule.policy)
+    return None
+
+
+Selection = Callable[[str, FlowKey, tuple[int, ...]], int]
+
+
+def _select(
+    view: DeviceView,
+    domain: str,
+    packet: IPPacket,
+    weights: tuple[int, ...],
+    select: Selection | None,
+) -> int:
+    key = FlowKey.from_packet(packet)
+    if select is not None:
+        return select(domain, key, weights)
+    kind = BalancerKind.AGGREGATE_PORT if domain == 'lag' else BalancerKind.ECMP
+    return view.load_balancer(kind).select(key, weights)
+
+
 def steer(
     view: DeviceView,
     packet: IPPacket,
     ingress: str | None,
     stage: int,
-) -> Srv6Encap | None:
-    """Gate B2 extension point; called once on ingress and after decapsulation."""
-    return None
+    *,
+    policy: PolicyRef | None = None,
+    select: Selection | None = None,
+) -> Srv6Encap | str | None:
+    """Resolve an ingress override/table against installed policy programs."""
+    ref = policy if policy is not None else steering_policy(view, packet)
+    if ref is None:
+        return None
+    fib = view.fib(6)
+    program = fib.policy_programs.get((ref.color, ref.endpoint)) if fib else None
+    if program is None:
+        return POLICY_DOWN
+    if not program.lists:
+        # The rule is consumed; ordinary lookup cannot match it again. Down
+        # IGP policy next hops are also excluded by the RIB compiler.
+        return POLICY_DOWN if program.fallback == FALLBACK_DROP else None
+    choices, weights = zip(*program.lists, strict=True)
+    return choices[_select(view, 'policy', packet, weights, select)]
 
 
 def srv6_settings(view: DeviceView, encap: Srv6Encap) -> tuple[int | None, int, int]:
@@ -398,6 +464,10 @@ def forward_ip(
     stage: int,
     *,
     encap: Srv6Encap | None = None,
+    policy: PolicyRef | None = None,
+    select: Selection | None = None,
+    fluid: bool = False,
+    policies: list[tuple[int, int]] | None = None,
 ) -> StepResult:
     """Execute the action program, shared by trace and Simulation.send.
 
@@ -418,9 +488,23 @@ def forward_ip(
     for _ in range(256):
         if do_steer:
             if encap is None:
-                encap = steer(view, packet, ingress, stage)
+                if policies is not None:
+                    ref = policy or steering_policy(view, packet)
+                    if ref is not None:
+                        policies.append((ref.color, ref.endpoint))
+                action = (
+                    steer(view, packet, ingress, stage, policy=policy, select=select)
+                    if policy is not None or select is not None
+                    else steer(view, packet, ingress, stage)
+                )
+                policy = None  # Demand override is consumed at the initial ingress.
+                if isinstance(action, str):
+                    return StepResult(DROP, action)
+                encap = action
             do_steer = False
         if encap is not None:
+            if policies is not None and encap.policy is not None:
+                policies.append(encap.policy)
             sr = True
             try:
                 source, hop_limit, seed = srv6_settings(view, encap)
@@ -433,7 +517,7 @@ def forward_ip(
                     source=source,
                     hop_limit=hop_limit,
                     flow_label=flow_label_for(FlowKey.from_packet(packet), seed),
-                    transit=stage == TRANSIT,
+                    transit=stage == TRANSIT and not fluid,
                 )
             except ValueError as error:
                 return StepResult(DROP, str(error))
@@ -447,7 +531,13 @@ def forward_ip(
         if entry.action == RECEIVE:
             return StepResult(DELIVER, packet=packet)
         if entry.action in DROP_ACTIONS:
-            reason = ACTION_DROP_REASON[entry.action]
+            reason = (
+                POLICY_DOWN
+                if isinstance(entry.program, PolicyRef)
+                else ACTION_DROP_REASON[entry.action]
+            )
+            if policies is not None and isinstance(entry.program, PolicyRef):
+                policies.append((entry.program.color, entry.program.endpoint))
             if entry.action == DROP_UNREACHABLE and any(
                 row[2].name == 'srv6-local' for row in entry.contributing
             ):
@@ -455,6 +545,8 @@ def forward_ip(
             return StepResult(DROP, reason)
         if entry.action == SRV6_LOCAL:
             sr = True
+            if fluid and isinstance(packet, IPv6Packet):
+                packet = dataclasses.replace(packet, hop_limit=255)
             result = local_sid(packet, entry.sid)
             if result.action in (DROP, DELIVER):
                 return StepResult(result.action, result.reason, packet=result.packet)
@@ -463,7 +555,11 @@ def forward_ip(
             if result.action == CROSS_CONNECT:
                 assert result.adjacency is not None
                 return _transmit(
-                    view, packet, _bind_adjacency(view, result.adjacency), sr=True
+                    view,
+                    packet,
+                    _bind_adjacency(view, result.adjacency),
+                    sr=True,
+                    select=select,
                 )
             if result.action == DECAP_LOOKUP:
                 stage, compiled, do_steer = AFTER_DECAP, None, True
@@ -474,16 +570,23 @@ def forward_ip(
         if group is None or not group.adjacencies:
             return StepResult(DROP, NO_ROUTE)
         if compiled is None and any(a.encap is not None for a in group.adjacencies):
-            # Gate B1 has one list; choose distinct transformations before underlay
-            # ECMP. The per-flow/policy slice can supply weighted list choice here.
+            # Select a transformation on the inner key before underlay ECMP
+            # uses the outer key. Sum resolved shares for each distinct list.
             choices = tuple(dict.fromkeys(a.encap for a in group.adjacencies))
-            if len(choices) != 1 or not isinstance(choices[0], Srv6Encap):
-                return StepResult(DROP, SRV6_UNSUPPORTED)
-            encap = choices[0]
-            compiled = group
-            continue
+            weights = tuple(
+                sum(a.weight for a in group.adjacencies if a.encap == choice)
+                for choice in choices
+            )
+            chosen = choices[_select(view, 'policy', packet, weights, select)]
+            legs = tuple(a for a in group.adjacencies if a.encap == chosen)
+            group = NexthopGroup(group.id, legs, sum(a.weight for a in legs))
+            if chosen is not None:
+                if not isinstance(chosen, Srv6Encap):
+                    return StepResult(DROP, SRV6_UNSUPPORTED)
+                encap, compiled = chosen, group
+                continue
         # RFC 1812 section 4.2.2.9: transit only, never after local SID or decap.
-        if stage == TRANSIT:
+        if stage == TRANSIT and not fluid:
             ttl = packet.ttl if isinstance(packet, IPv4Packet) else packet.hop_limit
             if ttl <= 1:
                 return StepResult(DROP, TTL_EXPIRED)
@@ -492,10 +595,9 @@ def forward_ip(
                 if isinstance(packet, IPv4Packet)
                 else dataclasses.replace(packet, hop_limit=ttl - 1)
             )
-        key = FlowKey.from_packet(packet)
         legs, weights = live_legs(view, group, af)
-        adj = legs[view.load_balancer(BalancerKind.ECMP).select(key, weights)]
-        return _transmit(view, packet, adj, sr=sr)
+        adj = legs[_select(view, 'ecmp', packet, weights, select)]
+        return _transmit(view, packet, adj, sr=sr, select=select)
     return StepResult(DROP, LOOP)
 
 
@@ -505,12 +607,12 @@ def _transmit(
     adj: Adjacency,
     *,
     sr: bool = False,
+    select: Selection | None = None,
 ) -> StepResult:
     """Shared egress checks; a CROSS_CONNECT enters here without a DA lookup."""
     from netsim.model.interfaces import OperState, PortChannelNode
 
     af = 4 if isinstance(packet, IPv4Packet) else 6
-    key = FlowKey.from_packet(packet)
     egress = view.interface(adj.interface)
     if egress is None or not _l3_usable(egress, af):
         return StepResult(DROP, EGRESS_DOWN, egress=adj.interface)
@@ -524,8 +626,7 @@ def _transmit(
         members = view.active_members(adj.interface)
         if not members:
             return StepResult(DROP, EGRESS_DOWN, egress=adj.interface)
-        lag = view.load_balancer(BalancerKind.AGGREGATE_PORT)
-        member = members[lag.select(key, (1,) * len(members))]
+        member = members[_select(view, 'lag', packet, (1,) * len(members), select)]
     if sr and ip_bytes(packet) > egress.config.mtu:
         return StepResult(DROP, MTU_EXCEEDED, egress=adj.interface)
     tx = view.link_for(member)
@@ -570,7 +671,13 @@ def _transmit(
     )
 
 
-def receive_frame(view: DeviceView, ingress: str, frame: EthernetFrame) -> StepResult:
+def receive_frame(
+    view: DeviceView,
+    ingress: str,
+    frame: EthernetFrame,
+    *,
+    policies: list[tuple[int, int]] | None = None,
+) -> StepResult:
     """L2 checks, then the IP step as a transit packet."""
     from netsim.model.interfaces import EthernetNode, OperState
 
@@ -588,7 +695,11 @@ def receive_frame(view: DeviceView, ingress: str, frame: EthernetFrame) -> StepR
         frame.payload, (IPv4Packet, IPv6Packet)
     ):
         return StepResult(DROP, UNSUPPORTED_ETHERTYPE)
-    return forward_ip(view, frame.payload, ingress, TRANSIT)
+    return (
+        forward_ip(view, frame.payload, ingress, TRANSIT, policies=policies)
+        if policies is not None
+        else forward_ip(view, frame.payload, ingress, TRANSIT)
+    )
 
 
 @record
