@@ -179,40 +179,95 @@ class LeaseRegistry:
             out.add((kind, name))
         return tuple(sorted(out))
 
+    @property
+    def active_leases(self) -> tuple[int, ...]:
+        """Live tokens, including acquisitions whose post-commit observer raised."""
+        return tuple(sorted(self._leases))
+
     def acquire(self, entities: Iterable[Entity]) -> int:
         members = self.resolve(entities)
         token = self._next
         self._next += 1
-        self._leases[token] = members
-        for entity in members:
-            kind, name = entity
-            count = self.counts.get(entity, 0)
-            if count == 0:
-                if kind == 'device':
-                    dev = self.sim.network.device(name)
-                    self._original[entity] = dev.enabled
-                    dev.configure(enabled=False)
-                else:
-                    link = self.sim.network.link(name)
-                    self._original[entity] = bool(link.state)
-                    link.fail()
-            self.counts[entity] = count + 1
+        net = self.sim.network
+        previous = {entity: self.counts.get(entity, 0) for entity in members}
+        originals = {
+            (kind, name): net.device(name).enabled
+            if kind == 'device'
+            else bool(net.link(name).state)
+            for kind, name in members
+            if previous[(kind, name)] == 0
+        }
+        old = net.state
+        entered = False
+        try:
+            with net.batch():
+                entered = True
+                for kind, name in originals:
+                    if kind == 'device':
+                        net.device(name).configure(enabled=False)
+                    else:
+                        net.link(name).fail()
+                # Publish registry state before the batch dispatches observers.
+                self._leases[token] = members
+                self._original.update(originals)
+                for entity, count in previous.items():
+                    self.counts[entity] = count + 1
+        except BaseException:
+            if not entered or net.state is old:
+                # A rejected batch did not commit. Undo only this lease's edits.
+                self._leases.pop(token, None)
+                for entity, count in previous.items():
+                    if count:
+                        self.counts[entity] = count
+                    else:
+                        self.counts.pop(entity, None)
+                        self._original.pop(entity, None)
+            else:
+                # Network commits before observer dispatch; preserve the lease.
+                self.history.append((self.sim.env.now, len(self.counts)))
+            raise
         self.history.append((self.sim.env.now, len(self.counts)))
         return token
 
     def release(self, token: int) -> None:
-        for entity in self._leases.pop(token):
-            count = self.counts[entity] - 1
-            if count:
-                self.counts[entity] = count
-                continue
-            del self.counts[entity]
-            was_up = self._original.pop(entity)
-            kind, name = entity
-            if kind == 'device':
-                self.sim.network.device(name).configure(enabled=was_up)
-            elif was_up:
-                self.sim.network.link(name).restore()
+        """Release once; retrying a consumed token is harmless after an error."""
+        if token not in self._leases:
+            if 0 <= token < self._next:
+                return
+            raise KeyError(token)
+        members = self._leases[token]
+        previous = {entity: self.counts[entity] for entity in members}
+        originals = {
+            entity: self._original[entity]
+            for entity, count in previous.items()
+            if count == 1
+        }
+        net = self.sim.network
+        old = net.state
+        entered = False
+        try:
+            with net.batch():
+                entered = True
+                for (kind, name), was_up in originals.items():
+                    if kind == 'device':
+                        net.device(name).configure(enabled=was_up)
+                    elif was_up:
+                        net.link(name).restore()
+                del self._leases[token]
+                for entity, count in previous.items():
+                    if count > 1:
+                        self.counts[entity] = count - 1
+                    else:
+                        del self.counts[entity]
+                        del self._original[entity]
+        except BaseException:
+            if not entered or net.state is old:
+                self._leases[token] = members
+                self.counts.update(previous)
+                self._original.update(originals)
+            else:
+                self.history.append((self.sim.env.now, len(self.counts)))
+            raise
         self.history.append((self.sim.env.now, len(self.counts)))
 
     def schedule(self, events: Iterable[FaultEvent]) -> None:
@@ -229,9 +284,14 @@ class LeaseRegistry:
             self.sim.at(event.start, lambda event=event: self._start(event))
 
     def _start(self, event: FaultEvent) -> None:
-        token = self.acquire(event.entities)
-        if event.duration is not None:
-            self.sim.at(event.start + event.duration, lambda: self.release(token))
+        token = self._next
+        try:
+            self.acquire(event.entities)
+        finally:
+            # A post-commit observer exception still leaves a real fault. Arm its
+            # repair before propagating the exception; an aborted fault has none.
+            if token in self._leases and event.duration is not None:
+                self.sim.at(event.start + event.duration, lambda: self.release(token))
 
 
 class Schedule:

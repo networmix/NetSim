@@ -236,3 +236,173 @@ def test_replay_selects_ids_preserves_weights_and_applies(tmp_path):
     row['failure_state'] = None
     with pytest.raises(ValueError, match='failure_state'):
         Draws.replay(doc, 'mc')
+
+
+def _raising_observer(*_):
+    raise ValueError('observer failed after commit')
+
+
+@pytest.mark.parametrize('operation', ['acquire', 'release'])
+def test_lease_post_commit_observer_error_preserves_consistency(operation):
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([]))
+    members = [('device', 'a'), ('link', lid)]
+    token = registry.acquire(members) if operation == 'release' else registry._next
+    # Observe both the atomic tree transition and its corresponding lease state.
+    seen = []
+    net.on_delta.append(
+        lambda *_: seen.append((net.device('a').enabled, net.link(lid).state))
+    )
+    net.on_delta.append(_raising_observer)
+    with pytest.raises(ValueError, match='observer failed'):
+        if operation == 'acquire':
+            registry.acquire(members)
+        else:
+            registry.release(token)
+    net.on_delta.remove(_raising_observer)
+    if operation == 'acquire':
+        assert seen == [(False, 0)]
+        assert registry.counts == {('device', 'a'): 1, ('link', lid): 1}
+        assert registry._leases[token] == tuple(members)
+        registry.release(token)
+    else:
+        assert seen == [(True, 1)]
+        # Retrying a committed release must not decrement another lease.
+        registry.release(token)
+    assert net.device('a').enabled and net.link(lid).state == 1
+    assert registry.counts == registry._leases == registry._original == {}
+
+
+@pytest.mark.parametrize('operation', ['acquire', 'release'])
+def test_lease_pre_commit_validation_error_aborts_all_entities(monkeypatch, operation):
+    import netsim.model.network as network_module
+
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([]))
+    members = [('device', 'a'), ('link', lid)]
+    token = registry.acquire(members) if operation == 'release' else None
+    before = net.state
+    counts = dict(registry.counts)
+    leases = dict(registry._leases)
+    original = dict(registry._original)
+    net.debug_validate = True
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            network_module,
+            'validate_immutable',
+            lambda _: (_ for _ in ()).throw(ValueError('abort before commit')),
+        )
+        with pytest.raises(ValueError, match='abort before commit'):
+            if operation == 'acquire':
+                registry.acquire(members)
+            else:
+                registry.release(token)
+    assert net.state is before
+    assert registry.counts == counts
+    assert registry._leases == leases
+    assert registry._original == original
+    if token is not None:
+        registry.release(token)
+    else:
+        registry.release(registry.acquire(members))
+    assert net.device('a').enabled and net.link(lid).state == 1
+
+
+def test_scheduled_committed_fault_arms_repair_even_when_observer_raises():
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([((('link', lid),), 1, 3)]))
+    net.on_delta.append(_raising_observer)
+    with pytest.raises(ValueError, match='observer failed'):
+        sim.run_until(1)
+    net.on_delta.remove(_raising_observer)
+    assert registry.counts == {('link', lid): 1}
+    sim.run_until(4)
+    assert net.link(lid).state == 1 and not registry.counts
+
+
+def test_scheduled_pre_commit_abort_does_not_arm_repair(monkeypatch):
+    import netsim.model.network as network_module
+
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([((('link', lid),), 1, 3)]))
+    net.debug_validate = True
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            network_module,
+            'validate_immutable',
+            lambda _: (_ for _ in ()).throw(ValueError('abort before commit')),
+        )
+        with pytest.raises(ValueError, match='abort before commit'):
+            sim.run_until(1)
+    assert not registry.counts and not registry._leases
+    assert net.link(lid).state == 1
+    sim.run_until(4)
+    assert not registry.counts
+
+
+def test_committed_release_retry_keeps_an_overlapping_lease():
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([]))
+    first = registry.acquire([('device', 'a'), ('link', lid)])
+    second = registry.acquire([('link', lid)])
+    net.on_delta.append(_raising_observer)
+    with pytest.raises(ValueError, match='observer failed'):
+        registry.release(first)
+    net.on_delta.remove(_raising_observer)
+    registry.release(first)
+    assert registry.active_leases == (second,)
+    assert registry.counts == {('link', lid): 1}
+    assert net.device('a').enabled and net.link(lid).state == 0
+    registry.release(second)
+    assert net.link(lid).state == 1
+    with pytest.raises(KeyError):
+        registry.release(999)
+
+
+def test_lease_change_inside_existing_batch_is_rejected_without_registry_mutation():
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([]))
+    with net.batch():
+        with pytest.raises(RuntimeError, match='nested'):
+            registry.acquire([('link', lid)])
+    assert registry.active_leases == () and not registry.counts
+    token = registry.acquire([('link', lid)])
+    with net.batch():
+        with pytest.raises(RuntimeError, match='nested'):
+            registry.release(token)
+    assert registry.active_leases == (token,) and registry.counts == {('link', lid): 1}
+    registry.release(token)
+
+
+@pytest.mark.parametrize('failure', ['abort', 'observer'])
+def test_failed_acquire_preserves_preexisting_overlap(monkeypatch, failure):
+    import netsim.model.network as network_module
+
+    net, lid = small_net()
+    sim = Simulation(Environment(), net)
+    registry = sim.failures(Schedule([]))
+    first = registry.acquire([('link', lid)])
+    with monkeypatch.context() as patch:
+        if failure == 'abort':
+            net.debug_validate = True
+            patch.setattr(network_module, 'validate_immutable', _raising_observer)
+        else:
+            net.on_delta.append(_raising_observer)
+        with pytest.raises(ValueError, match='observer failed'):
+            registry.acquire([('device', 'a'), ('link', lid)])
+    if failure == 'observer':
+        net.on_delta.remove(_raising_observer)
+        (second,) = set(registry.active_leases) - {first}
+        assert registry.counts == {('device', 'a'): 1, ('link', lid): 2}
+        registry.release(second)
+    assert registry.active_leases == (first,)
+    assert registry.counts == {('link', lid): 1}
+    assert net.device('a').enabled and net.link(lid).state == 0
+    registry.release(first)
+    assert net.link(lid).state == 1
