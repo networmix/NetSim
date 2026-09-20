@@ -396,8 +396,11 @@ Study results expose each failure snapshot's `data.netsim.policies` and a
 step-level `data.netsim.policy_iterations` list in `to_ngraph()`. Each policy
 reports basic validity, headend first-entry resolution, strict validity,
 selected path, programming status (`PENDING` or `INSTALLED`), programmed
-version, and observed delivery. Missing derived state is `UNCOMPUTED` with
-null validity/version. Delivery covers every steering form actually encountered
+version, and observed delivery. Basic validity includes mandatory first-entry
+resolution (RFC 9256 §5.1); structural validity alone does not qualify. Strict
+validation follows the emitted SID continuation and each owner's selected
+RIB action, independently of delayed FIB programming. Missing derived state is
+`UNCOMPUTED` with null validity/version. Delivery covers every steering form actually encountered
 by placement, including policies on transit and decapsulating nodes. Rates use
 the study's capacity unit; delivery is null without an observation and never
 infers validity. Recovery metrics do not overwrite the failure snapshot.
