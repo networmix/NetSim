@@ -24,8 +24,11 @@ from netsim.model.contracts import (
     LOCAL_PROFILE,
     SRV6_LOCAL_PROFILE,
     STATIC_PROFILE,
+    AgentNode,
     ClientId,
     ClientProfile,
+    DeviceAgent,
+    check_agent,
 )
 from netsim.model.entities import (
     Device,
@@ -273,6 +276,9 @@ class Network:
             SRV6_LOCAL_PROFILE.client: SRV6_LOCAL_PROFILE,
         }
         self.sources: list[RouteSource] = []
+        self.agents: dict[tuple[str, str], DeviceAgent] = {}
+        """Registered plugin objects by (device, agent name); the tree keeps
+        the matching ``AgentNode`` (config, state, generation)."""
         self.capacity_model: int = 1  # flows.UNCONSTRAINED
         self.debug_validate = DEBUG_VALIDATE
         self._dispatching = False
@@ -383,6 +389,7 @@ class Network:
         net._state = self.state
         net.profiles = dict(self.profiles)
         net.sources = list(self.sources)
+        net.agents = dict(self.agents)
         net.capacity_model = self.capacity_model
         net.debug_validate = self.debug_validate
         net.ngraph_link_ids = dict(self.ngraph_link_ids)
@@ -462,6 +469,77 @@ class Network:
 
     def add_source(self, source: RouteSource) -> None:
         self.sources.append(source)
+
+    # -- agents ------------------------------------------------------------------
+
+    def add_agent(
+        self, device: Device | str, agent: DeviceAgent, name: str | None = None
+    ) -> AgentNode:
+        """Register a protocol plugin on a device (Gate C contract).
+
+        Validates the plugin, registers its client profile (or checks it
+        against an existing registration of the same client), and commits an
+        ``AgentNode`` with a fresh generation. The runtime schedules
+        ``on_init`` from the resulting delta; ``converge()`` never runs agents.
+        One agent per name and one agent per client on a device.
+        """
+        check_agent(agent)
+        owner = self.device(device) if isinstance(device, str) else device
+        agent_name = check_name(agent.client.name if name is None else name)
+        existing = self.profiles.get(agent.client)
+        if existing is None:
+            self.profiles[agent.client] = agent.profile
+        elif existing != agent.profile:
+            raise ValueError(
+                f'client {agent.client} is registered with a different profile'
+            )
+        client = agent.client
+        config = agent.config
+
+        def apply(state: NetworkState) -> NetworkState:
+            dev = owner._node_in(state)
+            if agent_name in dev.agents:
+                raise ValueError(f'agent {agent_name!r} exists on {owner.name!r}')
+            for other in dev.agents.values():
+                if other.client == client:
+                    raise ValueError(
+                        f'client {client} is owned by agent {other.name!r} on {owner.name!r}'
+                    )
+            allocators, generation = state.allocators.take_generation()
+            node = AgentNode(agent_name, generation, client, config)
+            dev = dataclasses.replace(dev, agents=dev.agents.set(agent_name, node))
+            return dataclasses.replace(
+                state,
+                devices=state.devices.set(owner.name, dev),
+                allocators=allocators,
+            )
+
+        self.update(apply, ('add_agent', owner.name, agent_name))
+        self.agents[(owner.name, agent_name)] = agent
+        node = self.state.devices[owner.name].agents[agent_name]
+        assert isinstance(node, AgentNode)
+        return node
+
+    def remove_agent(self, device: Device | str, name: str) -> None:
+        """Remove an agent's node and plugin; the runtime cancels its timers,
+        sessions and inbox from the delta (``StateDelta.agents``). Its routes,
+        policies, SIDs and registrations stay until removed explicitly."""
+        owner = self.device(device) if isinstance(device, str) else device
+
+        def apply(state: NetworkState) -> NetworkState:
+            dev = owner._node_in(state)
+            if name not in dev.agents:
+                raise KeyError((owner.name, name))
+            dev = dataclasses.replace(dev, agents=dev.agents.remove(name))
+            return dataclasses.replace(
+                state, devices=state.devices.set(owner.name, dev)
+            )
+
+        self.update(apply, ('remove_agent', owner.name, name))
+        self.agents.pop((owner.name, name), None)
+
+    def agent(self, device: str, name: str) -> DeviceAgent:
+        return self.agents[(device, name)]
 
     # -- devices ----------------------------------------------------------------
 
@@ -558,6 +636,8 @@ class Network:
             )
 
         self.update(apply, ('remove_device', name))
+        for key in [k for k in self.agents if k[0] == name]:
+            del self.agents[key]
 
     def device(self, name: str) -> Device:
         dev = self._device_node(name)

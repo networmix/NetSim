@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 from heapq import heapify, heappop, heappush
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from netsim import core
 from netsim.model import derive, srv6
@@ -586,9 +586,14 @@ def placement_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
 
 
 def build_kinds(
-    network: Any, pipeline_ref: dict[str, Any], *, settle_delay: float = 0.0
+    network: Any,
+    pipeline_ref: dict[str, Any],
+    *,
+    settle_delay: float = 0.0,
+    extra: Iterable[Kind] = (),
 ) -> list[Kind]:
-    """Kinds bound to *network*; ``pipeline_ref['pipeline']`` is filled after construction."""
+    """Kinds bound to *network*; ``pipeline_ref['pipeline']`` is filled after
+    construction. ``extra`` adds runtime-owned kinds (AGENT, TRANSPORT)."""
 
     def carrier_run(
         state: NetworkState, now: float, entities: list[Any]
@@ -665,6 +670,7 @@ def build_kinds(
             placement_affected,
             lambda s, e: settle_delay,
         ),
+        *extra,
     ]
 
 

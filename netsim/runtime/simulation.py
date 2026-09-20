@@ -8,10 +8,12 @@ from netsim import core
 from netsim.model import derive
 from netsim.model.network import Network
 from netsim.model.state import NetworkState
+from netsim.runtime.agents import AgentRuntime
 from netsim.runtime.events import EventBus, Stats
 from netsim.runtime.failures import Entity, LeaseRegistry, Process, Schedule
 from netsim.runtime.pipeline import Pipeline, build_kinds, dirty_everything
 from netsim.runtime.timeline import Timeline
+from netsim.runtime.transport import TransportRuntime
 
 
 class Simulation:
@@ -48,7 +50,15 @@ class Simulation:
         self.stats = Stats()
         self.bus = EventBus(env, network)
         ref: dict[str, Any] = {}
-        kinds = build_kinds(network, ref, settle_delay=settle_delay)
+        # Runtime-owned bands (Gate C): agents and transport keep their
+        # inboxes, timers and queues outside the tree; their kinds join the
+        # pipeline next to the model-owned derivations.
+        self.agents = AgentRuntime(self)
+        self.transport = TransportRuntime(self)
+        extra = [
+            k for k in (self.agents.kind(), self.transport.kind()) if k is not None
+        ]
+        kinds = build_kinds(network, ref, settle_delay=settle_delay, extra=extra)
         self.pipeline = Pipeline(
             env,
             network,
@@ -70,6 +80,7 @@ class Simulation:
             self.timeline.initializing = False
         self.bus.release(env.now)  # nothing subscribes yet: drops the queue
         self.timeline.baseline(env.now, network.state)
+        self.agents.bind()
 
     @property
     def recorder(self) -> Timeline:
@@ -135,6 +146,13 @@ class Simulation:
 
     def retry(self) -> None:
         self.pipeline.retry()
+
+    def reset_agent(self, device: str, name: str, *, purge: bool = False) -> None:
+        """Restart an agent: invalidate its generation (receipts, timers,
+        sessions, pending runs, inbox and outbox), reset its state and run
+        ``on_init``. Routes, policies, SIDs and NHT registrations stay until
+        the first ``sync`` unless ``purge`` is set."""
+        self.agents.reset_agent(device, name, purge=purge)
 
     def failures(
         self,

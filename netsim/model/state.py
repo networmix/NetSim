@@ -681,7 +681,10 @@ class DeviceState:
     srv6_sids: Srv6Sids | None = None
     srv6_policies: Srv6Policies | None = None
     agents: PMap[str, Any] = field(default_factory=empty_pmap)
+    """``contracts.AgentNode`` per agent name; state and srdb_view are
+    identity-compared (``StateDelta.agents`` diffs by identity)."""
     nht: Any = None
+    """``contracts.NhtTable`` or ``None`` (registrations and results)."""
     l3_interfaces: PMap[str, Any] | None = None
     """Per-interface L3 contributions, owned by derive_l3; None before initialization."""
     interface_index: Any = None
@@ -697,6 +700,7 @@ class NetworkState:
     traffic_classes: PMap[str, Any] = field(default_factory=empty_pmap)
     placement: Any = None
     transport: Any = None
+    """``contracts.TransportState`` or ``None`` (listeners and connections)."""
     allocators: Allocators = field(default_factory=Allocators)
     srv6_consumers: frozenset[str] = field(default_factory=frozenset)
     """Bookkeeping index of policy headends, maintained incrementally by bump_epochs."""
