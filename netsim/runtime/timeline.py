@@ -270,6 +270,7 @@ class PolicyEvent(Event):
     reasons: tuple[tuple[int, int, str], ...]
     programmed_version: int
     basic_valid: tuple[tuple[int, int], ...] = ()
+    """RFC 9256 §5.1 lists, including mandatory first-entry resolution."""
     strict_valid: tuple[tuple[int, int], ...] = ()
     first_valid: tuple[tuple[int, int], ...] = ()
     programming: str = 'PENDING'

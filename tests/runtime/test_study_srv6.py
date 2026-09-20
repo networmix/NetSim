@@ -24,7 +24,7 @@ def test_derived_validity_and_exports_are_detached(tmp_path):
     assert row['destination'] == 'R4' and row['priority'] == 2
     assert row['demand'] == 100
     assert row['policy_status'] == 'DOWN'
-    assert row['policy_basic_valid'] is True and row['policy_strict_valid'] is False
+    assert row['policy_basic_valid'] is False and row['policy_strict_valid'] is False
     assert row['policy_active_path'] is None and row['policy_programmed_version'] > 0
     assert (
         row['policy_delivered'] == row['placed']
@@ -42,9 +42,9 @@ def test_derived_validity_and_exports_are_detached(tmp_path):
     with (tmp_path / 'flows.csv').open() as f:
         exported = next(csv.DictReader(f))
     assert exported['policy_status'] == 'DOWN'
-    assert exported['policy_basic_valid'] == 'True'
+    assert exported['policy_basic_valid'] == 'False'
     assert exported['priority'] == '2'
-    assert json.loads(exported['policy_basic_valid_lists']) == [[0, 0]]
+    assert json.loads(exported['policy_basic_valid_lists']) == []
 
 
 def test_status_fields_are_read_from_committed_state_without_inference():
@@ -156,7 +156,7 @@ def test_study_policy_failover_and_delivered_status():
     net, _ = network()
     result = Study(net).iterations([FailureSet(excluded_nodes=('R2',))])
     row = result.rows()[0]
-    assert row['policy_basic_valid'] is True
+    assert row['policy_basic_valid'] is False
     assert row['policy_strict_valid'] is False
     assert row['policy_active_path'] is None
     assert row['policy_delivered'] == row['placed'] == 0

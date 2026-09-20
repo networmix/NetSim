@@ -1,6 +1,7 @@
 """Gate B2 policy validity, programmed actions and steering regressions."""
 
 from dataclasses import replace
+from ipaddress import IPv6Address
 
 import pytest
 
@@ -9,6 +10,7 @@ from netsim.model import srv6 as sr
 from netsim.model.contracts import STATIC
 from netsim.model.igp import oracle_igp
 from netsim.model.interfaces import EthernetNode, PortChannelNode
+from netsim.model.network import Network
 from netsim.model.packets import IPv4Packet
 from netsim.model.routing import Nexthop, ResolutionPolicy
 from tests.model.test_network import A, build_diamond
@@ -80,6 +82,191 @@ def state_of(routers, p):
 
 def packet():
     return IPv4Packet(A('10.0.0.1'), A('10.0.0.4'), 17, payload_size=1000)
+
+
+def unmatched_steering(dev):
+    p = sr.SrPolicy(STATIC, 99, A('2001:db8::dead'))
+    dev.policy_client().add(p)
+    dev.policy_client().set_steering([sr.SteeringRule('unmatched', p.key, dscp=63)])
+
+
+@pytest.mark.parametrize('device', ['A', 'B', 'D'])
+@pytest.mark.parametrize('af', [4, 6])
+def test_unmatched_steering_preserves_plain_loop_placement(device, af):
+    net = Network()
+    for name, i in [('A', 1), ('B', 2), ('D', 3)]:
+        net.add_device(name).add_loopback(
+            'lo', ipv4=[f'10.0.0.{i}/32'], ipv6=[f'2001:db8::{i}/128']
+        )
+    net.add_p2p(net['A'], 'b', net['B'], 'a', unnumbered=True)
+    net.add_p2p(net['A'], 'd', net['D'], 'a', unnumbered=True)
+    dst = '10.0.0.3' if af == 4 else '2001:db8::3'
+    prefix = f'{dst}/{32 if af == 4 else 128}'
+    net['A'].add_route(prefix, [Nexthop.via('b'), Nexthop.via('d')])
+    net['B'].add_route(prefix, [Nexthop.via('a')])
+    net.add_demand('d', 'A', dst, 100e6)
+    net.converge()
+    before = net.placement
+    assert before.delivered_total == 50e6
+    assert dict(before.dropped_by_reason) == {fw.LOOP: 50e6}
+    unmatched_steering(net[device])
+    net.converge()
+    after = net.placement
+    assert after.demands == before.demands
+    assert after.offered == before.offered
+    assert after.carried == before.carried
+    assert after.dropped_by_reason == before.dropped_by_reason
+    assert after.classes == before.classes
+
+
+@pytest.mark.parametrize('topology', ['diamond', 'clos8x4', 'ring64'])
+@pytest.mark.parametrize('failed', [False, True])
+def test_unmatched_steering_preserves_plain_fingerprints(topology, failed):
+    from tests.model.clos import build_clos
+    from tests.test_fingerprints import EXPECTED, fingerprint, ring
+
+    if topology == 'diamond':
+        net, _ = build_diamond()
+        net.add_demand('d1', 'R1', '10.0.0.4', 100e6)
+    elif topology == 'clos8x4':
+        net = build_clos(8, 4, 100e9, 1e9, 1)
+    else:
+        net = ring(64)
+    net.converge()
+    if failed:
+        links = (
+            ['R1:eth1--R2:eth1']
+            if topology == 'diamond'
+            else sorted(net.links)[:5]
+            if topology == 'clos8x4'
+            else [sorted(net.links)[3]]
+        )
+        for name in links:
+            net.links[name].fail()
+        net.converge()
+        topology += '-fail5' if topology == 'clos8x4' else '-fail'
+    assert fingerprint(net) == EXPECTED[topology]
+    before = net.placement
+    # Every position is exercised, including headends, transit, and delivery.
+    for dev in net.devices.values():
+        unmatched_steering(dev)
+    net.converge()
+    assert fingerprint(net) == EXPECTED[topology]
+    assert net.placement.demands == before.demands
+    assert net.placement.classes == before.classes
+
+
+@pytest.mark.parametrize('compressed', [False, True])
+def test_strict_validation_checks_the_sid_owners_selected_action(compressed):
+    net, routers = diamond(compressed=compressed)
+    term = next(
+        s
+        for s in routers['R4'].node.srv6_sids.sids.values()
+        if s.behavior == sr.END_DT46
+    )
+    segments = path().segments if compressed else (sr.TermSeg('R4'),)
+    p = policy(routers, lists=(sr.SegmentList(segments),))
+    net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
+    net.converge()
+    assert state_of(routers, p).strict_valid == ((0, 0),)
+    assert net.placement.delivered_total == 100e6
+    routers['R4'].add_route(f'{IPv6Address(term.sid)}/128', [Nexthop.blackhole()])
+    net.converge()
+    status = state_of(routers, p)
+    assert status.first_valid == status.basic_valid == ((0, 0),)
+    assert status.strict_valid == ()
+    assert status.status == sr.POLICY_DOWN
+    assert (0, 0, sr.PATH_UNREACHABLE) in status.reasons
+    assert any(d[:2] == ('R4', 'failure') for d in status.dependencies)
+    # Disabling strict validation keeps the actual drop observable.
+    routers['R1'].configure(resolution_policy=ResolutionPolicy(validate_all_sids=False))
+    net.converge()
+    assert dict(net.placement.dropped_by_reason) == {'DROP_BLACKHOLE': 100e6}
+
+
+def test_strict_validation_rejects_malformed_terminal_csid_argument():
+    from tests.model.test_usid import diamond as usid_diamond
+    from tests.model.test_usid import strict_sids
+
+    net, _ = usid_diamond()
+    sids = strict_sids(net)
+    segments = tuple(sr.LiteralSid(s.sid) for s in sids[:-1]) + (
+        sr.LiteralSid(sids[-1].sid | 1),
+    )
+    p = policy(net.devices, lists=(sr.SegmentList(segments),))
+    net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
+    net.converge()
+    status = state_of(net.devices, p)
+    assert status.basic_valid == status.first_valid == ((0, 0),)
+    assert status.strict_valid == ()
+    assert status.status == sr.POLICY_DOWN
+    assert (0, 0, sr.SRH_MALFORMED) in status.reasons
+    net['R1'].configure(resolution_policy=ResolutionPolicy(validate_all_sids=False))
+    net.converge()
+    assert dict(net.placement.dropped_by_reason) == {fw.SRH_MALFORMED: 100e6}
+
+
+@pytest.mark.parametrize('malformed', [False, True])
+def test_strict_validation_executes_preencoded_csid_continuation(malformed):
+    from tests.model.test_usid import diamond as usid_diamond
+    from tests.model.test_usid import strict_sids
+
+    net, _ = usid_diamond()
+    strict_sids(net)
+    # Hand-encoded B:A1:A2:D4::; nonzero Arg is a valid continuation.
+    container = A('5f00:0:e001:e002:e104::') | int(malformed)
+    p = policy(net.devices, lists=(sr.SegmentList((sr.LiteralSid(container),)),))
+    net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
+    net.converge()
+    status = state_of(net.devices, p)
+    assert status.basic_valid == status.first_valid == ((0, 0),)
+    if malformed:
+        assert status.strict_valid == ()
+        assert (0, 0, sr.SRH_MALFORMED) in status.reasons
+    else:
+        assert status.strict_valid == ((0, 0),)
+        assert status.valid_lists == ((0, 0, (container,)),)
+        assert net.placement.delivered_total == 100e6
+
+
+def test_strict_validation_queries_the_encoded_address_at_intermediate_owners():
+    net, routers = diamond()
+    p = policy(routers)
+    net.add_demand('d', 'R1', '10.0.0.4', 100e6, steer=sr.PolicyRef(*p.key))
+    net.converge()
+    sid = next(
+        s for s in routers['R2'].node.srv6_sids.sids.values() if s.interface == 'eth3'
+    )
+    # A /128 for the zero-argument uA is not selected by a DA carrying D4.
+    routers['R2'].add_route(f'{IPv6Address(sid.sid)}/128', [Nexthop.blackhole()])
+    net.converge()
+    assert state_of(routers, p).strict_valid == ((0, 0),)
+    assert net.placement.delivered_total == 100e6
+    status = state_of(routers, p)
+    container = status.valid_lists[0][2][0]
+    from netsim.model.srv6_compress import shift_csid
+
+    head = next(
+        s for s in routers['R1'].node.srv6_sids.sids.values() if s.interface == 'Po1'
+    )
+    shifted, _ = shift_csid(container, head.structure)
+    routers['R2'].add_route(f'{IPv6Address(shifted)}/128', [Nexthop.blackhole()])
+    net.converge()
+    assert state_of(routers, p).strict_valid == ()
+    assert (0, 0, sr.PATH_UNREACHABLE) in state_of(routers, p).reasons
+
+
+def test_basic_validity_requires_first_entry_resolution():
+    net, routers = diamond(compressed=False)
+    p = policy(routers, lists=(sr.SegmentList((A('2001:db8:dead::1'),)),))
+    net.converge()
+    status = state_of(routers, p)
+    assert status.status == sr.POLICY_DOWN
+    assert (0, 0, sr.FIRST_SID_UNRESOLVABLE) in status.reasons
+    assert status.basic_valid == status.first_valid == ()
+    row = sr.policy_status(net.state)[0]
+    assert row['basic_valid'] is row['first_valid'] is False
+    assert row['basic_valid_lists'] == row['first_valid_lists'] == []
 
 
 def test_policy_derivation_and_demand_steering():

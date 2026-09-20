@@ -295,7 +295,10 @@ class PolicyState:
     """``(path index, list index, wire entries)`` for every valid list of the active path."""
     status: str = POLICY_DOWN
     basic_valid: tuple[tuple[int, int], ...] = ()
-    """Lists valid under RFC 9256 §5.1 basic validity: ``(path index, list index)``."""
+    """RFC 9256 §5.1 validity, including mandatory first-entry resolution.
+
+    Each item is ``(path index, list index)``; structure alone is insufficient.
+    """
     reasons: tuple[tuple[int, int, str], ...] = ()
     """Rejections ``(path index, list index, reason)`` from any validation layer."""
     programmed_version: int = 0
@@ -1406,7 +1409,9 @@ class _PolicyValidator:
             self.query(device, 'interface', interface, 'QUERIED')
         return entry, legs
 
-    def reaches(self, current: str, owner: str, address: int) -> str | None:
+    def reaches(
+        self, current: str, owner: str, address: int, sid: LocalSid
+    ) -> str | None:
         from netsim.model import forwarding as fw
 
         # Iterative DFS detects loops without a Python recursion-depth limit.
@@ -1417,7 +1422,17 @@ class _PolicyValidator:
             node, visited = pending.pop()
             self.query(node, 'reach', address, owner)
             if node == owner:
-                good = True
+                # Arrival is insufficient: a more-specific route may shadow
+                # the local SID. Validate the RIB's selected behavior, never
+                # the installed (possibly delayed) FIB snapshot.
+                entry, _ = self.forwarding(node, address)
+                if entry and entry.action == fw.SRV6_LOCAL and entry.sid == sid:
+                    good = True
+                else:
+                    failures.add(PATH_UNREACHABLE)
+                    self.query(
+                        node, 'failure', address, entry.action if entry else 'NO_ROUTE'
+                    )
                 continue
             if node in visited:
                 failures.add('LOOP_DETECTED')
@@ -1440,9 +1455,34 @@ class _PolicyValidator:
             return PARTIAL_ECMP
         return min(failures) if failures else None
 
-    def strict(self, segments: tuple[Any, ...], policy: SrPolicy) -> str | None:
+    def endpoint_owned(self, owner: str, policy: SrPolicy) -> bool:
+        dev = self.state.devices[owner]
+        owned = any(
+            policy.endpoint == a
+            for node in dev.interfaces.values()
+            for a, _ in node.config.ipv6
+        ) or bool(
+            dev.srv6_sids
+            and any(
+                contains(loc.prefix, policy.endpoint)
+                for loc in dev.srv6_sids.locators.values()
+            )
+        )
+        self.query(owner, 'endpoint', policy.endpoint, owned)
+        return owned
+
+    def strict(
+        self, segments: tuple[Any, ...], wire: tuple[int, ...], policy: SrPolicy
+    ) -> str | None:
+        # Check the declared owners/behaviors first (including symbolic intent).
+        # Route selection below uses actual wire addresses: a compressed DA can
+        # select a different more-specific route than its zero-argument SID.
+        from netsim.model.srv6_compress import csid_arg, shift_csid
+
         current = self.head
-        for i, segment in enumerate(segments):
+        pending = list(reversed(segments))
+        while pending:
+            segment = pending.pop()
             symbolic = isinstance(segment, (AdjSeg, NodeSeg, TermSeg))
             address = (
                 segment.address
@@ -1462,27 +1502,22 @@ class _PolicyValidator:
             if symbolic:
                 address = sid.sid
             self.query(owner, 'sid-oper', sid.sid, sid.adjacency_up)
-            last = i == len(segments) - 1
+            if (
+                sid.flavors & NEXT_CSID
+                and sid.behavior != END_DT46
+                and csid_arg(address, sid.structure)
+            ):
+                # A literal can already contain a NEXT-C-SID continuation.
+                # It must execute before advancing to the next SRH entry
+                # (RFC 9800 §4.1.1 N01-N09), including for endpoint checks.
+                pending.append(shift_csid(address, sid.structure)[0])
+            last = not pending
             if sid.behavior == END_DT46 and not last:
                 return TERMINAL_NOT_LAST
             if last:
                 if sid.behavior != END_DT46 and not sid.flavors & USD:
                     return ENDPOINT_NO_DECAP
-                dev = self.state.devices[owner]
-                endpoint_owned = any(
-                    policy.endpoint == a
-                    for node in dev.interfaces.values()
-                    for a, _ in node.config.ipv6
-                )
-                endpoint_owned |= bool(
-                    dev.srv6_sids
-                    and any(
-                        contains(loc.prefix, policy.endpoint)
-                        for loc in dev.srv6_sids.locators.values()
-                    )
-                )
-                self.query(owner, 'endpoint', policy.endpoint, endpoint_owned)
-                if not endpoint_owned:
+                if not self.endpoint_owned(owner, policy):
                     return ENDPOINT_MISMATCH
             # RFC 9800 sections 5.1-5.2: LIB scope is the executing node.
             bare = is_csid(sid.structure) and sid.structure.lnl == 0
@@ -1490,11 +1525,7 @@ class _PolicyValidator:
                 if current != owner:
                     self.query(current, 'local-scope', sid.sid, f'WRONG_OWNER:{owner}')
                     return PATH_UNREACHABLE
-            else:
-                reason = self.reaches(current, owner, address)
-                if reason:
-                    return reason
-                current = owner
+            current = owner
             if sid.behavior == END_X:
                 if not sid.adjacency_up or sid.interface is None:
                     return PATH_UNREACHABLE
@@ -1502,7 +1533,64 @@ class _PolicyValidator:
                 if peer is None:
                     return PATH_UNREACHABLE
                 current = peer
-        return None
+        return self.encoded(wire, policy)
+
+    def encoded(self, wire: tuple[int, ...], policy: SrPolicy) -> str | None:
+        """Validate the emitted continuation with the packet behavior interpreter.
+
+        RFC 9800 §4.1.1 extracts/executes Arg before classic SRH processing;
+        valid nonzero arguments carry further C-SIDs. In particular, checking
+        only a terminal's prefix misses malformed suffixes after that prefix.
+        All route queries remain RIB-derived, independently of FIB programming.
+        """
+        from netsim.model import forwarding as fw
+        from netsim.model.packets import IPv4Packet, IPv6Packet, encapsulate
+
+        packet = encapsulate(
+            IPv4Packet(0, 0, 17),
+            wire,
+            behavior=H_ENCAPS_RED,
+            source=0,
+            hop_limit=255,
+            flow_label=0,
+            transit=False,
+        )
+        current = self.head
+        seen: set[tuple[str, int, Any]] = set()
+        while True:
+            key = current, packet.dst, packet.srh
+            if key in seen:
+                return 'LOOP_DETECTED'
+            seen.add(key)
+            found = self.literal(packet.dst, current)
+            if found is None:
+                return PATH_UNREACHABLE
+            owner, sid = found
+            if is_csid(sid.structure) and sid.structure.lnl == 0 and current != owner:
+                self.query(current, 'local-scope', packet.dst, f'WRONG_OWNER:{owner}')
+                return PATH_UNREACHABLE
+            reason = self.reaches(current, owner, packet.dst, sid)
+            if reason:
+                return reason
+            # Reachability is not a hop-limit simulation. Reset the abstract
+            # packet at each behavior, as in the FLUID interpreter.
+            result = fw.local_sid(replace(packet, hop_limit=255), sid)
+            self.query(owner, 'behavior', packet.dst, result.reason or result.action)
+            if result.action == fw.DROP:
+                return result.reason or PATH_UNREACHABLE
+            if result.packet is None:
+                return PATH_UNREACHABLE
+            if not isinstance(result.packet, IPv6Packet):
+                # The synthetic IPv4 inner packet was decapsulated. Its actual
+                # endpoint must agree with the declared policy, too.
+                return None if self.endpoint_owned(owner, policy) else ENDPOINT_MISMATCH
+            packet = result.packet
+            current = owner
+            if result.action == fw.CROSS_CONNECT:
+                peer = self.peer(owner, sid.interface) if sid.interface else None
+                if not sid.adjacency_up or peer is None:
+                    return PATH_UNREACHABLE
+                current = peer
 
 
 def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | None:
@@ -1555,7 +1643,6 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                 if reason:
                     reasons.append((pi, li, reason))
                     continue
-                basic.append((pi, li))
                 wire = compress(encoded)
                 reachable, deps = resolve_first_entry(
                     DeviceContext(state, device), settings, Srv6Encap(wire)
@@ -1568,9 +1655,12 @@ def derive_policy_states(state: NetworkState, device: str) -> Srv6Policies | Non
                     validator.query(device, 'interface', interface, 'QUERIED')
                 if reachable:
                     first.append((pi, li))
+                    # RFC 9256 §5.1: first-SID path resolution is mandatory
+                    # basic validity, not merely an independent status field.
+                    basic.append((pi, li))
                 else:
                     reasons.append((pi, li, FIRST_SID_UNRESOLVABLE))
-                strict_reason = validator.strict(segment_list.segments, policy)
+                strict_reason = validator.strict(segment_list.segments, wire, policy)
                 if strict_reason:
                     reasons.append((pi, li, strict_reason))
                 else:

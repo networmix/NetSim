@@ -287,10 +287,12 @@ def _frame_bytes(af: int, payload_size: int) -> int:
 class _PacketState(NamedTuple):
     """Forwarding identity, excluding TTL (FLUID uses SCC loop-cut).
 
-    Plain IP has only an inner family. SR steps must retain the complete
-    remaining SID/action continuation, not just the active DA: equal-sized
-    SRHs can have different tails. ``stage`` distinguishes steering after
-    DECAP from initial ingress; it is never a monotonically growing hop id.
+    Production vertices always retain the same normalized header token,
+    including plain IP. Abbreviated states are supported for injected steps.
+    SR steps must retain the complete remaining SID/action continuation, not
+    just the active DA: equal-sized SRHs can have different tails. ``stage``
+    distinguishes an unconsumed demand override from subsequent ingress;
+    without that override ORIGINATED and TRANSIT are equivalent in FLUID.
     Tuple ordering makes vertex and leg ordering stable without hash/id order.
     """
 
@@ -517,6 +519,8 @@ def _forward_edges(
     """
     from netsim.model.network import _View
 
+    if packet_state.wire:
+        af, dst = packet_state.wire[0], packet_state.wire[2]
     view = _View(state, device)
     fib = view.fib(6 if packet_state.outer else af)
     entry = (
@@ -527,8 +531,11 @@ def _forward_edges(
     group = fib.group(entry) if fib and entry else None
     sr_fib = view.fib(6)
     if not (
-        packet_state.wire
-        or packet_state.outer
+        packet_state.outer
+        or packet_state.srh_entries
+        or packet_state.wire
+        and af == IPV6
+        and packet_state.wire[7]
         or steer is not None
         or sr_fib
         and sr_fib.steering
@@ -758,17 +765,41 @@ def walk_class(
     if template is not None:
         af, dst, payload_size = template.af, template.dst, payload_bytes(template)
         dscp = template.dscp
-    initial = (
-        _state_from_packet(template.to_packet(), ORIGINATED)
-        if template is not None
-        and (template.inner is not None or template.srh is not None)
-        else _PacketState(af)
-    )
+    if step is None:
+        # Use the same header identity before and after either expansion path.
+        # The only origin-specific FLUID action is the demand override: TTL is
+        # excluded, and ingress steering runs at both origin and transit.
+        initial = {
+            source: _state_from_packet(
+                (
+                    template
+                    or PacketTemplate(
+                        af,
+                        _source_address(state, source, af),
+                        dst,
+                        payload_size=payload_size,
+                        dscp=dscp,
+                    )
+                ).to_packet(),
+                ORIGINATED if steer is not None else TRANSIT,
+            )
+            for source in sources
+        }
+    else:
+        initial = {
+            source: (
+                _state_from_packet(template.to_packet(), ORIGINATED)
+                if template is not None
+                and (template.inner is not None or template.srh is not None)
+                else _PacketState(af)
+            )
+            for source in sources
+        }
     expand = _forward_edges if step is None else step
     decisions: dict[_Vertex, _Decision] = {}
     succ: dict[_Vertex, list[_Vertex]] = {}
     order: list[_Vertex] = []
-    frontier = [(d, initial) for d in sorted(sources)]
+    frontier = [(d, initial[d]) for d in sorted(sources)]
     seen: set[_Vertex] = set()
     while frontier:
         v = frontier.pop()
@@ -802,7 +833,7 @@ def walk_class(
             cyclic.add(i)
     inflow: dict[_Vertex, Fraction] = defaultdict(Fraction)
     for s, f in sources.items():
-        inflow[(s, initial)] += f
+        inflow[(s, initial[s])] += f
     edges: dict[int, Fraction] = defaultdict(Fraction)
     carried: dict[int, Fraction] = defaultdict(Fraction)
     transmissions: list[_Transmission] = []
