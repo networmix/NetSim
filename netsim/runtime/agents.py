@@ -24,8 +24,10 @@ are implemented by their own slice; the method names below are fixed):
   generation on reset or removal. Cancellation is invoked by commit dispatch
   (it must not synchronously call Network.update from that hook).
 - Optional connection counters are read from ``transport.budget()['connections']``:
-  a mapping of connection id to ``queued_messages`` and ``queued_bytes``;
-  absent counters default to zero. No transport runtime object enters Context.
+  a mapping of connection id to a pair of per-direction dicts (``a->b``,
+  ``b->a``) with ``messages`` and ``bytes``; an agent sees the direction it
+  sends on; absent counters default to zero. No transport runtime object
+  enters the context.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from netsim.model import contracts as c
-from netsim.model import derive, interfaces, routing, srv6
+from netsim.model import derive, interfaces, nht, routing, srv6
 from netsim.model.addressing import MacAddress
 from netsim.model.network import mark_published
 from netsim.model.state import (
@@ -250,9 +252,7 @@ class AgentRuntime:
                 ) != self._outcomes(new, node.client):
                     self._cause(device, name, c.Cause(c.CAUSE_ROUTES))
                     out.add((device, name))
-                if nht_changed and self._nht(old, node.client) != self._nht(
-                    new, node.client
-                ):
+                if nht_changed and self._nht_changed(old, new, node.client):
                     self._cause(device, name, c.Cause(c.CAUSE_NHT))
                     out.add((device, name))
                 if sids_changed and self._sids(old, node.client) != self._sids(
@@ -270,6 +270,19 @@ class AgentRuntime:
             for key, value in result.rows.sorted_items()
             if key[2] == client
         )
+
+    @staticmethod
+    def _nht_changed(old: Any, new: Any, client: c.ClientId) -> bool:
+        """Result identity is the notification contract (``nht.refresh``
+        keeps the old object for an unchanged answer, even across epochs)."""
+        before = old.nht.registrations if old.nht else PMap()
+        after = new.nht.registrations if new.nht else PMap()
+        for key, value in after.items():
+            if key.owner == client and before.get(key, value) is not value:
+                return True
+            if key.owner == client and key not in before:
+                return True
+        return any(key.owner == client and key not in after for key in before)
 
     @staticmethod
     def _nht(dev: Any, client: c.ClientId) -> PMap:
@@ -438,7 +451,10 @@ class AgentRuntime:
                 )
                 if local is None:
                     continue
-                counters = budgets.get(cid, {}) if isinstance(budgets, dict) else {}
+                directions = budgets.get(cid) if isinstance(budgets, dict) else None
+                counters: dict[str, int] = {}
+                if isinstance(directions, tuple) and len(directions) == 2:
+                    counters = directions[0] if a else directions[1]
                 connections[cid] = c.ConnectionView(
                     cid,
                     conn.state,
@@ -447,8 +463,8 @@ class AgentRuntime:
                     conn.initiator_a if a else not conn.initiator_a,
                     conn.reason,
                     node.generation,
-                    counters.get('queued_messages', 0),
-                    counters.get('queued_bytes', 0),
+                    counters.get('messages', 0),
+                    counters.get('bytes', 0),
                     conn.a_to_b_reachable if a else conn.b_to_a_reachable,
                 )
         rng = random.Random()
@@ -522,6 +538,7 @@ class AgentRuntime:
                 add=op.add,
                 delete=op.delete,
                 sync=(client, op.sync) if op.sync is not None else None,
+                profile=self.sim.network.profiles.get(client),
             )
             if changed is not rib:
                 ribs = ribs.set(op.af, changed)
@@ -586,6 +603,8 @@ class AgentRuntime:
             state = replace(
                 state, devices=state.devices.set(device, replace(dev, nht=table))
             )
+            # New registrations get their first answer before publication.
+            state = nht.refresh(state, device)
         return state
 
     def _run(self, state: NetworkState, now: float, due: list[Any]) -> NetworkState:
@@ -716,33 +735,6 @@ class AgentRuntime:
             mark_published(errors[0])
             raise errors[0]
 
-    def _transport_shim(
-        self, method: str, key: tuple[str, str, int], item: Any = None
-    ) -> None:
-        """Temporary C0/C3 seam: ONLY NotImplementedError becomes Rejection.
-
-        Cancellation has no surviving recipient on removal. Other transport
-        errors remain post-publication errors and never replay the receipt.
-        """
-        try:
-            fn = getattr(self.sim.transport, method)
-            if method == 'cancel_agent':
-                fn(*key)
-            else:
-                fn(*key, item)
-        except NotImplementedError:
-            if method != 'cancel_agent':
-                entry = c.Rejection(
-                    self.sim.env.now,
-                    'TRANSPORT_UNAVAILABLE',
-                    detail=method,
-                    generation=key[2],
-                )
-                if not self.deliver(key[0], key[1], entry):
-                    raise RuntimeError(
-                        'transport shim rejection inbox overflow'
-                    ) from None
-
     def _publish_outbox(
         self, key: tuple[str, str, int], output: c.AgentOutput, now: float
     ) -> None:
@@ -767,17 +759,21 @@ class AgentRuntime:
                     lambda _, k=key, n=timer.name, t=ticket: self._fire(k, n, t)
                 )
         self._compact_timers()
-        errors = []
-        for method, entries in (
-            ('send_datagram', output.datagrams),
-            ('send_message', output.messages),
-            ('session_op', output.sessions),
-        ):
+        # The outbox is published exactly once, after the commit: a transport
+        # error is a post-publication error and never replays the receipt.
+        transport = self.sim.transport
+        errors: list[Exception] = []
+
+        def publish(fn: Any, entries: tuple[Any, ...]) -> None:
             for entry in entries:
                 try:
-                    self._transport_shim(method, key, entry)
+                    fn(*key, entry)
                 except Exception as error:
                     errors.append(error)
+
+        publish(transport.send_datagram, output.datagrams)
+        publish(transport.send_message, output.messages)
+        publish(transport.session_op, output.sessions)
         if errors:
             raise errors[0]
 
@@ -835,7 +831,7 @@ class AgentRuntime:
         self._kind._compact()
         self.sim.pipeline.successor.get(derive.AGENT, set()).discard(entity)
         self._compact_timers()
-        self._transport_shim('cancel_agent', key)
+        self.sim.transport.cancel_agent(*key)
 
     def reset_agent(self, device: str, name: str, *, purge: bool = False) -> None:
         def apply(state: NetworkState) -> NetworkState:

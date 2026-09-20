@@ -709,6 +709,8 @@ def dirty_everything(pipeline: Pipeline, state: NetworkState, now: float) -> Non
             entities = set(state.devices)
         elif kind.offset == derive.FIB:
             entities = {(d, af) for d in state.devices for af in derive.AFS}
+        elif kind.offset == derive.AGENT:
+            continue  # agents are not derivations of the tree: nothing to redo
         else:
             entities = {'*'}
         pipeline.mark(kind, entities, now, state)

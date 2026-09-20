@@ -149,7 +149,7 @@ def test_observer_failure_consumes_receipt_and_outbox(monkeypatch):
     assert len(calls) == len(sent) == 1
 
 
-def test_messages_only_and_unimplemented_transport_rejection():
+def test_messages_only_output_is_published_and_transport_rejects_explicitly():
     def callback(ctx):
         return c.AgentOutput(
             state=ctx.inbox, messages=() if ctx.inbox else (c.Message(1, 'x'),)
@@ -159,7 +159,10 @@ def test_messages_only_and_unimplemented_transport_rejection():
     sim.settle()
     node = sim.state.devices['r'].agents['test']
     assert node.runs == 2
-    assert node.state[0].reason == 'TRANSPORT_UNAVAILABLE'
+    # A message on a connection that does not exist is an explicit rejection
+    # delivered to the sender's inbox, never a silent drop.
+    assert node.state[0].reason == 'NOT_ESTABLISHED'
+    assert node.state[0].connection == 1
     assert not sim.agents.budget()['inbox_entries']
 
 
@@ -688,7 +691,13 @@ def test_link_neighbor_and_connection_projections(monkeypatch):
     monkeypatch.setattr(
         sim.transport,
         'budget',
-        lambda: {'connections': {1: {'queued_messages': 2, 'queued_bytes': 50}}},
+        # The transport reports one counter dict per direction (a->b, b->a);
+        # side a of connection 1 sees its own sending direction.
+        lambda: {
+            'connections': {
+                1: ({'messages': 2, 'bytes': 50}, {'messages': 9, 'bytes': 99})
+            }
+        },
     )
     sim.settle()
     ctx = contexts[0]

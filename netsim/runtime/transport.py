@@ -1046,6 +1046,13 @@ class TransportRuntime:
                         b_to_a_reachable=False,
                     ),
                 )
+        if self.sim.network._dispatching:
+            # Called from commit dispatch (agent removal or reset observed by
+            # the agent runtime): a nested update is illegal there, and the
+            # TRANSPORT kind derives the same DOWN/RESET states and listener
+            # removals from that very delta (``affected`` sees the lifecycle
+            # change), so the tree edit is left to its run.
+            return
         self._publish(
             replace(transport, listeners=listeners, connections=connections), 'reset'
         )
