@@ -371,7 +371,11 @@ class RibClient:
         return self._apply('add_routes', add=self._check(rows))
 
     def delete_routes(self, keys: Iterable[RowKey]) -> Any:
-        return self._apply('delete_routes', delete=tuple(keys))
+        keys = tuple(keys)
+        for key in keys:
+            if key[2] != self.client:
+                raise ValueError(f'row {key} does not belong to {self.client}')
+        return self._apply('delete_routes', delete=keys)
 
     def sync(self, rows: Iterable[Route]) -> Any:
         return self._apply('sync', sync=(self.client, self._check(rows)))

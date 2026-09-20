@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import replace
 from hashlib import sha256
 from random import Random
@@ -7,7 +8,7 @@ import pytest
 from netsim.model import forwarding as fw
 from netsim.model import routing as rt
 from netsim.model.addressing import IPV4, IPV6, prefix_to_int, to_int
-from netsim.model.contracts import CONNECTED, IGP, STATIC, ClientId
+from netsim.model.contracts import CONNECTED, IGP, STATIC, ClientId, ClientProfile
 from netsim.model.routing import (
     Nexthop,
     ResolutionPolicy,
@@ -181,7 +182,90 @@ class TestNexthopAndRoute:
         assert r.key == (A('10.0.0.4'), 32, STATIC, ())
 
 
+@pytest.mark.parametrize('batched', [False, True])
+@pytest.mark.parametrize('mixed', [False, True])
+@pytest.mark.parametrize('foreign', [ClientId('bgp', 7), ClientId('static', 1)])
+def test_client_rejects_foreign_deletions_atomically(batched, mixed, foreign):
+    from netsim.model.network import Network
+
+    net = Network()
+    net.register_client(ClientProfile(foreign, distance=20))
+    device = net.add_device('a')
+    static_client = device.rib_client(STATIC)
+    other_client = device.rib_client(foreign, distance=20)
+    own = static('10.0.0.1/32', [Nexthop.blackhole()])
+    other = replace(own, source=foreign)
+    static_client.add_routes((own,))
+    other_client.add_routes((other,))
+    pending = replace(own, prefix=P('10.0.0.2/32'))
+
+    with net.batch() if batched else nullcontext():
+        static_client.add_routes((pending,))
+        before = device.rib(IPV4)
+        committed = net._state
+        staged = net._batch_ops
+        keys = (own.key, other.key, pending.key) if mixed else (other.key,)
+        with pytest.raises(ValueError, match='does not belong'):
+            static_client.delete_routes(iter(keys))
+        assert net._batch_ops == staged
+        assert device.rib(IPV4) == before
+        assert net._state is committed
+        # Even a missing foreign key is rejected before the valid key is staged.
+        with pytest.raises(ValueError, match='does not belong'):
+            static_client.delete_routes((own.key, replace(other, prefix=(0, 0)).key))
+        assert device.rib(IPV4) == before
+        assert net._state is committed
+
+    assert device.rib(IPV4).rows_of(STATIC) == (own, pending)
+    assert device.rib(IPV4).rows_of(foreign) == (other,)
+    with net.batch() if batched else nullcontext():
+        static_client.delete_routes((own.key, pending.key))
+    assert device.rib(IPV4).rows_of(STATIC) == ()
+    assert device.rib(IPV4).rows_of(foreign) == (other,)
+
+
 class TestRibApply:
+    @pytest.mark.parametrize('count', [1000, 10_000])
+    @pytest.mark.parametrize('operation', ['add', 'delete', 'replace'])
+    def test_small_updates_do_not_enumerate_the_client(
+        self, monkeypatch, count, operation
+    ):
+        rows = tuple(
+            Route((i, 32), IPV4, STATIC, 1, (Nexthop.blackhole(),))
+            for i in range(count)
+        )
+        rib = rib_apply(RibState.empty(IPV4), sync=(STATIC, rows))
+        added = replace(rows[0], prefix=(count, 32))
+        key = rows[count // 2].key
+        route_key = Route.key.fget
+        visited = 0
+
+        def counted(row):
+            nonlocal visited
+            visited += 1
+            return route_key(row)
+
+        monkeypatch.setattr(Route, 'key', property(counted))
+        if operation == 'add':
+            updated = rib_apply(rib, add=(added,))
+        elif operation == 'delete':
+            updated = rib_apply(rib, delete=(key,))
+        else:
+            updated = rib_apply(rib, add=(replace(rows[count // 2], metric=7),))
+        assert visited <= 4, f'one-row {operation} visited {visited} rows'
+        assert updated is not rib
+        for old, new in (
+            (rib.clients[STATIC], updated.clients[STATIC]),
+            (rib.prefixes._tables[32], updated.prefixes._tables[32]),
+            (rib.shards[32], updated.shards[32]),
+        ):
+            assert isinstance(old, PMap) and isinstance(new, PMap)
+            assert len(old._shards) == len(new._shards) == 256
+            assert (
+                sum(a is not b for a, b in zip(old._shards, new._shards, strict=True))
+                == 1
+            )
+
     def test_indexed_reads_do_not_scan_or_sort_storage(self, monkeypatch):
         rows = tuple(
             Route((i, 32), IPV4, STATIC, 1, (Nexthop.blackhole(),)) for i in range(1000)
@@ -191,12 +275,13 @@ class TestRibApply:
         def no_scan(*args, **kwargs):
             pytest.fail('indexed reads must not scan or sort RIB storage')
 
-        monkeypatch.setattr(PMap, 'values', no_scan)
-        monkeypatch.setattr(PMap, 'sorted_items', no_scan)
-        monkeypatch.setattr(rt, '_rank', no_scan)
-        assert rib.rows((500, 32)) == (rows[500],)
-        assert rib.candidates((500, 32)) is rib.rows((500, 32))
-        assert list(rib.best_groups((500, 32))) == [(rows[500],)]
+        with monkeypatch.context() as patch:
+            patch.setattr(PMap, 'values', no_scan)
+            patch.setattr(PMap, 'sorted_items', no_scan)
+            patch.setattr(rt, '_rank', no_scan)
+            assert rib.rows((500, 32)) == (rows[500],)
+            assert rib.candidates((500, 32)) is rib.rows((500, 32))
+            assert list(rib.best_groups((500, 32))) == [(rows[500],)]
         assert rib.rows_of(STATIC) == rows
         assert rib.rows_of(IGP) == ()
         assert rib.rows((2000, 32)) == rib.rows((0, 24)) == ()
@@ -227,7 +312,7 @@ class TestRibApply:
         updated = rib_apply(rib, sync=(STATIC, (covering,)))
         assert updated.rows(a.prefix) == (c,)
         assert updated.rows_of(STATIC) == (covering,)
-        assert updated.rows_of(IGP) is rib.rows_of(IGP)
+        assert updated.clients[IGP] is rib.clients[IGP]
         assert updated.prefixes.lookup(0) == (0, bits, (c,))
         assert len(updated) == 2 and len(updated.prefixes) == 2
         assert updated.prefixes._tables[0] is rib.prefixes._tables[0]
