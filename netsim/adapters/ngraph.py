@@ -99,15 +99,19 @@ class _MetadataGuard:
 
     def __init__(self, net: Network) -> None:
         self.net = net
+        self.root = net.state
         self.saved = {
-            k: copy.copy(v) for k, v in vars(net).items() if k.startswith('netsim_')
+            k: copy.deepcopy(v) for k, v in vars(net).items() if k.startswith('netsim_')
         }
 
     def __enter__(self) -> _MetadataGuard:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if exc_type is not None:
+        # An exception raised by an observer after the commit leaves the new
+        # tree in place; the metadata must then describe that tree, so only
+        # a failure before publication (root unchanged) rolls it back.
+        if exc_type is not None and self.net.state is self.root:
             for k in [k for k in vars(self.net) if k.startswith('netsim_')]:
                 delattr(self.net, k)
             for k, v in self.saved.items():

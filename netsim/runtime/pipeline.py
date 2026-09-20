@@ -530,6 +530,18 @@ def fib_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
         ):
             for af in derive.AFS:
                 out.add((name, af))
+            continue
+        # A batch may change inputs and revert them: the published delta
+        # then carries only the advanced epochs. A dirty epoch is itself a
+        # cause, so the resolver runs and records the epoch as processed.
+        if delta.device_field_changed(name, 'resolver_input_epoch'):
+            for af in derive.AFS:
+                if dev.resolver_input_epoch.get(af, 0) != (
+                    dev.resolver_outcomes.get(af).processed_epoch
+                    if dev.resolver_outcomes.get(af) is not None
+                    else -1
+                ):
+                    out.add((name, af))
     return out
 
 

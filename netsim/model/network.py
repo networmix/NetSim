@@ -368,7 +368,7 @@ class Network:
         # consistent with what the shared root already contains.
         for name, value in vars(self).items():
             if name.startswith('netsim_'):
-                setattr(net, name, copy.copy(value))
+                setattr(net, name, copy.deepcopy(value))
         return net
 
     def update(

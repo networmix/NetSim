@@ -726,3 +726,53 @@ def test_route_sync_fold_order_across_clients_matches_sequential(snapshot):
             if snapshot:
                 assert tree_equal(net.state, expected.state)
     assert tree_equal(net.state, expected.state)
+
+
+def test_reverted_inputs_inside_a_batch_still_resolve_in_the_timed_pipeline():
+    """Two callbacks change and restore a resolver input: the published
+    delta carries only the advanced epoch, which must still schedule the FIB."""
+    import dataclasses
+
+    import netsim
+    from netsim.model.routing import ResolutionPolicy
+    from netsim.runtime import Simulation
+    from tests.model.test_network import build_diamond
+
+    net, R = build_diamond()
+    env = netsim.Environment()
+    sim = Simulation(env, net)
+    original = net.state.devices['R1'].config.resolution_policy
+    fib = R['R1'].fib(4)
+    entry = fib.lookup(
+        __import__('netsim.model.addressing', fromlist=['to_int']).to_int('10.0.0.4')[0]
+    )
+    assert len(fib.group(entry).adjacencies) == 2
+
+    def set_policy(policy):
+        def fn(state):
+            dev = state.devices['R1']
+            cfg = dataclasses.replace(dev.config, resolution_policy=policy)
+            return dataclasses.replace(
+                state,
+                devices=state.devices.set('R1', dataclasses.replace(dev, config=cfg)),
+            )
+
+        return fn
+
+    def edit():
+        with net.batch():
+            net.update(set_policy(ResolutionPolicy(max_ecmp_paths=1)), 'narrow')
+            net.update(set_policy(original), 'restore')
+
+    sim.at(5, edit)
+    sim.run_until(6)
+    from netsim.model.addressing import to_int
+    from netsim.model.contracts import STATIC
+
+    fib = R['R1'].fib(4)
+    entry = fib.lookup(to_int('10.0.0.4')[0])
+    assert entry is not None and len(fib.group(entry).adjacencies) == 2
+    assert (
+        R['R1'].route_status(4, (to_int('10.0.0.4')[0], 32, STATIC, ()))[0]
+        == 'INSTALLED'
+    )

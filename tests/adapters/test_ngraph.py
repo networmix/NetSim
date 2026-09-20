@@ -507,3 +507,37 @@ class TestCombineAllocation:
         td3.group_mode = 'per_group'
         with pytest.raises(ValueError, match='group_mode'):
             adapter.demands_from(graph, net, {'z': [td3]}, capacity_unit=1.0)
+
+
+def test_metadata_survives_a_post_commit_observer_error():
+    graph = diamond_stub()
+    net = adapter.from_network(graph)
+    adapter.demands_from(
+        graph,
+        net,
+        {'p': [TrafficDemand('^R1$', '^R4$', 20.0, mode='pairwise', priority=1)]},
+        capacity_unit=1.0,
+    )
+
+    def boom(*args):
+        raise RuntimeError('observer failure')
+
+    net.on_delta.append(boom)
+    with pytest.raises(RuntimeError, match='observer failure'):
+        adapter.demands_from(
+            graph,
+            net,
+            {'p': [TrafficDemand('^R1$', '^R4$', 20.0, mode='pairwise', priority=9)]},
+            capacity_unit=1.0,
+        )
+    assert net.state.demands['p:0:R1>R4'].priority == -9  # the commit stood
+    assert net.netsim_demand_priorities['p:0:R1>R4'] == 9  # and so does the label
+
+
+def test_fork_detaches_nested_adapter_metadata():
+    graph = diamond_stub()
+    net = adapter.from_network(graph)
+    net.netsim_failure_parameters[('device', 'R1')] = {'mtbf': 10, 'mttr': 1}
+    fork = net.fork()
+    fork.netsim_failure_parameters[('device', 'R1')]['mtbf'] = 2
+    assert net.netsim_failure_parameters[('device', 'R1')]['mtbf'] == 10
