@@ -6,6 +6,12 @@ the inbox deque and its captured prefix, armed timers, the per-run RNG
 handoff and stat buffers, the subscription index and the receipt journal.
 The tree keeps ``contracts.AgentNode``; the transport keeps queues.
 
+Rejected receipts are parked outside the AGENT deadline heap until explicit
+``Simulation.retry()``. Their captured prefix, pre-run state and RNG remain
+intact; later arrivals accumulate without scheduling them. Reset/removal
+discards parked tickets together with the generation's inbox. Budget counters
+distinguish runnable ``pending_runs`` from ``parked_runs``.
+
 Contract between this runtime and ``netsim.runtime.transport`` (both sides
 are implemented by their own slice; the method names below are fixed):
 
@@ -188,15 +194,6 @@ class AgentInboxOverflow(RuntimeError):
         )
 
 
-class _AgentKind(Kind):
-    def _claim_due(self, now, successor=None):
-        # A fresh arrival cannot implicitly retry a rejected captured run.
-        blocked = set(successor or ())
-        for entries in self.retryable.values():
-            blocked.update(entries)
-        return super()._claim_due(now, blocked)
-
-
 class AgentRuntime:
     def __init__(self, sim: Simulation) -> None:
         self.sim = sim
@@ -216,13 +213,14 @@ class AgentRuntime:
         self._timer_events: dict[int, Any] = {}
         self._published: list[tuple[tuple[str, str, int], c.AgentOutput, tuple]] = []
         self._rejections: list[AgentRejection] = []
-        self._kind = _AgentKind(
+        self._kind = Kind(
             derive.AGENT,
             COALESCE,
             self._run,
             self.affected,
             self._delay,
             after_run=self._after_run,
+            park_retries=True,
         )
 
     def kind(self) -> Kind:
@@ -839,10 +837,9 @@ class AgentRuntime:
         rejections, self._rejections = tuple(self._rejections), []
         for rejection in rejections:
             entity = (rejection.device, rejection.agent)
-            self._kind._enqueue(entity, now)
-            ticket = self._kind.pending[entity][1]
-            self._kind.retryable.setdefault(now, {})[entity] = ticket
+            self._kind._park_retry(entity, now)
             self.sim.pipeline.successor.get(derive.AGENT, set()).discard(entity)
+        self._kind._compact()
         # Every accepted receipt is committed. Consume ALL captured prefixes
         # before stats/transport callbacks, which may raise or deliver new work.
         consumed: dict[tuple[str, str, int], tuple[c.InboxEntry, ...]] = {}
@@ -999,6 +996,8 @@ class AgentRuntime:
         self._captures.pop(key, None)
         self._armed_count -= len(self._timers.pop(key, {}))
         self._kind.pending.pop(entity, None)
+        assert self._kind.parked is not None
+        self._kind.parked.pop(entity, None)
         for entries in self._kind.retryable.values():
             entries.pop(entity, None)
         self._kind._compact()
@@ -1069,6 +1068,7 @@ class AgentRuntime:
         return {
             'agents': len(self._live),
             'pending_runs': len(self._kind.pending),
+            'parked_runs': len(self._kind.parked or ()),
             'inbox_entries': sum(map(len, self._inboxes.values())),
             'armed_timers': armed,
             'scheduled_timer_events': len(self._timer_events),

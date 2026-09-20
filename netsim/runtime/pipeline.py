@@ -93,6 +93,7 @@ class Kind:
         delay: Callable[[NetworkState, Any], float] | None = None,
         *,
         after_run: Callable[[float, list[Any]], None] | None = None,
+        park_retries: bool = False,
     ) -> None:
         self.offset = offset
         self.priority = core.DEFERRED + offset
@@ -108,6 +109,19 @@ class Kind:
         self._heap: list[tuple[float, int, Any]] = []
         self._ticket = 0  # per-kind, independent of round generations
         self.retryable: dict[float, dict[Any, int]] = {}
+        # AGENT receipts retain their captured run outside runnable work until
+        # explicit retry. In particular, heap compaction must not restore them.
+        self.parked: dict[Any, tuple[float, int]] | None = {} if park_retries else None
+
+    def _park_retry(
+        self, entity: Any, deadline: float, ticket: int | None = None
+    ) -> None:
+        assert self.parked is not None
+        if ticket is None:
+            self._ticket += 1
+            ticket = self._ticket
+        self.pending.pop(entity, None)
+        self.parked[entity] = (deadline, ticket)
 
     def _enqueue(self, entity: Any, deadline: float) -> None:
         self._ticket += 1
@@ -205,6 +219,8 @@ class Pipeline:
     def schedule_entity(
         self, kind: Kind, entity: Any, target: float, now: float
     ) -> None:
+        if kind.parked is not None and entity in kind.parked:
+            return  # fresh causes cannot retry an AGENT's captured receipt
         target = max(target, now)
         existing = kind.pending.get(entity)
         if kind.mode == COALESCE:
@@ -322,6 +338,12 @@ class Pipeline:
                 # Published: the claimed work is consumed exactly once; an
                 # observer failure is reported but never re-executes the run.
                 raise
+            if kind.parked is not None:
+                for e in due:
+                    kind._park_retry(e, *claimed[e])
+                kind._compact()
+                self.successor.get(kind.offset, set()).difference_update(due)
+                raise
             retryable = kind.retryable.setdefault(now, {})
             for e in due:
                 deadline, ticket = claimed[e]
@@ -361,6 +383,13 @@ class Pipeline:
     def retry(self) -> None:
         now = self.env.now
         for kind in self.kinds:
+            if kind.parked is not None:
+                parked, kind.parked = kind.parked, {}
+                for entity in sorted(parked, key=repr):
+                    # Normal scheduling enforces the visited-band frontier:
+                    # an AGENT retry cannot republish in the current round.
+                    self.schedule_entity(kind, entity, now, now)
+                continue
             if kind.retryable:
                 for _t, entities in kind.retryable.items():
                     for e, ticket in entities.items():
