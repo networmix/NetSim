@@ -306,4 +306,6 @@ class TestRuntimeStubs:
             net.state.devices['R1'].agents['ref'].generation
         )
         assert sim.agents.generation('R1', 'nope') is None
-        assert sim.agents.budget() == {} and sim.transport.budget() == {}
+        assert sim.agents.budget() == {}
+        assert sim.transport.budget()['inflight_datagrams'] == 0
+        assert sim.transport.budget()['queued_messages'] == 0
