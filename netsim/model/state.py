@@ -26,6 +26,8 @@ from typing import (
     dataclass_transform,
 )
 
+from netsim.model.lpm import FrozenPrefixTable
+
 K = TypeVar('K', bound=Hashable)
 V = TypeVar('V')
 T = TypeVar('T')
@@ -508,6 +510,11 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
         if id(o) in seen:
             continue
         seen.add(id(o))
+        if isinstance(o, FrozenPrefixTable):
+            for plen, table in o.shards().items():
+                for net_, value in table.items():
+                    stack.append((value, f'{p}[{net_}/{plen}]'))
+            continue
         if isinstance(o, PMap):
             for k, v in o.items():
                 stack.append((v, f'{p}[{k!r}]'))

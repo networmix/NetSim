@@ -219,3 +219,14 @@ def test_traffic_class_change_is_not_empty():
     )
     assert delta is not None
     assert ('traffic_classes', 'gold') in delta.changed_paths()
+
+
+def test_debug_validation_accepts_frozen_prefix_tables():
+    from netsim.model.addressing import to_int
+    from tests.model.test_network import build_diamond
+
+    net, R = build_diamond()
+    net.debug_validate = True
+    R['R1'].add_route('10.9.9.9/32', [('eth3', '10.1.13.1')])
+    net.converge()
+    assert R['R1'].fib(4).lookup(to_int('10.9.9.9')[0]) is not None

@@ -137,7 +137,8 @@ def test_draws_match_actual_square_mesh_monte_carlo_and_replay(tmp_path):
         json.dumps(container.to_dict(), allow_nan=False)
     # Preserve the existing adapter's per-pair volume semantics. NetGraph
     # aggregates this selector demand; T6 does not alter placement semantics.
-    assert result.baseline['summary']['total_demand'] == 144
+    # pairwise volume is split over the expanded pairs, as NetGraph does
+    assert result.baseline['summary']['total_demand'] == 12
     assert expected[0]['summary']['total_demand'] == 12
     assert {row['destination'] for row in result.rows()} == set(scenario.network.nodes)
     path = tmp_path / 'results.json'

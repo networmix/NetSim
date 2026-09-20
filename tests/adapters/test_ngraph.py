@@ -172,7 +172,7 @@ class TestFromNetwork:
             capacity_unit=1e6,
         )
         assert len(ids) == 4 and all(
-            net.state.demands[i].rate == pytest.approx(40e6) for i in ids
+            net.state.demands[i].rate == pytest.approx(10e6) for i in ids
         )
         ids2 = adapter.demands_from(
             g,
@@ -265,3 +265,47 @@ def test_failure_schedules_share_overlapping_leases():
     assert net.link(net.ngraph_link_ids[lid]).state == 0
     sim.run_until(6)
     assert net.link(net.ngraph_link_ids[lid]).state == 1
+
+
+def test_demand_volume_follows_netgraph_expansion_semantics():
+    """``pairwise`` splits the volume over the pairs; ``combine`` is one
+    aggregate of the same total. Both offer ``volume`` in total."""
+    graph = diamond_stub()
+    for mode in ('pairwise', 'combine'):
+        sets = {'t': [TrafficDemand('^R1$', '^R[234]$', 12.0, mode=mode)]}
+        net = adapter.from_network(graph)
+        ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
+        rates = [net.state.demands[i].rate for i in ids]
+        assert len(rates) == 3 and sum(rates) == pytest.approx(12.0), mode
+        assert all(r == pytest.approx(4.0) for r in rates)
+
+
+def test_real_ngraph_total_demand_matches_netgraph():
+    pytest.importorskip('ngraph', reason='netsim[ngraph] extra not installed')
+    import pathlib
+
+    import yaml
+    from ngraph.scenario import Scenario as NgScenario
+
+    text = (
+        pathlib.Path(__file__)
+        .with_name('data')
+        .joinpath('square_mesh.yaml')
+        .read_text()
+    )
+    doc = yaml.safe_load(text)
+    doc['workflow'] = [
+        {
+            'type': 'TrafficMatrixPlacement',
+            'name': 'tm',
+            'demand_set': 'baseline_traffic_matrix',
+            'iterations': 0,
+        }
+    ]
+    scenario = NgScenario.from_yaml(yaml.safe_dump(doc))
+    scenario.run()
+    total = scenario.results.to_dict()['steps']['tm']['data']['baseline']['summary'][
+        'total_demand'
+    ]
+    net, ids, _ = adapter.from_scenario(scenario, capacity_unit=1.0)
+    assert sum(net.state.demands[i].rate for i in ids) == pytest.approx(total)

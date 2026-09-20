@@ -345,12 +345,11 @@ def _populate_demands(
             pairs = [(s, t) for s in sources for t in targets if s != t]
             if not pairs:
                 continue
-            mode = getattr(td, 'mode', 'combine')
-            per_pair = (
-                td.volume * capacity_unit / len(pairs)
-                if mode == 'combine'
-                else td.volume * capacity_unit
-            )
+            # NetGraph semantics: ``pairwise`` splits the volume evenly over
+            # the expanded pairs; ``combine`` is one aggregate of ``volume``
+            # between the source and target sets, approximated here by the
+            # same even split (NetGraph originates an even share per source).
+            per_pair = td.volume * capacity_unit / len(pairs)
             for s, t in pairs:
                 dst = _loopback_v4(net, t)
                 did = f'{set_name}:{i}:{s}>{t}'
