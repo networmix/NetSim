@@ -45,7 +45,7 @@ from netsim.model import derive
 from netsim.model import forwarding as fw
 from netsim.model.network import _View
 from netsim.model.packets import IPv4Packet, IPv6Packet, L4Header
-from netsim.model.state import NetworkState, StateDelta, validate_immutable
+from netsim.model.state import NetworkState, StateDelta, diff_pmap, validate_immutable
 from netsim.runtime.channels import (
     Wire,
     configured,
@@ -210,6 +210,10 @@ class TransportRuntime:
         self._ports: dict[str, tuple[Any, dict[int, tuple[tuple[str, int], ...]]]] = {}
         self._cancelled: dict[tuple[str, str], int] = {}
         self._sessions: dict[int, _Session] = {}
+        self._indexed_transport: c.TransportState | None = None
+        self._connection_deps: dict[int, tuple[str, ...]] = {}
+        self._by_device: dict[str, set[int]] = {}
+        self._listener_devices: dict[str, set[Any]] = {}
         self._inflight = 0
         self._dropped = 0
         self._rejected = 0
@@ -281,7 +285,11 @@ class TransportRuntime:
         interface: str | None = None,
     ) -> c.Rejection:
         rejection = c.Rejection(
-            self.sim.env.now, reason, connection=connection, interface=interface
+            self.sim.env.now,
+            reason,
+            connection=connection,
+            interface=interface,
+            generation=generation,
         )
         self._rejected += 1
         if self._live(device, agent, generation) and not self.sim.agents.deliver(
@@ -391,7 +399,9 @@ class TransportRuntime:
         overflow = False
         for name, generation in entry.receivers:
             if self._live(entry.wire.rx[0], name, generation):
-                if self.sim.agents.deliver(entry.wire.rx[0], name, delivery):
+                if self.sim.agents.deliver(
+                    entry.wire.rx[0], name, replace(delivery, generation=generation)
+                ):
                     delivered = True
                 else:
                     self._inbox_rejected += 1
@@ -412,14 +422,57 @@ class TransportRuntime:
             for entry in queue:
                 self._cancel(entry.event)
 
+    def _index(self, transport: c.TransportState | None) -> None:
+        """Index committed dependency queries, including misses and endpoints.
+
+        An unrelated device delta touches only its reverse-index buckets. The
+        immutable transport identity makes the common lookup O(1); transport
+        edits refresh only changed persistent-map shards. Bootstrap once for
+        pre-existing transport trees, and tolerate read-only snapshot queries.
+        """
+        previous = self._indexed_transport
+        if transport is previous:
+            return
+        before = previous.connections if previous is not None else None
+        after = transport.connections if transport is not None else None
+        for cid in diff_pmap(before, after).keys:
+            for device in self._connection_deps.pop(cid, ()):
+                bucket = self._by_device[device]
+                bucket.remove(cid)
+                if not bucket:
+                    del self._by_device[device]
+            conn = after.get(cid) if after is not None else None
+            if conn is None or conn.state == c.DOWN:
+                continue
+            deps = set(conn.deps)
+            deps.add(conn.a_device)
+            if conn.b_device is not None:
+                deps.add(conn.b_device)
+            self._connection_deps[cid] = tuple(sorted(deps))
+            for device in deps:
+                self._by_device.setdefault(device, set()).add(cid)
+        old_listeners = previous.listeners if previous is not None else None
+        new_listeners = transport.listeners if transport is not None else None
+        for key in diff_pmap(old_listeners, new_listeners).keys:
+            old = old_listeners.get(key) if old_listeners is not None else None
+            new = new_listeners.get(key) if new_listeners is not None else None
+            if old is not None:
+                bucket = self._listener_devices[old.device]
+                bucket.remove(key)
+                if not bucket:
+                    del self._listener_devices[old.device]
+            if new is not None:
+                self._listener_devices.setdefault(new.device, set()).add(key)
+        self._indexed_transport = transport
+
     def affected(self, delta: StateDelta, state: NetworkState) -> set[Any]:
         transport = state.transport
+        self._index(transport)
         if transport is None:
             return set()
         if delta.transport_changed():
             return set(transport.connections)
         changed = set()
-        lifecycle = False
         devices = delta.devices()
         for name in devices.keys:
             if delta.agents(name).keys:
@@ -432,7 +485,6 @@ class TransportRuntime:
                         after is None or before.generation != after.generation
                     ):
                         changed.add(name)
-                        lifecycle = True
             if (
                 delta.config_changed(name)
                 or delta.interface_changes(name)
@@ -454,13 +506,10 @@ class TransportRuntime:
                 link = root.links.get(lid)
                 if link is not None:
                     changed.update((link.a[0], link.b[0]))
-        out = {
-            cid
-            for cid, conn in transport.connections.items()
-            if conn.state != c.DOWN
-            and changed.intersection((*conn.deps, conn.a_device, conn.b_device))
-        }
-        if transport.listeners and (lifecycle or changed):
+        out: set[Any] = set()
+        for device in changed:
+            out.update(self._by_device.get(device, ()))
+        if any(device in self._listener_devices for device in changed):
             out.add(0)  # reserved maintenance entity; connection ids start at 1
         return out
 
@@ -600,6 +649,13 @@ class TransportRuntime:
                 return self._reject(device, agent, generation, c.UNREACHABLE_ENDPOINT)
             key = _key(device, op.local)
             listener = transport.listeners.get(key)
+            if listener is not None and not self._live(
+                listener.device, listener.agent, listener.generation
+            ):
+                # Reset dispatch defers tree cleanup to TRANSPORT. A new
+                # generation's on_init may run first and replace its stale
+                # listener without colliding with that retired incarnation.
+                listener = None
             if op.kind == c.LISTEN_OP:
                 if listener is not None and (listener.agent, listener.generation) != (
                     agent,
@@ -759,9 +815,19 @@ class TransportRuntime:
                         local,
                         remote,
                         initiator,
+                        generation=generation,
                     ),
                 ):
                     self._inbox_rejected += 1
+
+    def _retire_session(self, cid: int) -> None:
+        runtime = self._sessions.pop(cid, None)
+        if runtime is not None:
+            self._cancel(runtime.handshake)
+            self._cancel(runtime.timer)
+            for direction in runtime.directions:
+                self._cancel(direction.event)
+                self._cancel(direction.timer)
 
     def _committed(self, time: float, origin: Any, delta: StateDelta) -> None:
         if (
@@ -771,6 +837,7 @@ class TransportRuntime:
             and delta.new.transport is None
         ):
             return  # No agents/channels/sessions: no model scans or new work.
+        self._index(delta.new.transport)
         for device in delta.devices().keys:
             old = delta.old.devices.get(device)
             new = delta.new.devices.get(device)
@@ -791,13 +858,7 @@ class TransportRuntime:
             if before is conn:
                 continue
             if conn.state == c.DOWN:
-                runtime = self._sessions.pop(cid, None)
-                if runtime is not None:
-                    self._cancel(runtime.handshake)
-                    self._cancel(runtime.timer)
-                    for direction in runtime.directions:
-                        self._cancel(direction.event)
-                        self._cancel(direction.timer)
+                self._retire_session(cid)
                 if before is None or before.state != c.DOWN:
                     self._session_event(conn)
                 continue
@@ -817,6 +878,10 @@ class TransportRuntime:
                         listener = delta.new.transport.listeners.get(
                             _key(conn.b_device, conn.b_local)
                         )
+                        if listener is not None and not self._live(
+                            listener.device, listener.agent, listener.generation
+                        ):
+                            listener = None
                         runtime.handshake = self._later(
                             target,
                             lambda cid=cid, listener=listener: self._handshake(
@@ -996,6 +1061,7 @@ class TransportRuntime:
                 connection=cid,
                 port=local.port,
                 seq=queued.seq,
+                generation=conn.b_generation if side == 0 else conn.a_generation,
             )
             if not self.sim.agents.deliver(device, agent, entry):
                 self._inbox_rejected += 1
@@ -1022,6 +1088,19 @@ class TransportRuntime:
         transport = self.sim.network.state.transport
         if transport is None:
             return
+        if self.sim.network._dispatching:
+            # Called from commit dispatch (agent removal or reset observed by
+            # the agent runtime): a nested update is illegal there, and the
+            # TRANSPORT kind derives the same DOWN/RESET states and listener
+            # removals from that very delta (``affected`` sees the lifecycle
+            # change), so the tree edit is left to its run. Retire runtime
+            # events now: a same-time NORMAL timeout may precede that band.
+            self._index(transport)
+            for cid in sorted(self._by_device.get(device, ())):
+                conn = transport.connections[cid]
+                if self._direction(conn, device, agent, generation) is not None:
+                    self._retire_session(cid)
+            return
         listeners = transport.listeners
         for key, listener in transport.listeners.items():
             if (listener.device, listener.agent, listener.generation) == (
@@ -1046,13 +1125,6 @@ class TransportRuntime:
                         b_to_a_reachable=False,
                     ),
                 )
-        if self.sim.network._dispatching:
-            # Called from commit dispatch (agent removal or reset observed by
-            # the agent runtime): a nested update is illegal there, and the
-            # TRANSPORT kind derives the same DOWN/RESET states and listener
-            # removals from that very delta (``affected`` sees the lifecycle
-            # change), so the tree edit is left to its run.
-            return
         self._publish(
             replace(transport, listeners=listeners, connections=connections), 'reset'
         )
