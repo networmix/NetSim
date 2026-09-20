@@ -316,7 +316,8 @@ def test_inbox_limit_and_float_deadlines():
 
     sim = fixture(Plugin(config=c.AgentConfig(run_delay=1, inbox_limit=1)))
     sim.settle()
-    assert sim.agents.deliver('r', 'test', c.TimerFired(0, 'first'))
+    for index in range(4):
+        assert sim.agents.deliver('r', 'test', c.TimerFired(0, f'timer-{index}'))
     with pytest.raises(AgentInboxOverflow):
         sim.agents.deliver('r', 'test', c.TimerFired(0, 'overflow'))
     sim.run_until(1)

@@ -368,7 +368,8 @@ def test_transport_inbox_overflow_is_explicit_and_counted():
     rejections = entries(sim, 'R1', c.Rejection)
     assert len(rejections) == 2
     assert all(
-        entry.reason == c.OVERFLOW and entry.interface == 'Po1' for entry in rejections
+        entry.reason == 'INBOX_FULL' and entry.interface == 'Po1'
+        for entry in rejections
     )
     assert sim.agents.budget()['inbox_entries'] == 1
     assert node(sim, 'R2').runs == 1

@@ -70,11 +70,11 @@ def test_commit_time_sr_validation_rejects_only_its_journal(malformed):
     assert sim.agents.budget()['inbox_entries'] == 0
 
 
-@pytest.mark.parametrize('failing_step', ['stats', 'transport'])
+@pytest.mark.parametrize('failing_step', ['stats', 'transport', 'consumed'])
 def test_finalization_failure_consumes_every_receipt_and_finishes_peers(
     monkeypatch, failing_step
 ):
-    calls, sent, flushed = [], [], []
+    calls, sent, flushed, acknowledged = [], [], [], []
 
     def callback(ctx):
         calls.append(ctx.agent)
@@ -101,17 +101,60 @@ def test_finalization_failure_consumes_every_receipt_and_finishes_peers(
         if sent[-1] == 'a' and failing_step == 'transport':
             raise RuntimeError('finalization failed')
 
+    def consumed(device, agent, generation, entries):
+        assert sim.agents.budget()['inbox_entries'] == 0
+        acknowledged.append((agent, entries))
+        if agent == 'a' and failing_step == 'consumed':
+            raise RuntimeError('finalization failed')
+
     monkeypatch.setattr(sim.stats, 'add', stat)
     monkeypatch.setattr(sim.transport, 'send_message', send)
+    monkeypatch.setattr(sim.transport, 'consumed', consumed)
     with pytest.raises(RuntimeError, match='finalization failed') as caught:
         sim.settle()
     assert published_failure(caught.value)
     assert flushed == ['a', 'after-a', 'b', 'after-b'] and sent == ['a', 'b']
+    assert [agent for agent, _ in acknowledged] == ['a', 'b']
+    assert all(len(entries) == 1 for _, entries in acknowledged)
     assert sim.agents.budget()['armed_timers'] == 2
     assert all(n.runs == 1 for n in sim.state.devices['r'].agents.values())
     sim.retry()
     sim.settle()
     assert calls == ['a', 'b'] and sent == ['a', 'b']
+    assert len(acknowledged) == 2
+
+
+def test_only_published_captured_prefixes_are_acknowledged(monkeypatch):
+    bad = True
+    acknowledgements = []
+
+    def callback(ctx):
+        if ctx.agent == 'b' and bad:
+            raise ValueError('reject b')
+        return c.AgentOutput(state=ctx.inbox)
+
+    sim = fixture(*(Plugin(c.ClientId(name), callback=callback) for name in ('a', 'b')))
+    first = c.SessionEvent(0, 1, c.DOWN, c.CLOSED)
+    later = c.TimerFired(0, 'later')
+    for name in ('a', 'b'):
+        sim.agents.deliver('r', name, first)
+    real_consumed = sim.transport.consumed
+
+    def consumed(device, agent, generation, entries):
+        acknowledgements.append((agent, entries))
+        real_consumed(device, agent, generation, entries)
+
+    monkeypatch.setattr(sim.transport, 'consumed', consumed)
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    assert acknowledgements == [('a', (first,))]
+    sim.agents.deliver('r', 'b', later)
+    bad = False
+    sim.retry()
+    sim.settle()
+    assert acknowledgements == [('a', (first,)), ('b', (first,)), ('b', (later,))]
+    assert acknowledgements[1][1][0] is first
+    assert acknowledgements[2][1][0] is later
 
 
 @pytest.mark.parametrize(
@@ -127,19 +170,20 @@ def test_control_allowance_is_separate_and_exhaustion_is_explicit(entry):
     sim.settle()
     assert sim.agents.deliver('r', 'test', c.Delivery(0, 'data', connection=1))
     assert not sim.agents.deliver('r', 'test', c.Delivery(0, 'more data', connection=1))
-    assert sim.agents.deliver('r', 'test', entry)
+    for _ in range(4):
+        assert sim.agents.deliver('r', 'test', entry)
     with pytest.raises(RuntimeError, match='control inbox'):
         sim.agents.deliver('r', 'test', entry)
-    assert sim.agents.budget()['inbox_entries'] == 2
+    assert sim.agents.budget()['inbox_entries'] == 5
     sim.run_until(1)
     assert sim.agents.deliver('r', 'test', entry)
 
 
 def test_transport_control_overflow_propagates_out_of_run_until():
-    # Real transport rejects two messages to missing connections. The second
-    # control entry cannot fit: it must terminate the run explicitly.
+    # Real transport rejects five messages to missing connections. The fifth
+    # exceeds the control floor: it must terminate the run explicitly.
     def callback(ctx):
-        return c.AgentOutput(messages=(c.Message(1, 'one'), c.Message(2, 'two')))
+        return c.AgentOutput(messages=tuple(c.Message(i + 1, i) for i in range(5)))
 
     sim = fixture(Plugin(config=c.AgentConfig(inbox_limit=1), callback=callback))
     with pytest.raises(RuntimeError, match='control inbox') as caught:

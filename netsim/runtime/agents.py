@@ -13,7 +13,10 @@ are implemented by their own slice; the method names below are fixed):
   the agent's *current* generation and schedules a run (``run_delay``);
   it returns ``False`` when the agent is gone, the generation is stale or
   the data inbox is full. Data Deliveries and control notifications have
-  separate allowances of ``config.inbox_limit`` entries each. A live control
+  separate allowances: ``config.inbox_limit`` data entries and
+  ``max(4, config.inbox_limit)`` controls. The four-entry floor accommodates
+  a timer, session transition and two admission rejections even for a
+  one-slot data inbox. A live control
   notification (SessionEvent, Rejection or TimerFired) never returns False:
   exhausting its allowance raises ``AgentInboxOverflow`` through the caller
   to the simulation driver. Callers must propagate it, never count-and-ignore.
@@ -30,9 +33,11 @@ are implemented by their own slice; the method names below are fixed):
 - ``transport.connections_of(device, agent, generation)`` supplies owned ids;
   ``transport.connection_counters(cid)`` supplies per-direction dicts (``a->b``,
   ``b->a``) with ``messages`` and ``bytes``; an agent sees the direction it
-  sends on. Until C3 supplies these methods, a delta-maintained owner index
-  and a bounded per-session compatibility read serve the same purpose; no
-  global budget scan or transport runtime object enters the context.
+  sends on. No global budget scan or transport runtime object enters the
+  context. After consuming each published captured prefix, publication calls
+  ``transport.consumed(device, agent, generation, captured_inbox)`` exactly
+  once. Rejected prefixes are never acknowledged. This lets transport retire
+  fully acknowledged DOWN records under its configured retention bound.
 
 Opaque state and SR views returned by identity are trusted. Normal admission
 checks only the top-level immutable representation; persistent builders own
@@ -59,7 +64,6 @@ from netsim.model.state import (
     NetworkState,
     PMap,
     StateDelta,
-    diff_pmap,
     validate_immutable,
 )
 from netsim.runtime.pipeline import COALESCE, Kind
@@ -236,7 +240,6 @@ class AgentRuntime:
         self._live: dict[tuple[str, str], int] = {}
         self._inboxes: dict[tuple[str, str, int], deque[c.InboxEntry]] = {}
         self._inbox_counts: dict[tuple[str, str, int], list[int]] = {}
-        self._connections: dict[tuple[str, str, int], set[int]] = {}
         self._causes: dict[tuple[str, str, int], set[c.Cause]] = {}
         self._captures: dict[tuple[str, str, int], _Capture] = {}
         self._timers: dict[tuple[str, str, int], dict[str, tuple[float, int]]] = {}
@@ -308,10 +311,6 @@ class AgentRuntime:
         return dev.agents.get(name) if dev is not None else None
 
     def bind(self) -> None:
-        transport = self.sim.state.transport
-        if transport is not None and not hasattr(self.sim.transport, 'connections_of'):
-            for cid, conn in transport.connections.items():
-                self._index_connection(cid, conn, add=True)
         for device, name in sorted(self.sim.network.agents):
             node = self.sim.state.devices[device].agents.get(name)
             if node is not None:
@@ -341,14 +340,6 @@ class AgentRuntime:
         out: set[Any] = set()
         if not self._live and not self.sim.network.agents:
             return out
-        if delta.old.transport is not state.transport and not hasattr(
-            self.sim.transport, 'connections_of'
-        ):
-            before = delta.old.transport.connections if delta.old.transport else PMap()
-            after = state.transport.connections if state.transport else PMap()
-            for cid in diff_pmap(before, after, by_identity=True).keys:
-                self._index_connection(cid, before.get(cid), add=False)
-                self._index_connection(cid, after.get(cid), add=True)
         for device in delta.devices().keys:
             old, new = delta.old.devices.get(device), state.devices.get(device)
             changes = delta.agents(device)
@@ -464,11 +455,10 @@ class AgentRuntime:
         counts = self._inbox_counts.setdefault(key, [0, 0])
         node = self.sim.state.devices[device].agents[agent]
         category = 0 if isinstance(entry, c.Delivery) else 1
-        if counts[category] >= node.config.inbox_limit:
+        limit = max(4, node.config.inbox_limit) if category else node.config.inbox_limit
+        if counts[category] >= limit:
             if category:
-                raise AgentInboxOverflow(
-                    device, agent, generation, node.config.inbox_limit
-                )
+                raise AgentInboxOverflow(device, agent, generation, limit)
             return False
         # Validate before admission, so an unrepresentable deadline changes nothing.
         self._delay(self.sim.state, (device, agent))
@@ -488,37 +478,6 @@ class AgentRuntime:
         )
         self.sim.pipeline.mark(self._kind, {(device, agent)}, self.sim.env.now)
         return True
-
-    def _index_connection(self, cid: int, conn: Any, *, add: bool) -> None:
-        if conn is None:
-            return
-        for device, agent, generation in (
-            (conn.a_device, conn.a_agent, conn.a_generation),
-            (conn.b_device, conn.b_agent, conn.b_generation),
-        ):
-            if device is None or agent is None or generation is None:
-                continue
-            key = (device, agent, generation)
-            if add:
-                self._connections.setdefault(key, set()).add(cid)
-            elif key in self._connections:
-                self._connections[key].discard(cid)
-                if not self._connections[key]:
-                    del self._connections[key]
-
-    def _connection_counters(self, cid: int) -> tuple:
-        accessor = getattr(self.sim.transport, 'connection_counters', None)
-        if accessor is not None:
-            return accessor(cid)
-        # C3R compatibility: read only this session, never materialize budget().
-        session = getattr(self.sim.transport, '_sessions', {}).get(cid)
-        return (
-            tuple(
-                {'messages': len(d.queue), 'bytes': d.size} for d in session.directions
-            )
-            if session
-            else ({}, {})
-        )
 
     def _context(
         self,
@@ -606,8 +565,7 @@ class AgentRuntime:
         transport = state.transport
         if transport:
             owner = (device, name, node.generation)
-            accessor = getattr(self.sim.transport, 'connections_of', None)
-            owned = accessor(*owner) if accessor else self._connections.get(owner, ())
+            owned = self.sim.transport.connections_of(*owner)
             for cid in sorted(owned):
                 conn = transport.connections[cid]
                 a = (conn.a_device, conn.a_agent, conn.a_generation) == (
@@ -629,7 +587,7 @@ class AgentRuntime:
                     continue
                 if remote is not None and remote.scope is not None:
                     remote = replace(remote, scope=local.scope)
-                directions = self._connection_counters(cid)
+                directions = self.sim.transport.connection_counters(cid)
                 counters: dict[str, int] = {}
                 if isinstance(directions, tuple) and len(directions) == 2:
                     counters = directions[0] if a else directions[1]
@@ -910,8 +868,10 @@ class AgentRuntime:
             self.sim.pipeline.successor.get(derive.AGENT, set()).discard(entity)
         # Every accepted receipt is committed. Consume ALL captured prefixes
         # before stats/transport callbacks, which may raise or deliver new work.
+        consumed: dict[tuple[str, str, int], tuple[c.InboxEntry, ...]] = {}
         for key, _, _ in published:
             capture = self._captures.pop(key)
+            consumed[key] = capture.inbox
             queue = self._inboxes.get(key)
             if queue is not None:
                 counts = self._inbox_counts[key]
@@ -923,6 +883,10 @@ class AgentRuntime:
                     self._inbox_counts.pop(key, None)
         errors: list[Exception] = []
         for key, output, stats in published:
+            try:
+                self.sim.transport.consumed(*key, consumed[key])
+            except Exception as error:
+                errors.append(error)
             for stat_name, value in stats + output.stats:
                 try:
                     self.sim.stats.add(stat_name, now, value)
