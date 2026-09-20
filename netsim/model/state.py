@@ -14,6 +14,7 @@ import os
 from collections.abc import ItemsView, KeysView, ValuesView
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Generic,
@@ -27,6 +28,9 @@ from typing import (
 )
 
 from netsim.model.lpm import FrozenPrefixTable
+
+if TYPE_CHECKING:
+    from netsim.model.srv6 import Srv6Policies, Srv6Sids
 
 K = TypeVar('K', bound=Hashable)
 V = TypeVar('V')
@@ -603,6 +607,7 @@ class Allocators:
     next_mac_index: int = 0
     next_link_index: int = 0
     next_ifindex: PMap[str, int] = field(default_factory=empty_pmap)
+    next_srv6_node: PMap[tuple[int, int], int] = field(default_factory=empty_pmap)
 
     def take_generation(self) -> tuple[Allocators, int]:
         return dataclasses.replace(
@@ -673,8 +678,8 @@ class DeviceState:
     nexthop_groups: Any = None
     load_balancers: Any = None
     srv6_config: Any = None
-    srv6_sids: Any = None
-    srv6_policies: Any = None
+    srv6_sids: Srv6Sids | None = None
+    srv6_policies: Srv6Policies | None = None
     agents: PMap[str, Any] = field(default_factory=empty_pmap)
     nht: Any = None
     l3_interfaces: PMap[str, Any] | None = None
@@ -693,6 +698,8 @@ class NetworkState:
     placement: Any = None
     transport: Any = None
     allocators: Allocators = field(default_factory=Allocators)
+    srv6_consumers: frozenset[str] = field(default_factory=frozenset)
+    """Bookkeeping index of policy headends, maintained incrementally by bump_epochs."""
 
 
 # ---------------------------------------------------------------------------
