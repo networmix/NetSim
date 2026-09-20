@@ -12,6 +12,7 @@ later time. Every round counts against a convergence limit.
 from __future__ import annotations
 
 import dataclasses
+from heapq import heapify, heappop, heappush
 from typing import Any, Callable
 
 from netsim import core
@@ -97,9 +98,39 @@ class Kind:
         self.run = run
         self.affected = affected
         self.delay = delay
-        self.pending: dict[Any, float] = {}
-        """entity → target time (COALESCE: one deadline per entity)."""
-        self.retryable: dict[float, set[Any]] = {}
+        self.pending: dict[Any, tuple[float, int]] = {}
+        """entity → (deadline, ticket), authoritative over the lazy heap."""
+        self._heap: list[tuple[float, int, Any]] = []
+        self._ticket = 0  # per-kind, independent of round generations
+        self.retryable: dict[float, dict[Any, int]] = {}
+
+    def _enqueue(self, entity: Any, deadline: float) -> None:
+        self._ticket += 1
+        self.pending[entity] = (deadline, self._ticket)
+        # Unique tickets also prevent comparisons between unlike entity types.
+        heappush(self._heap, (deadline, self._ticket, entity))
+        self._compact()
+
+    def _compact(self) -> None:
+        # Each live pending entry has exactly one matching heap entry. Rebuild
+        # only when stale entries outnumber live ones, amortizing the scan.
+        if len(self._heap) > 2 * len(self.pending):
+            self._heap = [(t, ticket, e) for e, (t, ticket) in self.pending.items()]
+            heapify(self._heap)
+        # This bounds only this kind's heap. Stale StageEvents stay in the
+        # engine queue until consumed; generation and pending-deadline checks
+        # make them harmless. Do not remove their scheduled/ROUND_END keys here.
+
+    def _claim_due(self, now: float) -> dict[Any, tuple[float, int]]:
+        claimed: dict[Any, tuple[float, int]] = {}
+        while self._heap and self._heap[0][0] <= now:
+            deadline, ticket, entity = heappop(self._heap)
+            pending = self.pending.get(entity)
+            if pending is None or pending[1] != ticket:
+                continue
+            claimed[entity] = self.pending.pop(entity)
+        self._compact()
+        return claimed
 
 
 class Pipeline:
@@ -158,16 +189,14 @@ class Pipeline:
         self, kind: Kind, entity: Any, target: float, now: float
     ) -> None:
         target = max(target, now)
+        existing = kind.pending.get(entity)
         if kind.mode == COALESCE:
-            existing = kind.pending.get(entity)
-            if existing is not None and existing <= target:
+            if existing is not None and existing[0] <= target:
                 return  # joins the pending run
-            kind.pending[entity] = target
         else:
-            existing = kind.pending.get(entity)
-            if existing is not None and existing == target:
+            if existing is not None and existing[0] == target:
                 return
-            kind.pending[entity] = target
+        kind._enqueue(entity, target)
         if target > now:
             self._ensure_event(kind, target, generation=0)
             return
@@ -236,26 +265,28 @@ class Pipeline:
         if event.generation != gen:
             return  # stale generation
         kind = self.by_offset[event.kind]
-        due = sorted((e for e, t in kind.pending.items() if t <= now), key=repr)
+        # Claim before running: a cause raised by this very commit (the kind
+        # re-dirtying itself) must create fresh work for the successor round.
+        claimed = kind._claim_due(now)
+        due = sorted(claimed, key=repr)
         if not due:
             self.ran_this_round.add(kind.offset)
             return
         self.ran_this_round.add(kind.offset)
         self.last_origins.append((kind.name, now, gen))
         self.last_origins = self.last_origins[-8:]
-        # Claim the due work before running: a cause raised by this very
-        # commit (the kind re-dirtying itself) must create fresh pending
-        # work for the successor round instead of being swallowed by the
-        # entry that is being processed.
-        claimed = {e: kind.pending.pop(e) for e in due}
         try:
             self.network.update(
                 lambda state: kind.run(state, now, due), ('kind', kind.name, gen)
             )
         except Exception:
-            for e, t in claimed.items():
-                kind.pending.setdefault(e, t)
-            kind.retryable.setdefault(now, set()).update(due)
+            retryable = kind.retryable.setdefault(now, {})
+            for e in due:
+                deadline, ticket = claimed[e]
+                if e not in kind.pending:
+                    kind.pending[e] = (deadline, ticket)
+                    heappush(kind._heap, (deadline, ticket, e))
+                retryable[e] = ticket
             raise
 
     def _round_end(self, event: core.Event) -> None:
@@ -288,8 +319,12 @@ class Pipeline:
         for kind in self.kinds:
             if kind.retryable:
                 for _t, entities in kind.retryable.items():
-                    for e in entities:
-                        kind.pending[e] = max(kind.pending.get(e, now), now)
+                    for e, ticket in entities.items():
+                        pending = kind.pending.get(e)
+                        # Newer requests (even completed/cancelled ones) win.
+                        if pending is not None and pending[1] == ticket:
+                            if pending[0] < now:
+                                kind._enqueue(e, now)
                 kind.retryable = {}
                 self._ensure_event(kind, now, self._generation_for(now))
 
