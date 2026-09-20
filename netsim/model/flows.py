@@ -18,26 +18,32 @@ import dataclasses
 from collections import defaultdict
 from dataclasses import field
 from fractions import Fraction
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple, Protocol
 
 from netsim.model import derive
 from netsim.model import forwarding as fw
-from netsim.model.addressing import IPV4, to_int
+from netsim.model.addressing import IPV4, IPV6, to_int
 from netsim.model.hashing import BalancerKind
 from netsim.model.interfaces import AdminState, OperState, PortChannelNode, l3_usable
 from netsim.model.links import transfer_blocked
 from netsim.model.packets import (
+    AFTER_DECAP,
+    AFTER_ENCAP,
     ETHERNET_HEADER,
     ETHERTYPE_IPV4,
     ETHERTYPE_IPV6,
     IPV4_HEADER,
     IPV6_HEADER,
     ORIGINATED,
+    SRH_BASE,
+    SRH_ENTRY,
     EthernetFrame,
     IPv4Packet,
     PacketTemplate,
+    frame_bytes,
     ip_bytes,
 )
+from netsim.model.srv6 import NESTED_ENCAP_UNSUPPORTED, PolicyRef
 from netsim.model.state import (
     FloatArray,
     NetworkState,
@@ -69,14 +75,31 @@ class Demand:
     flows: int = 1
     priority: int = 0
     tag: str | None = None
+    steer: PolicyRef | None = None
 
     def __post_init__(self) -> None:
         if self.rate < 0 or self.payload_size <= 0 or self.flows < 1:
             raise ValueError('demand needs rate >= 0, payload_size > 0, flows >= 1')
+        if self.template is not None and self.template.payload_size <= 0:
+            raise ValueError('template needs payload_size > 0')
 
     @property
     def class_key(self) -> tuple:
-        return (self.af, self.dst, self.dscp, self.payload_size)
+        base = (self.af, self.dst, self.dscp, self.payload_size)
+        if self.template is None and self.steer is None:
+            return base  # Preserve Gate A cache keys exactly.
+        template = (
+            tuple(
+                getattr(self.template, f.name)
+                for f in dataclasses.fields(self.template)
+            )
+            if self.template is not None
+            else ()
+        )
+        steer = (
+            (self.steer.color, self.steer.endpoint) if self.steer is not None else ()
+        )
+        return (*base, template, steer)
 
 
 def make_demand(id: str, source: str, dst: str, rate: float, **kw: Any) -> Demand:
@@ -93,6 +116,8 @@ class SourceResult:
     carried: tuple[tuple[int, Fraction], ...]
     delivered: Fraction
     drops: tuple[tuple[str, str, Fraction], ...]
+    transmissions: tuple[_Transmission, ...] = field(default=(), repr=False)
+    """Internal accounting metadata; omitted from the stable Gate A repr."""
 
 
 @record
@@ -111,6 +136,12 @@ class ClassResult:
     per_source: tuple[tuple[str, SourceResult], ...] = ()
     """Exact per-source results, filled only when the class has several
     sources and loses traffic (otherwise every source is fully delivered)."""
+    transmissions: tuple[_Transmission, ...] = field(default=(), repr=False)
+    """Each leg's attempted/carried payload fraction and transmitted frame bytes.
+    Packet rate on a leg is ``fraction * payload_rate / (8 * payload_size)``.
+    Repeated uses of a physical edge remain separate transmissions."""
+    cacheable: bool = field(default=True, repr=False)
+    """False for injected steps whose external inputs have no dependency token."""
 
 
 @record
@@ -210,6 +241,59 @@ def _frame_bytes(af: int, payload_size: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+class _PacketState(NamedTuple):
+    """Forwarding identity, excluding TTL (FLUID uses SCC loop-cut).
+
+    Plain IP has only an inner family. SR steps must retain the complete
+    remaining SID/action continuation, not just the active DA: equal-sized
+    SRHs can have different tails. ``stage`` distinguishes steering after
+    DECAP from initial ingress; it is never a monotonically growing hop id.
+    Tuple ordering makes vertex and leg ordering stable without hash/id order.
+    """
+
+    inner_af: int
+    outer: bool = False
+    srh_entries: int = 0
+    active_da: int = 0
+    continuation: tuple[int, ...] = ()
+    stage: int = ORIGINATED
+
+    def encap(
+        self, active_da: int, srh_entries: int = 0, continuation: tuple[int, ...] = ()
+    ) -> _PacketState:
+        """Push the Gate B outer IPv6 stack; the SR step supplies its continuation."""
+        if self.outer:
+            raise ValueError(NESTED_ENCAP_UNSUPPORTED)
+        if srh_entries < 0:
+            raise ValueError('SRH entry count must be non-negative')
+        return _PacketState(
+            self.inner_af, True, srh_entries, active_da, continuation, AFTER_ENCAP
+        )
+
+    def decap(self) -> _PacketState:
+        """Pop the outer stack and expose the inner steering context."""
+        return _PacketState(self.inner_af, stage=AFTER_DECAP) if self.outer else self
+
+    def frame_bytes(self, payload_size: int) -> int:
+        # RFC 8200 section 3 and RFC 8754 section 2: outer 40 + SRH 8 + 16*n.
+        size = _frame_bytes(self.inner_af, payload_size)
+        if self.outer:
+            size += IPV6_HEADER
+            if self.srh_entries:
+                size += SRH_BASE + SRH_ENTRY * self.srh_entries
+        return size
+
+
+_Vertex = tuple[str, _PacketState]
+
+
+class _Transmission(NamedTuple):
+    edge_id: int
+    frame_bytes: int
+    offered: Fraction
+    carried: Fraction
+
+
 @record
 class _Edge:
     edge_id: int
@@ -217,12 +301,58 @@ class _Edge:
     fraction: Fraction
     blocked: str | None
     """Physical or MTU reason, or ``None``."""
+    frame_bytes: int
+    packet_state: _PacketState
+    """Successor state after this transmission's complete local action program."""
+
+
+_Decision = tuple[str, Any, list[_Edge], list[tuple[str, Fraction]]]
+
+
+class _Step(Protocol):
+    def __call__(
+        self,
+        state: NetworkState,
+        device: str,
+        packet_state: _PacketState,
+        af: int,
+        dst: int,
+        payload_size: int,
+        *,
+        template: PacketTemplate | None,
+        steer: PolicyRef | None,
+        dscp: int,
+    ) -> _Decision:
+        """Expand local actions into ordered physical legs and node drops.
+
+        ENCAP/DECAP steps transform the state before egress resolution, using
+        ``encap``/``decap`` and then ``_egress_edges`` (or a cross-connect).
+        Each returned edge carries the transmitted size and successor state.
+        The step owns local-action validation and steering consumption; the
+        walk owns SCCs, physical-leg accounting and capacity allocation.
+        """
+        ...
 
 
 def _egress_edges(
-    state: NetworkState, device: str, af: int, dst: int, ip_len: int
-) -> tuple[str, Any, list[_Edge], list[tuple[str, Fraction]]]:
+    state: NetworkState,
+    device: str,
+    packet_state: _PacketState,
+    af: int,
+    dst: int,
+    payload_size: int,
+    *,
+    template: PacketTemplate | None = None,
+    steer: PolicyRef | None = None,
+    dscp: int = 0,
+) -> _Decision:
     """FIB decision at *device* for *dst*: ``(action, entry, edges, node_drops)``."""
+    if steer is not None and packet_state.stage == ORIGINATED:
+        return fw.DROP, None, [], [(fw.SRV6_UNSUPPORTED, Fraction(1))]
+    if packet_state.outer:
+        af, dst = IPV6, packet_state.active_da
+    frame_len = packet_state.frame_bytes(payload_size)
+    ip_len = frame_len - ETHERNET_HEADER
     dev = state.devices[device]
     fib = dev.fibs.get(af)
     entry = fib.lookup(dst) if fib is not None else None
@@ -288,7 +418,14 @@ def _egress_edges(
             if blocked is None and mnode.oper.oper != OperState.UP:
                 blocked = fw.EGRESS_DOWN
             edges.append(
-                _Edge(link.edge_id((device, member)), peer[0], member_share, blocked)
+                _Edge(
+                    link.edge_id((device, member)),
+                    peer[0],
+                    member_share,
+                    blocked,
+                    frame_len,
+                    packet_state,
+                )
             )
     return fw.TRANSMIT, entry, edges, drops
 
@@ -318,14 +455,16 @@ def edge_of_location(where: str) -> int | None:
     return int(where[5:]) if where.startswith('edge:') else None
 
 
-def _tarjan(nodes: list[str], succ: dict[str, list[str]]) -> list[list[str]]:
+def _tarjan(
+    nodes: list[_Vertex], succ: dict[_Vertex, list[_Vertex]]
+) -> list[list[_Vertex]]:
     """Strongly connected components in reverse topological order (Tarjan),
     with an explicit stack so a forwarding chain of any length works."""
-    index: dict[str, int] = {}
-    low: dict[str, int] = {}
-    on_stack: set[str] = set()
-    stack: list[str] = []
-    comps: list[list[str]] = []
+    index: dict[_Vertex, int] = {}
+    low: dict[_Vertex, int] = {}
+    on_stack: set[_Vertex] = set()
+    stack: list[_Vertex] = []
+    comps: list[list[_Vertex]] = []
     counter = 0
     for root in nodes:
         if root in index:
@@ -334,7 +473,9 @@ def _tarjan(nodes: list[str], succ: dict[str, list[str]]) -> list[list[str]]:
         counter += 1
         stack.append(root)
         on_stack.add(root)
-        work: list[tuple[str, Iterator[str]]] = [(root, iter(succ.get(root, ())))]
+        work: list[tuple[_Vertex, Iterator[_Vertex]]] = [
+            (root, iter(succ.get(root, ())))
+        ]
         while work:
             v, it = work[-1]
             descended = False
@@ -375,50 +516,77 @@ def walk_class(
     sources: dict[str, Fraction],
     residual: list[float] | None = None,
     scale: float = 1.0,
+    *,
+    template: PacketTemplate | None = None,
+    steer: PolicyRef | None = None,
+    step: _Step | None = None,
+    dscp: int = 0,
 ) -> ClassResult:
-    """Walk one class from *sources* (device → fraction of a unit inflow).
+    """Walk one class, propagating original payload fractions (packet rate).
 
-    With ``residual`` (LOSSY), edge shares are clipped against the residual
-    wire capacity scaled by *scale* (the demand's payload rate) and the
-    residual is decremented in place.
+    With ``residual`` (LOSSY), clip each transmission's wire load scaled by
+    the demand's payload rate. Deterministic leg order is reverse Tarjan
+    component order (roots/successors sorted by vertex), sorted vertices
+    within a component, then the step's edge order. The plain step preserves
+    FIB adjacency order and sorted bundle members. SR steps must emit policy
+    lists by descending weight, then name, and legs in chain order.
+
+    ``step`` is the SR expansion seam. It must be a pure finite derivation of
+    the immutable snapshot, including complete continuation in every vertex.
     """
-    ip_len = (IPV4_HEADER if af == IPV4 else IPV6_HEADER) + payload_size
-    wire_per_payload = _frame_bytes(af, payload_size) / payload_size
-    decisions: dict[str, tuple[str, Any, list[_Edge], list[tuple[str, Fraction]]]] = {}
-    succ: dict[str, list[str]] = {}
-    order: list[str] = []
-    frontier = sorted(sources)
-    seen: set[str] = set()
+    if template is not None:
+        af, dst, payload_size = template.af, template.dst, template.payload_size
+        dscp = template.dscp
+    initial = _PacketState(af)
+    expand = _egress_edges if step is None else step
+    decisions: dict[_Vertex, _Decision] = {}
+    succ: dict[_Vertex, list[_Vertex]] = {}
+    order: list[_Vertex] = []
+    frontier = [(d, initial) for d in sorted(sources)]
+    seen: set[_Vertex] = set()
     while frontier:
-        d = frontier.pop()
-        if d in seen or d not in state.devices:
+        v = frontier.pop()
+        d, packet_state = v
+        if v in seen or d not in state.devices:
             continue
-        seen.add(d)
-        order.append(d)
-        dec = _egress_edges(state, d, af, dst, ip_len)
-        decisions[d] = dec
-        nxt = sorted({e.peer for e in dec[2] if e.blocked is None})
-        succ[d] = nxt
+        seen.add(v)
+        order.append(v)
+        dec = expand(
+            state,
+            d,
+            packet_state,
+            af,
+            dst,
+            payload_size,
+            template=template,
+            steer=steer,
+            dscp=dscp,
+        )
+        decisions[v] = dec
+        nxt = sorted({(e.peer, e.packet_state) for e in dec[2] if e.blocked is None})
+        succ[v] = nxt
         frontier.extend(n for n in nxt if n not in seen)
     comps = _tarjan(sorted(order), succ)
-    comp_of: dict[str, int] = {}
+    comp_of: dict[_Vertex, int] = {}
     cyclic: set[int] = set()
     for i, comp in enumerate(comps):
         for v in comp:
             comp_of[v] = i
         if len(comp) > 1 or (comp and comp[0] in succ.get(comp[0], ())):
             cyclic.add(i)
-    inflow: dict[str, Fraction] = defaultdict(Fraction)
+    inflow: dict[_Vertex, Fraction] = defaultdict(Fraction)
     for s, f in sources.items():
-        inflow[s] += f
+        inflow[(s, initial)] += f
     edges: dict[int, Fraction] = defaultdict(Fraction)
     carried: dict[int, Fraction] = defaultdict(Fraction)
-    delivered = Fraction(0)
+    transmissions: list[_Transmission] = []
+    zero = Fraction(0)
+    delivered = zero
     drops: dict[tuple[str, str], Fraction] = defaultdict(Fraction)
     # Tarjan yields components in reverse topological order: process from the last.
     for ci in range(len(comps) - 1, -1, -1):
         for v in comps[ci]:
-            q = inflow.get(v, Fraction(0))
+            q = inflow.get(v, zero)
             if q == 0:
                 continue
             action, _entry, egress, node_drops = decisions[v]
@@ -426,20 +594,24 @@ def walk_class(
                 delivered += q
                 continue
             for reason, f in node_drops:
-                drops[(reason, v)] += q * f
+                drops[(reason, v[0])] += q * f
             if action == fw.DROP:
                 continue
             for e in egress:
                 share = q * e.fraction
                 edges[e.edge_id] += share
-                if e.blocked is not None:
-                    drops[(e.blocked, _edge_loc(e.edge_id))] += share
-                    continue
-                if comp_of.get(e.peer) == ci and ci in cyclic:
-                    drops[(fw.LOOP, _edge_loc(e.edge_id))] += share
+                successor = (e.peer, e.packet_state)
+                reason = e.blocked
+                if reason is None and comp_of.get(successor) == ci and ci in cyclic:
+                    reason = fw.LOOP
+                if reason is not None:
+                    drops[(reason, _edge_loc(e.edge_id))] += share
+                    transmissions.append(
+                        _Transmission(e.edge_id, e.frame_bytes, share, zero)
+                    )
                     continue
                 if residual is not None:
-                    # payload bit/s -> wire bit/s: frame bytes per payload byte
+                    wire_per_payload = e.frame_bytes / payload_size
                     wire_cap = residual[e.edge_id]
                     attempted = float(share) * scale * wire_per_payload
                     if attempted > wire_cap:
@@ -448,7 +620,7 @@ def walk_class(
                                 max(wire_cap, 0.0) / (scale * wire_per_payload)
                             )
                             if scale > 0
-                            else Fraction(0)
+                            else zero
                         )
                         carried_share = min(carried_share, share)
                         drops[(fw.CONGESTION, _edge_loc(e.edge_id))] += (
@@ -461,14 +633,19 @@ def walk_class(
                 else:
                     carried_share = share
                 carried[e.edge_id] += carried_share
-                inflow[e.peer] += carried_share
+                transmissions.append(
+                    _Transmission(e.edge_id, e.frame_bytes, share, carried_share)
+                )
+                inflow[successor] += carried_share
     return ClassResult(
         tuple(sorted(edges.items())),
         tuple(sorted(carried.items())),
         delivered,
         tuple(sorted((r, w, f) for (r, w), f in drops.items())),
-        tuple(sorted(order)),
+        tuple(sorted({d for d, _packet_state in order})),
         tuple(sorted(sources.items())),
+        transmissions=tuple(transmissions),
+        cacheable=step is None,
     )
 
 
@@ -529,10 +706,13 @@ def walk_hash(
     views: Any,
     max_hops: int = 64,
     residual: list[float] | None = None,
+    *,
+    wire: tuple[dict[int, float], dict[int, float]] | None = None,
 ) -> tuple[dict[int, float], dict[int, float], float, dict[tuple[str, str], float]]:
     """Per microflow forward-step execution; returns edge offered/carried
     payload rates, delivered payload rate and drops. With ``residual``
-    (LOSSY) each hop is clipped against the remaining wire capacity."""
+    (LOSSY) each hop is clipped against the remaining wire capacity. Optional
+    ``wire`` accumulators receive the corresponding per-hop wire rates."""
     template = demand.template or PacketTemplate(
         demand.af,
         _source_address(state, demand.source, demand.af),
@@ -541,11 +721,10 @@ def walk_hash(
         payload_size=demand.payload_size,
     )
     per_flow = demand.rate / demand.flows
-    wire_per_payload = (
-        _frame_bytes(demand.af, demand.payload_size) / demand.payload_size
-    )
     offered: dict[int, float] = defaultdict(float)
     carried: dict[int, float] = defaultdict(float)
+    wire_offered: dict[tuple[int, int], float] = defaultdict(float)
+    wire_carried: dict[tuple[int, int], float] = defaultdict(float)
     delivered = 0.0
     drops: dict[tuple[str, str], float] = defaultdict(float)
     for i in range(demand.flows):
@@ -560,13 +739,24 @@ def walk_hash(
         for _ in range(max_hops):
             view = views(current)
             if frame is None:
-                res = fw.forward_ip(view, packet, None, ORIGINATED)
+                res = (
+                    fw.StepResult(fw.DROP, reason=fw.SRV6_UNSUPPORTED)
+                    if demand.steer is not None
+                    else fw.forward_ip(view, packet, None, ORIGINATED)
+                )
             else:
                 assert ingress is not None
                 res = fw.receive_frame(view, ingress, frame)
             where = current
+            wire_per_payload = 0.0
+            frame_len = 0
             if res.edge_id is not None:
+                assert res.packet is not None
+                frame_len = frame_bytes(res.packet)
+                wire_per_payload = frame_len / template.payload_size
                 offered[res.edge_id] += rate
+                if wire is not None:
+                    wire_offered[(res.edge_id, frame_len)] += rate
             if res.outcome != fw.TRANSMIT:
                 outcome, reason = res.outcome, res.reason
                 if res.reason in (fw.LINK_DOWN, fw.RX_DOWN) and res.edge_id is not None:
@@ -588,6 +778,8 @@ def walk_hash(
                 else:
                     residual[res.edge_id] = wire_cap - attempted
             carried[res.edge_id] += rate
+            if wire is not None:
+                wire_carried[(res.edge_id, frame_len)] += rate
             packet = res.packet
             ethertype = (
                 ETHERTYPE_IPV4 if isinstance(packet, IPv4Packet) else ETHERTYPE_IPV6
@@ -598,6 +790,14 @@ def walk_hash(
             delivered += rate
         else:
             drops[(reason or fw.LOOP, where)] += rate
+    if wire is not None:
+        # Aggregate equal-sized transmissions before scaling, preserving the
+        # plain-IP arithmetic even for many microflows sharing an edge.
+        for rates, output in zip((wire_offered, wire_carried), wire, strict=True):
+            for (edge, size), payload_rate in sorted(rates.items()):
+                output[edge] = output.get(edge, 0.0) + payload_rate * (
+                    size / template.payload_size
+                )
     return offered, carried, delivered, drops
 
 
@@ -622,13 +822,47 @@ def _source_address(state: NetworkState, device: str, af: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _wire_rates(
+    result: ClassResult | SourceResult,
+    payload_size: int,
+    rate: float,
+    weight: float = 1.0,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Scale each transmission's packet rate by its own frame length.
+
+    When all transmissions have the same framing, aggregate the exact
+    fractions first, preserving Gate A's floating-point arithmetic and bytes.
+    """
+    frames = {t.frame_bytes for t in result.transmissions}
+    if len(frames) == 1:
+        wire = frames.pop() / payload_size
+        return (
+            {e: float(fr) * rate * weight * wire for e, fr in result.edges},
+            {e: float(fr) * rate * weight * wire for e, fr in result.carried},
+        )
+    offered: dict[int, float] = defaultdict(float)
+    carried: dict[int, float] = defaultdict(float)
+    for t in result.transmissions:
+        wire = t.frame_bytes / payload_size
+        offered[t.edge_id] += float(t.offered) * rate * weight * wire
+        carried[t.edge_id] += float(t.carried) * rate * weight * wire
+    return offered, carried
+
+
 def derive_placement(
     state: NetworkState,
     model: int = UNCONSTRAINED,
     views: Any = None,
     detail: bool = True,
+    *,
+    fluid_step: _Step | None = None,
 ) -> NetworkState:
-    """PLACEMENT derivation: recompute the report from FIBs, oper state and demands."""
+    """PLACEMENT derivation over the immutable root.
+
+    An injected ``fluid_step`` bypasses cached class reuse: arbitrary external
+    views have no dependency token. Production SR expansion in the default
+    step must record its dependencies before enabling cached SR classes.
+    """
     previous: PlacementReport | None = state.placement
     n, edge_links, caps = _edge_tables(state)
     offered = [0.0] * n
@@ -654,14 +888,14 @@ def derive_placement(
         delivered: float,
         drops: dict[tuple[str, str], float],
         attributed: bool = True,
+        *,
+        wire: tuple[dict[int, float], dict[int, float]],
     ) -> None:
         nonlocal delivered_total
-        frame = _frame_bytes(demand.af, demand.payload_size)
-        wire = 8 * frame / (8 * demand.payload_size)
-        for e, r in edges.items():
-            offered[e] += r * wire
-        for e, r in carried_edges.items():
-            carried[e] += r * wire
+        for e, r in wire[0].items():
+            offered[e] += r
+        for e, r in wire[1].items():
+            carried[e] += r
         for (reason, where), r in drops.items():
             eid = edge_of_location(where)
             if eid is not None:
@@ -689,7 +923,7 @@ def derive_placement(
             total = float(exact_total)
             if exact_total <= 0:
                 for d in members:
-                    account(d, {}, {}, 0.0, {})
+                    account(d, {}, {}, 0.0, {}, wire=({}, {}))
                 continue
             for d in members:
                 sources[d.source] += _share(d.rate, exact_total)
@@ -697,6 +931,8 @@ def derive_placement(
             src_items = tuple(sorted(sources.items()))
             if (
                 cached is not None
+                and fluid_step is None
+                and cached.cacheable
                 and cached.sources == src_items
                 and _deps_valid(previous, cached, state, tokens)
             ):
@@ -704,7 +940,18 @@ def derive_placement(
                     cached  # unchanged inputs: reuse (a pure rate change only rescales)
                 )
             else:
-                walk = walk_class(state, key[0], key[1], key[3], dict(sources))
+                representative = members[0]
+                walk = walk_class(
+                    state,
+                    key[0],
+                    key[1],
+                    key[3],
+                    dict(sources),
+                    template=representative.template,
+                    steer=representative.steer,
+                    dscp=representative.dscp,
+                    step=fluid_step,
+                )
             classes[key] = walk
             for dev in walk.visited:
                 if dev not in tokens:
@@ -716,14 +963,19 @@ def derive_placement(
                 walk = dataclasses.replace(
                     walk,
                     per_source=tuple(
-                        (src, _source_result(state, key[0], key[1], key[3], src))
+                        (src, _source_result(state, members[0], src, fluid_step))
                         for src in sorted(sources)
                     ),
                 )
                 classes[key] = walk
+            if cached is not None and walk is not cached and walk == cached:
+                # An uncached derivation can still produce identical content.
+                # Reuse the record while retaining freshly checked dependencies.
+                walk = classes[key] = cached
             per_source = dict(walk.per_source)
             single = len(sources) == 1
             for d in members:
+                payload_size = d.template.payload_size if d.template else d.payload_size
                 sr = per_source.get(d.source)
                 if sr is not None:
                     account(
@@ -732,6 +984,7 @@ def derive_placement(
                         {e: float(fr) * d.rate for e, fr in sr.carried},
                         float(sr.delivered) * d.rate,
                         {(r, w): float(fr) * d.rate for r, w, fr in sr.drops},
+                        wire=_wire_rates(sr, payload_size, d.rate),
                     )
                     continue
                 f = d.rate / total
@@ -742,16 +995,19 @@ def derive_placement(
                     float(walk.delivered) * total * f,
                     {(r, w): float(fr) * total * f for r, w, fr in walk.drops},
                     attributed=single,
+                    wire=_wire_rates(walk, payload_size, total, f),
                 )
         for d in demands:
             if d.mode == HASH:
-                o, c, dl, dr = walk_hash(state, d, views)
-                account(d, o, c, dl, dr)
+                wire = ({}, {})
+                o, c, dl, dr = walk_hash(state, d, views, wire=wire)
+                account(d, o, c, dl, dr, wire=wire)
     else:
         for d in demands:
             if d.mode == HASH:
-                o, c, dl, dr = walk_hash(state, d, views, residual=residual)
-                account(d, o, c, dl, dr)
+                wire = ({}, {})
+                o, c, dl, dr = walk_hash(state, d, views, residual=residual, wire=wire)
+                account(d, o, c, dl, dr, wire=wire)
                 continue
             walk = walk_class(
                 state,
@@ -761,6 +1017,10 @@ def derive_placement(
                 {d.source: Fraction(1)},
                 residual,
                 d.rate,
+                template=d.template,
+                steer=d.steer,
+                dscp=d.dscp,
+                step=fluid_step,
             )
             account(
                 d,
@@ -768,6 +1028,11 @@ def derive_placement(
                 {e: float(fr) * d.rate for e, fr in walk.carried},
                 float(walk.delivered) * d.rate,
                 {(r, w): float(fr) * d.rate for r, w, fr in walk.drops},
+                wire=_wire_rates(
+                    walk,
+                    d.template.payload_size if d.template else d.payload_size,
+                    d.rate,
+                ),
             )
     version = (previous.version + 1) if previous is not None else 1
     report = PlacementReport(
@@ -813,10 +1078,23 @@ def _same_cache(a: PlacementReport, b: PlacementReport) -> bool:
 
 
 def _source_result(
-    state: NetworkState, af: int, dst: int, payload_size: int, source: str
+    state: NetworkState,
+    demand: Demand,
+    source: str,
+    step: _Step | None = None,
 ) -> SourceResult:
-    w = walk_class(state, af, dst, payload_size, {source: Fraction(1)})
-    return SourceResult(w.edges, w.carried, w.delivered, w.drops)
+    w = walk_class(
+        state,
+        demand.af,
+        demand.dst,
+        demand.payload_size,
+        {source: Fraction(1)},
+        template=demand.template,
+        steer=demand.steer,
+        dscp=demand.dscp,
+        step=step,
+    )
+    return SourceResult(w.edges, w.carried, w.delivered, w.drops, w.transmissions)
 
 
 def _deps_valid(
