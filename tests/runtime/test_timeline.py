@@ -80,6 +80,39 @@ class TestRecords:
 
 
 class TestEvents:
+    @pytest.mark.parametrize('batched', [False, True])
+    def test_earlier_raising_hook_cannot_hide_committed_outage(self, batched):
+        from contextlib import nullcontext
+
+        from netsim.model.interfaces import OperState
+
+        net, devices = build_diamond()
+        link = net.links[LINK]
+        error = ValueError('user observer failed')
+
+        def fail_on_link_change(time, origin, delta):
+            if delta.links().changed:
+                raise error
+
+        net.on_delta.append(fail_on_link_change)
+        sim = Simulation(netsim.Environment(), net)
+
+        def fail():
+            with net.batch() if batched else nullcontext():
+                link.fail()
+
+        sim.at(5, fail)
+        with pytest.raises(ValueError) as raised:
+            sim.run_until(5)
+        assert raised.value is error
+        events = sim.timeline.select(kind=LinkStateEvent)
+        assert [(e.time, e.link, e.old, e.new) for e in events] == [
+            (5, LINK, 'UP', 'FAILED')
+        ]
+        sim.run()
+        assert devices['R1']['eth1'].oper.oper == OperState.DOWN
+        assert 'carrier' in sim.timeline.stage_names(5)
+
     def test_link_failure_events(self):
         net, R, sim = flap()
         tl = sim.timeline

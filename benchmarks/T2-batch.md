@@ -1,5 +1,8 @@
 # T2: scoped batches and NetGraph construction
 
+This is the original implementation report. The convergence-in-batch contract
+is superseded by [T2C](T2C-batch.md): commit before `converge()` or `place()`.
+
 Base: `c2d658e67e62a8df1fe99aa3cae5a1f9f3656630` (`network-layer-gate-a`).
 Worktree/branch: `scale/t2-batch`. No other worktree was modified.
 

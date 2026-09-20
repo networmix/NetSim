@@ -1,5 +1,9 @@
 # T2B: convergence boundaries and incremental RIB snapshots
 
+The convergence-in-batch contract below is historical and superseded by
+[T2C](T2C-batch.md): `converge()` and `place()` now reject active batches.
+The incremental RIB snapshot behavior remains in place.
+
 Base: `7d4976ad79693663cb3b604f7e0fef1727f812d2`, after the requested
 `git merge network-layer-gate-a`. The merge fast-forwarded this worktree and
 included all integrated worker changes. Initial `make check-ci` passed:

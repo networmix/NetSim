@@ -175,15 +175,20 @@ counters. Handles created for provisional entities are permanently stale after
 an abort (`exists` is false), even if a later entity reuses their name and
 generation; their equality/hash incarnation also stays distinct. Handles for
 existing entities remain valid. Nested batches raise `RuntimeError`. As with
-`update()`, a hook exception after publication does not undo a commit.
+`update()`, hook exceptions after publication never undo a commit or starve
+other observers. Every hook runs in registration order, then the first
+exception is re-raised.
 
 Reads see staged edits: `state`, device `node`, and `fork()` publish immutable
 snapshots, and explicit `update(fn)` passes an immutable snapshot to `fn`.
 These reads/updates are freeze boundaries and can reduce the bulk-construction
 benefit if performed on every iteration: changed route indexes still need to
-be frozen. Plain reads preserve the epoch baseline; edits after an intermediate
-`converge()` invalidate its processed inputs when the batch commits. `update()`
-returns `None` inside a batch because no delta is committed yet. Non-tree settings (client profiles,
+be frozen. Plain reads preserve the epoch baseline; `update(fn)` accounts for
+resolver inputs changed by both preceding builders and the callback itself.
+`update()` returns `None` inside a batch because no delta is committed yet.
+A batch contains builder and pure update operations only: `converge()` and
+`place()` raise `RuntimeError` inside the block. Commit the batch first, then
+run derivations on the committed root. Non-tree settings (client profiles,
 route sources, capacity model and adapter metadata) are outside the transaction.
 
 Every committed change is one timeline record (`seq`, `time`, `round`,
