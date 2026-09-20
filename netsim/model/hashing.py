@@ -4,6 +4,11 @@ region selection over the 64-bit hash space.
 FLUID placement uses ideal rational shares; HASH placement and probes use
 ``select``. The two differ only by the integer rounding of region
 boundaries documented in ``select_region``.
+
+``FlowKey.from_packet`` keeps the outer IP fields (including Next Header
+43 when an SRH is present) and extracts ports through the SRH only when
+it leads to transport. It never hashes inner-IP fields directly; at the
+headend ``flow_label_for`` carries inner-flow entropy into the outer label.
 """
 
 from __future__ import annotations
