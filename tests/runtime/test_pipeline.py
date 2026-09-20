@@ -6,6 +6,8 @@ import pytest
 
 from netsim import Environment
 from netsim.model.network import Network
+from netsim.model.state import StateDelta
+from netsim.runtime import pipeline as coordinator
 from netsim.runtime.pipeline import COALESCE, DEBOUNCE, Kind, Pipeline, build_kinds
 
 
@@ -21,6 +23,163 @@ def pipeline(mode=DEBOUNCE, run=None):
     kind = Kind(0, mode, record if run is None else run, lambda d, s: set())
     pipe = Pipeline(env, net, [kind])
     return env, kind, pipe, calls
+
+
+@pytest.mark.parametrize('mode', [COALESCE, DEBOUNCE])
+@pytest.mark.parametrize(
+    'source,target,expected_round', [(3, 0, 1), (0, 3, 0), (3, 3, 1)]
+)
+def test_due_now_invalidation_respects_round_frontier(
+    mode, source, target, expected_round
+):
+    env = Environment()
+    calls = []
+
+    def runner(offset):
+        def run(state, now, entities):
+            assert pipe.round_open(now)
+            calls.append((offset, pipe.round_of(now)))
+            if entities == ['initial']:
+                pipe.schedule_entity(kinds[target], 'followup', now, now)
+            return state
+
+        return run
+
+    kinds = {
+        offset: Kind(offset, mode, runner(offset), lambda d, s: set())
+        for offset in {source, target}
+    }
+    pipe = Pipeline(env, Network(), list(kinds.values()))
+    pipe.schedule_entity(kinds[source], 'initial', 0, 0)
+    env.run()
+    assert calls == [(source, 0), (target, expected_round)]
+    assert not pipe.round_open(0)
+    assert not pipe.scheduled
+    assert not pipe.round_end_scheduled
+    assert all(not kind.pending for kind in kinds.values())
+
+
+def test_interleaved_normal_event_respects_round_frontier():
+    env = Environment()
+    calls = []
+
+    def early(state, now, entities):
+        calls.append(('early', pipe.round_of(now)))
+        return state
+
+    def late(state, now, entities):
+        calls.append(('late', pipe.round_of(now)))
+        return state
+
+    first = Kind(0, COALESCE, early, lambda d, s: set())
+    last = Kind(3, COALESCE, late, lambda d, s: set())
+    pipe = Pipeline(env, Network(), [first, last])
+    pipe.schedule_entity(last, 'initial', 0, 0)
+    env.step()  # The higher band ran, but ROUND_END has not run yet.
+    normal = env.timeout(0)
+    assert normal.callbacks is not None
+    normal.callbacks.append(lambda _: pipe.mark(first, {'interleaved'}, env.now))
+    env.run()
+    assert calls == [('late', 0), ('early', 1)]
+
+
+@pytest.mark.parametrize('trigger', ['successor', 'settled', 'future'])
+def test_new_round_resets_frontier_for_forward_work(trigger):
+    env = Environment()
+    calls = []
+
+    def early(state, now, entities):
+        calls.append(('early', now, pipe.round_of(now)))
+        pipe.mark(middle_kind, {'forward'}, now)
+        return state
+
+    def middle(state, now, entities):
+        calls.append(('middle', now, pipe.round_of(now)))
+        return state
+
+    def late(state, now, entities):
+        calls.append(('late', now, pipe.round_of(now)))
+        if trigger != 'settled':
+            pipe.schedule_entity(early_kind, 'backward', int(trigger == 'future'), now)
+        return state
+
+    def settled(now):
+        if trigger == 'settled' and len(calls) == 1:
+            pipe.mark(early_kind, {'after-close'}, now)
+
+    early_kind = Kind(0, COALESCE, early, lambda d, s: set())
+    middle_kind = Kind(2, COALESCE, middle, lambda d, s: set())
+    late_kind = Kind(3, COALESCE, late, lambda d, s: set())
+    pipe = Pipeline(
+        env, Network(), [early_kind, middle_kind, late_kind], on_settled=settled
+    )
+    pipe.mark(late_kind, {'initial'}, 0)
+    env.run()
+    time, generation = (1, 0) if trigger == 'future' else (0, 1)
+    assert calls == [
+        ('late', 0, 0),
+        ('early', time, generation),
+        ('middle', time, generation),
+    ]
+    assert not pipe.scheduled
+    assert not pipe.round_end_scheduled
+
+
+def test_retry_does_not_move_frontier_back_before_intervening_band():
+    env = Environment()
+    calls = []
+
+    def early(state, now, entities):
+        calls.append(('early', pipe.round_of(now)))
+        if len(calls) == 1:
+            raise RuntimeError('boom')
+        pipe.mark(middle_kind, {'backward-from-frontier'}, now)
+        return state
+
+    def middle(state, now, entities):
+        calls.append(('middle', pipe.round_of(now)))
+        return state
+
+    def late(state, now, entities):
+        calls.append(('late', pipe.round_of(now)))
+        return state
+
+    early_kind = Kind(0, COALESCE, early, lambda d, s: set())
+    middle_kind = Kind(2, COALESCE, middle, lambda d, s: set())
+    late_kind = Kind(3, COALESCE, late, lambda d, s: set())
+    pipe = Pipeline(env, Network(), [early_kind, middle_kind, late_kind])
+    pipe.mark(early_kind, {'initial'}, 0)
+    pipe.mark(late_kind, {'initial'}, 0)
+    with pytest.raises(RuntimeError, match='boom'):
+        env.run()
+    env.step()  # Advance to the higher band before retrying the failed one.
+    pipe.retry()
+    env.run()
+    assert calls == [('early', 0), ('late', 0), ('early', 0), ('middle', 1)]
+
+
+def test_device_disable_enumerates_ethernet_interfaces_once(monkeypatch):
+    n = 2000
+    net = Network()
+    with net.batch():
+        dev = net.add_device('A')
+        for i in range(n):
+            dev.add_ethernet(f'e{i}')
+    before = net.state
+    dev.configure(enabled=False)
+    delta = StateDelta(before, net.state)
+    original = coordinator._ethernets_of
+    visits = []
+
+    def counted(state, device):
+        visits.append(len(state.devices[device].interfaces))
+        return original(state, device)
+
+    monkeypatch.setattr(coordinator, '_ethernets_of', counted)
+    assert coordinator.carrier_affected(delta, net.state) == {
+        ('A', f'e{i}') for i in range(n)
+    }
+    assert (len(visits), sum(visits)) == (1, n)
 
 
 @pytest.mark.parametrize('n', [250, 4000])
