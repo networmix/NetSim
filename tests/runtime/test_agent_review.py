@@ -284,10 +284,11 @@ def test_fresh_equal_state_is_a_change_without_structural_comparison():
     assert comparisons == []
 
 
-def test_normal_state_admission_is_shallow_and_identity_return_is_not_walked(
-    monkeypatch,
-):
-    reads, walks = [], []
+def test_admission_walks_only_new_subtrees_and_identity_return_is_free():
+    """Principle 3: incremental trusted admission. A newly admitted state is
+    validated once; a state returned by identity costs nothing; a record
+    that reuses its previous fields by identity costs only what changed."""
+    reads = []
 
     @dataclass(frozen=True)
     class Leaf:
@@ -298,30 +299,67 @@ def test_normal_state_admission_is_shallow_and_identity_return_is_not_walked(
                 reads.append(name)
             return object.__getattribute__(self, name)
 
-    state = tuple(Leaf(i) for i in range(1000))
-    view = c.SrDbView((c.RemoteSid(A('2001:db8::1'), 128, srv6.END, owner='remote'),))
-    real = agents.validate_immutable
+    @dataclass(frozen=True)
+    class Box:
+        items: tuple
+        extra: Leaf
 
-    def validate(obj, path='root'):
-        walks.append(path)
-        real(obj, path)
-
-    sim = fixture(
-        Plugin(
-            callback=lambda ctx: c.AgentOutput(
-                state=state if ctx.agent_state is None else ctx.agent_state,
-                srdb_view=view,
-            )
-        )
+    big = tuple(Leaf(i) for i in range(1000))
+    plan = iter(
+        [
+            Box(big, Leaf(-1)),  # first admission: the whole state is new
+            None,  # identity return
+            'replace-extra',  # reuse ``items`` by identity, one new leaf
+        ]
     )
-    monkeypatch.setattr(agents, 'validate_immutable', validate)
+
+    def callback(ctx):
+        step = next(plan)
+        if step is None:
+            return c.AgentOutput(state=ctx.agent_state)
+        if step == 'replace-extra':
+            return c.AgentOutput(state=Box(ctx.agent_state.items, Leaf(-2)))
+        return c.AgentOutput(state=step)
+
+    sim = fixture(Plugin(callback=callback))
     sim.settle()
-    assert reads == walks == []
+    assert len(reads) == 1001  # validated once, transitively
+    reads.clear()
     sim.agents.deliver('r', 'test', c.TimerFired(0, 'tick'))
-    walks.clear()
     sim.settle()
-    assert reads == walks == []
-    assert sim.state.devices['r'].agents['test'].state is state
+    assert reads == []  # identity return: nothing walked
+    first = sim.state.devices['r'].agents['test'].state
+    sim.agents.deliver('r', 'test', c.TimerFired(0, 'tick'))
+    sim.settle()
+    # Only the new leaf is validated (its predecessor's field is read once to
+    # pair it); the 1000 reused ``items`` are trusted by identity.
+    assert len(reads) == 2
+    assert sim.state.devices['r'].agents['test'].state.items is first.items
+
+
+@pytest.mark.parametrize('field', ['state', 'srdb_view'])
+def test_admission_rejects_nested_mutable_values_without_losing_peer(field):
+    """RC2 finding 1: a frozen wrapper around a mutable container must never
+    reach a published root (it would make snapshots and forks mutable)."""
+
+    @dataclass(frozen=True)
+    class Box:
+        values: list
+
+    payload = []
+    value = Box(payload) if field == 'state' else c.SrDbView(sids=(Box(payload),))
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(**{field: value})),
+    )
+    assert not sim.network.debug_validate
+    with pytest.raises(agents.AgentBatchError, match='mutable list'):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+    assert nodes['b'].state is None and nodes['b'].srdb_view is None
+    payload.append('changed without a commit')
+    assert nodes['b'].state is None  # nothing in the tree aliases the list
 
 
 @pytest.mark.parametrize('field', ['state', 'srdb_view'])

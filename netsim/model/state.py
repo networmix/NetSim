@@ -545,6 +545,76 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
             raise TypeError(f'unrecognized object {type(o).__name__} at {p}')
 
 
+def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
+    """Validate *new* transitively, trusting every subtree that is the very
+    object found at the same place in *old* (a previously admitted value).
+
+    Admission of agent state and advertised views uses this instead of a
+    whole-tree walk: a value returned by identity costs nothing, a record
+    that reuses most of its previous fields costs only its changed subtrees
+    (the incremental trusted-builder rule of the design), and a mutable
+    container anywhere in a *new* subtree is still rejected. Pairing follows
+    structure: dataclass fields by name (same type only), ``PMap`` entries by
+    key, tuples by index when lengths match; anything unpaired is walked in
+    full. ``old`` must itself have been admitted through this function or
+    ``validate_immutable``.
+    """
+    stack: list[tuple[Any, Any, str]] = [(new, old, path)]
+    seen: set[int] = set()
+    while stack:
+        o, prev, p = stack.pop()
+        if o is prev:
+            continue  # trusted by identity: admitted before
+        if isinstance(o, _LEAF_TYPES):
+            continue
+        if isinstance(o, _FORBIDDEN):
+            raise TypeError(f'mutable {type(o).__name__} at {p}')
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        if isinstance(o, FrozenPrefixTable):
+            if type(o) is not FrozenPrefixTable:
+                raise TypeError(f'mutable {type(o).__name__} at {p}')
+            prev_shards = prev.shards() if type(prev) is FrozenPrefixTable else {}
+            for plen, table in o.shards().items():
+                prev_table = prev_shards.get(plen, {})
+                for net_, value in table.items():
+                    stack.append((value, prev_table.get(net_), f'{p}[{net_}/{plen}]'))
+            continue
+        if isinstance(o, PMap):
+            paired = isinstance(prev, PMap)
+            for k, v in o.items():
+                stack.append((v, prev.get(k) if paired else None, f'{p}[{k!r}]'))
+            continue
+        if isinstance(o, tuple):
+            paired = isinstance(prev, tuple) and len(prev) == len(o)
+            for i, v in enumerate(o):
+                stack.append((v, prev[i] if paired else None, f'{p}[{i}]'))
+            continue
+        if isinstance(o, frozenset):
+            for i, v in enumerate(o):
+                stack.append((v, None, f'{p}[{i}]'))
+            continue
+        if dataclasses.is_dataclass(o) and not isinstance(o, type):
+            params = getattr(o, '__dataclass_params__', None)
+            if params is None or not params.frozen:
+                raise TypeError(f'non-frozen dataclass {type(o).__name__} at {p}')
+            paired = type(prev) is type(o)
+            for f in dataclasses.fields(o):
+                stack.append(
+                    (
+                        getattr(o, f.name),
+                        getattr(prev, f.name) if paired else None,
+                        f'{p}.{f.name}',
+                    )
+                )
+            continue
+        if hasattr(o, '__dict__') or hasattr(o, '__slots__'):
+            if getattr(type(o), '__netsim_immutable__', False) or _is_enum(o):
+                continue
+            raise TypeError(f'unrecognized object {type(o).__name__} at {p}')
+
+
 def _is_enum(o: Any) -> bool:
     import enum
 

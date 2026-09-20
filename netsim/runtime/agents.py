@@ -51,8 +51,7 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from dataclasses import dataclass, fields, is_dataclass, replace
-from enum import Enum
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Any
 
 from netsim.model import contracts as c
@@ -60,10 +59,10 @@ from netsim.model import derive, interfaces, nht, routing, srv6
 from netsim.model.addressing import MacAddress
 from netsim.model.network import mark_published
 from netsim.model.state import (
-    FloatArray,
     NetworkState,
     PMap,
     StateDelta,
+    validate_admitted,
     validate_immutable,
 )
 from netsim.runtime.pipeline import COALESCE, Kind
@@ -78,37 +77,6 @@ def _future(now: float, delay: float) -> float:
     if not math.isfinite(target) or target <= now:
         raise ValueError('positive delay must advance the finite float clock')
     return target
-
-
-def _check_opaque(value: Any) -> None:
-    """Shallow normal-mode admission; never visit opaque state children."""
-    if isinstance(value, (list, dict, set, bytearray, memoryview)):
-        raise TypeError(f'mutable {type(value).__name__} as agent state')
-    if isinstance(
-        value,
-        (
-            int,
-            float,
-            str,
-            bytes,
-            bool,
-            type(None),
-            tuple,
-            frozenset,
-            PMap,
-            FloatArray,
-            Enum,
-        ),
-    ):
-        return
-    if is_dataclass(value) and not isinstance(value, type):
-        params = getattr(value, '__dataclass_params__', None)
-        if params is not None and params.frozen:
-            return
-        raise TypeError(f'non-frozen dataclass {type(value).__name__} as agent state')
-    if getattr(type(value), '__netsim_immutable__', False):
-        return
-    raise TypeError(f'unrecognized object {type(value).__name__} as agent state')
 
 
 @dataclass(frozen=True, slots=True)
@@ -783,10 +751,19 @@ class AgentRuntime:
                 finally:
                     self.active = None
                 output = c.check_output(output)
+                # Opaque values are validated once at admission, trusting the
+                # subtrees the plugin reused by identity from its committed
+                # state (design principle 3: incremental trusted builders;
+                # whole-root walks stay debug-only in Network.update).
                 if output.state is not ctx.agent_state:
-                    _check_opaque(output.state)
-                # Output envelopes do not walk opaque state. Validate operation
-                # records separately; message payloads remain a strict boundary.
+                    validate_admitted(
+                        output.state, ctx.agent_state, 'AgentOutput.state'
+                    )
+                if output.srdb_view is not node.srdb_view:
+                    validate_admitted(
+                        output.srdb_view, node.srdb_view, 'AgentOutput.srdb_view'
+                    )
+                # Operation records and payloads are always new: strict boundary.
                 for field in fields(output):
                     if field.name not in ('state', 'srdb_view'):
                         value = getattr(output, field.name)
