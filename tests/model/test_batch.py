@@ -399,24 +399,10 @@ def test_update_boundaries_advance_inputs_after_each_staged_change():
     assert epochs == [2, 3]
 
 
-def test_batch_can_converge_and_read_placement_before_commit():
-    net = Network()
-    calls = []
-    net.on_delta.append(lambda *args: calls.append(args))
-    with net.batch():
-        build(net)
-        net.converge()
-        assert net.placement.delivered_total == 1e6
-        assert net.place() is net.placement
-        assert calls == []
-    assert len(calls) == 1
-    assert net.placement.delivered_total == 1e6
-
-
 @pytest.mark.parametrize('timed', [False, True])
 @pytest.mark.parametrize('af', [4, 6])
-@pytest.mark.parametrize('converge_last', [False, True])
-def test_routes_after_intermediate_batch_converge(timed, af, converge_last):
+@pytest.mark.parametrize('method', ['converge', 'place'])
+def test_batch_rejects_derivations_without_changing_staged_inputs(timed, af, method):
     from netsim import Environment
     from netsim.runtime import Simulation
 
@@ -436,22 +422,22 @@ def test_routes_after_intermediate_batch_converge(timed, af, converge_last):
     def edit():
         with net.batch():
             rows.append(a.add_route(prefixes[0], ['blackhole']))
-            net.converge()
+            staged = net.state
+            with pytest.raises(RuntimeError) as error:
+                getattr(net, method)()
+            assert (
+                str(error.value) == f'{method}() inside batch(): commit the batch first'
+            )
+            assert net.state == staged
             rows.append(a.add_route(prefixes[1], ['blackhole']))
-            # Reads must not move the baseline used to invalidate resolver inputs.
-            assert len(a.rib(af)) == 2
-            assert len(net.state.devices['A'].ribs[af]) == 2
-            if converge_last:
-                net.converge()
             assert commits == []
-        assert len(commits) == 1 and commits[0][0] == 'batch'
+        assert commits == [('batch', 2)]
         for row in rows:
-            expected = 'INSTALLED' if converge_last else 'PENDING'
-            assert a.route_status(af, row.key)[0] == expected
+            assert a.route_status(af, row.key) == ('PENDING', None)
 
     if sim is not None:
         sim.at(5, edit)
-        sim.run_until(5)
+        sim.run()
     else:
         edit()
         net.converge()
@@ -461,6 +447,132 @@ def test_routes_after_intermediate_batch_converge(timed, af, converge_last):
     root = net.state
     net.converge()
     assert net.state is root
+    assert net.place() is net.placement
+
+
+@pytest.mark.parametrize('method', ['converge', 'place'])
+def test_uncaught_batch_derivation_aborts_provisional_entities(method):
+    net = Network()
+    old = net.state
+    calls = []
+    net.on_delta.append(lambda *args: calls.append(args))
+    with pytest.raises(RuntimeError, match='commit the batch first'):
+        with net.batch():
+            provisional = net.add_device('A')
+            getattr(net, method)()
+    assert net.state is old
+    assert not provisional.exists
+    assert calls == []
+    assert net.add_device('A').exists
+
+
+@pytest.mark.parametrize('timed', [False, True])
+@pytest.mark.parametrize('af', [4, 6])
+def test_batch_update_callback_invalidates_its_changed_inputs(timed, af):
+    from dataclasses import replace
+
+    from netsim import Environment
+    from netsim.model.routing import rib_apply
+    from netsim.runtime import Simulation
+    from netsim.runtime.pipeline import fib_affected
+
+    net = Network()
+    a = net.add_device('A', fib_delay=1)
+    first = a.add_route('192.0.2.1/32' if af == 4 else '2001:db8::1/128', ['blackhole'])
+    net.converge()
+    sim = Simulation(Environment(), net) if timed else None
+    old = net.state
+    second = replace(first, prefix=(first.prefix[0] + 1, first.prefix[1]))
+    commits = []
+    net.on_delta.append(lambda time, origin, delta: commits.append((origin, delta)))
+
+    def edit():
+        def add_route(root):
+            dev = root.devices['A']
+            rib = rib_apply(dev.ribs[af], add=(second,))
+            return replace(
+                root,
+                devices=root.devices.set('A', replace(dev, ribs=dev.ribs.set(af, rib))),
+            )
+
+        with net.batch():
+            assert net.update(add_route) is None
+            # The callback's result must be pending before it becomes the next
+            # staging base, even when no builder edited inputs before it.
+            staged = net.state.devices['A']
+            for family in (4, 6):
+                assert staged.resolver_input_epoch[family] == (
+                    old.devices['A'].resolver_input_epoch[family] + 1
+                )
+                assert staged.resolver_input_epoch[family] > (
+                    staged.resolver_outcomes[family].processed_epoch
+                )
+            assert a.route_status(af, second.key) == ('PENDING', None)
+            assert net.update(lambda root: root) is None
+            assert net.state.devices['A'] is staged
+            assert commits == []
+        assert len(commits) == 1
+        origin, delta = commits[0]
+        assert origin == ('batch', 2)
+        assert delta.old is old and delta.new is net.state
+        assert fib_affected(delta, net.state) == {('A', 4), ('A', 6)}
+        assert a.route_status(af, second.key) == ('PENDING', None)
+
+    if sim is not None:
+        sim.at(5, edit)
+        sim.run_until(5)
+        assert a.fib(af).lookup(second.prefix[0]) is None
+        sim.run()
+        assert 'fib' in sim.timeline.stage_names(6)
+    else:
+        edit()
+        net.converge()
+    for row in (first, second):
+        assert a.fib(af).lookup(row.prefix[0]) is not None
+        assert a.route_status(af, row.key) == ('INSTALLED', None)
+
+
+@pytest.mark.parametrize('timed', [False, True])
+@pytest.mark.parametrize('change', ['policy', 'link'])
+def test_reverted_batch_inputs_publish_no_delta(timed, change):
+    from netsim import Environment
+    from netsim.model.contracts import STATIC
+    from netsim.model.interfaces import OperState
+    from netsim.model.routing import ResolutionPolicy
+    from netsim.runtime import Simulation
+    from tests.model.test_network import A, build_diamond
+
+    net, devices = build_diamond()
+    net.converge()
+    sim = Simulation(Environment(), net) if timed else None
+    old = net.state
+    a = devices['R1']
+    link = net.links['R1:eth1--R2:eth1']
+    policy = a.node.config.resolution_policy
+    calls = []
+    net.on_delta.append(lambda *args: calls.append(args))
+    with net.batch():
+        if change == 'policy':
+            a.configure(resolution_policy=ResolutionPolicy(max_ecmp_paths=1))
+            assert a.node.config.resolution_policy.max_ecmp_paths == 1
+            a.configure(resolution_policy=policy)
+        else:
+            link.fail()
+            _ = net.state
+            link.restore()
+    assert net.state is old
+    assert calls == []
+    if sim is not None:
+        records = tuple(sim.timeline.records)
+        sim.run()
+        assert tuple(sim.timeline.records) == records
+    else:
+        net.converge()
+    assert net.state is old
+    fib = a.fib(4)
+    assert len(fib.group(fib.lookup(A('10.0.0.4'))).adjacencies) == 2
+    assert a.route_status(4, (A('10.0.0.4'), 32, STATIC, ())) == ('INSTALLED', None)
+    assert a['eth1'].oper.oper == OperState.UP
 
 
 def test_rib_snapshots_submit_only_pending_changed_rows(monkeypatch):
@@ -614,18 +726,3 @@ def test_route_sync_fold_order_across_clients_matches_sequential(snapshot):
             if snapshot:
                 assert tree_equal(net.state, expected.state)
     assert tree_equal(net.state, expected.state)
-
-
-def test_repeated_staged_converge_and_later_withdrawal():
-    net = Network()
-    a = net.add_device('A')
-    net.converge()
-    with net.batch():
-        first = a.add_route('192.0.2.1/32', ['blackhole'])
-        net.converge()
-        a.add_route('192.0.2.2/32', ['blackhole'])
-        net.converge()
-        a.rib_client().delete_routes((first.key,))
-    net.converge()
-    assert a.fib(4).lookup(first.prefix[0]) is None
-    assert a.fib(4).lookup(first.prefix[0] + 1) is not None

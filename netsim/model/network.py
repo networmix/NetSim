@@ -3,8 +3,10 @@
 ``update(fn, origin)`` applies a pure function to the current root,
 validates and canonicalizes the candidate, computes the delta *before*
 commit, returns ``None`` for an empty content delta, commits once and
-then dispatches the delta to ``on_delta`` hooks. The commit machinery
-owns the per-(device, AF) resolver input epochs.
+then dispatches the delta to every ``on_delta`` hook in registration order.
+Observer failures never roll back the commit or starve other observers; the
+first exception is re-raised after dispatch. The commit machinery owns the
+per-(device, AF) resolver input epochs.
 """
 
 from __future__ import annotations
@@ -209,7 +211,7 @@ class _Edits:
         if new_dev is not dev:
             # Publish the frozen device into staging, without recording a
             # builder-operation undo entry. The immutable base remains the
-            # last update/converge boundary used for epoch invalidation.
+            # last update boundary used for epoch invalidation.
             self.devices.builder.set(name, new_dev)
             self.devices.touched[name] = None
         self.rib_ops.pop(name, None)
@@ -274,11 +276,14 @@ class Network:
         builder/update calls (including no-ops); add_p2p contributes three.
         Hooks run only at exit, at the commit clock time. Explicit state/node
         reads and pure update callbacks freeze a snapshot of staged work.
+        converge() and place() are rejected: derivations must run on committed
+        roots, after exiting the batch.
 
         An exception aborts the tree and allocators. Handles for entities born
         in the batch are permanently invalidated on abort, even if a later
         entity reuses the same generation. Exceptions from post-commit hooks
-        retain the committed tree, as for update().
+        retain the committed tree and do not prevent other hooks from running,
+        as for update().
         """
         if self._edits is not None or self._dispatching:
             raise RuntimeError('nested Network.batch()')
@@ -288,9 +293,8 @@ class Network:
         self._batch_handles = []
         try:
             yield self
-            # A staged converge may already have consumed an earlier epoch.
-            # Invalidate edits since that boundary before comparing against
-            # the batch-entry root during the single outer commit.
+            # Account for builder edits since the last pure update callback
+            # before comparing against the batch-entry root at commit.
             candidate = self._edits.snapshot()
             if self._edits.base is not old:
                 candidate = derive.bump_epochs(self._edits.base, candidate)
@@ -370,11 +374,20 @@ class Network:
     def update(
         self, fn: Callable[[NetworkState], NetworkState], origin: Any = 'op'
     ) -> StateDelta | None:
+        """Apply a pure edit; batches stage it until their single outer commit.
+
+        After publication, every observer runs even if earlier observers fail.
+        Failures never roll back the root; the first is re-raised after dispatch.
+        """
         if self._dispatching:
             raise RuntimeError('nested Network.update() from a derivation or observer')
         if self._edits is not None:
+            base = self._edits.base
             snapshot = self._edits.snapshot()
-            candidate = fn(derive.bump_epochs(self._edits.base, snapshot))
+            candidate = fn(derive.bump_epochs(base, snapshot))
+            # The callback may change inputs too. Invalidate its result before
+            # adopting it as the baseline for subsequent staged operations.
+            candidate = derive.bump_epochs(base, candidate)
             self._edits = _Edits(candidate)
             self._batch_ops += 1
             return None
@@ -391,11 +404,17 @@ class Network:
             return None
         self._state = candidate
         self._dispatching = True
+        errors: list[BaseException] = []
         try:
             for hook in list(self.on_delta):
-                hook(self.clock(), origin, delta)
+                try:
+                    hook(self.clock(), origin, delta)
+                except BaseException as error:
+                    errors.append(error)
         finally:
             self._dispatching = False
+        if errors:
+            raise errors[0]
         return delta
 
     def _handle(self, cls: type, key: tuple, generation: int) -> Any:
@@ -745,6 +764,8 @@ class Network:
     # -- derivations ------------------------------------------------------------------
 
     def converge(self, now: float | None = None) -> None:
+        if self._edits is not None:
+            raise RuntimeError('converge() inside batch(): commit the batch first')
         t = self.clock() if now is None else now
 
         def fn(state: NetworkState) -> NetworkState:
@@ -792,6 +813,8 @@ class Network:
 
     def place(self) -> Any:
         """Clock-free placement over the current FIBs; returns the report."""
+        if self._edits is not None:
+            raise RuntimeError('place() inside batch(): commit the batch first')
         self.update(self._placement, 'place')
         return self.state.placement
 

@@ -165,6 +165,48 @@ class TestBuildAndConverge:
 
 
 class TestUpdateSemantics:
+    @pytest.mark.parametrize('batched', [False, True])
+    def test_observer_errors_do_not_starve_later_hooks(self, batched):
+        from contextlib import nullcontext
+
+        net = Network()
+        device = net.add_device('A')
+        old = net.state
+        first = ValueError('first hook failed')
+        second = RuntimeError('last hook failed')
+        calls = []
+
+        def record(name, delta):
+            assert net.state is delta.new
+            calls.append((name, delta))
+            with pytest.raises(RuntimeError, match='nested Network.update'):
+                device.configure(fib_delay=2)
+
+        def fail_first(time, origin, delta):
+            record('first', delta)
+            raise first
+
+        def observe(time, origin, delta):
+            record('middle', delta)
+
+        def fail_last(time, origin, delta):
+            record('last', delta)
+            raise second
+
+        net.on_delta.extend((fail_first, observe, fail_last))
+        with pytest.raises(ValueError) as error:
+            with net.batch() if batched else nullcontext():
+                device.configure(fib_delay=1)
+        assert error.value is first
+        assert [name for name, _ in calls] == ['first', 'middle', 'last']
+        delta = calls[0][1]
+        assert all(d is delta for _, d in calls)
+        assert delta.old is old and delta.new is net.state
+        assert device.node.config.fib_delay == 1
+        net.on_delta.clear()
+        device.configure(fib_delay=3)
+        assert device.node.config.fib_delay == 3
+
     def test_failed_update_leaves_root_and_allocators(self):
         net = Network()
         r1 = net.add_device('R1')
