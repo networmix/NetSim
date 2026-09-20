@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import field, replace
 from ipaddress import IPv6Address, IPv6Network, summarize_address_range
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from netsim.model.contracts import STATIC, ClientId
 from netsim.model.state import PMap, canon, empty_pmap, record
@@ -1021,21 +1021,50 @@ def set_steering(
     )
 
 
-def unknown_prefixes(db: Srv6Sids) -> tuple[tuple[int, int], ...]:
-    """Exact LIB/WLIB cover, not a summary that could swallow a routed GIB."""
+def unknown_prefixes(
+    db: Srv6Sids, active_prefixes: Iterable[tuple[int, int]] = ()
+) -> tuple[tuple[int, int], ...]:
+    """Exact LIB/WLIB cover minus prefixes installed as active local SIDs.
+
+    Subtract address intervals before summarizing: a cover must neither tie
+    an active SID at the same prefix nor shadow one with a more-specific
+    drop. With no exclusions this returns the complete configured ranges.
+    """
     if not db.drop_unknown_local:
         return ()
     from ipaddress import collapse_addresses
 
-    nets = []
+    intervals = []
     blocks = sorted(
         {loc.block for loc in db.locators.values() if is_csid(loc.structure)}
     )
     for block in blocks:
         ranges = db.ranges.get(block, SidRanges())
         for low, high in (ranges.lib, ranges.wlib):
-            start = block[0] | low << 80
-            end = block[0] | high << 80 | ((1 << 80) - 1)
+            intervals.append(
+                (block[0] | low << 80, block[0] | high << 80 | ((1 << 80) - 1))
+            )
+    exclusions = sorted(
+        (int(net.network_address), int(net.broadcast_address))
+        for net in map(IPv6Network, active_prefixes)
+    )
+    nets = []
+    index = 0
+    for start, end in sorted(intervals):
+        while index < len(exclusions) and exclusions[index][1] < start:
+            index += 1
+        while index < len(exclusions) and exclusions[index][0] <= end:
+            low, high = exclusions[index]
+            if start < low:
+                nets.extend(
+                    summarize_address_range(IPv6Address(start), IPv6Address(low - 1))
+                )
+            start = max(start, high + 1)
+            if high >= end:
+                # This exclusion may also span the next range or block.
+                break
+            index += 1
+        if start <= end:
             nets.extend(summarize_address_range(IPv6Address(start), IPv6Address(end)))
     return tuple(
         (int(net.network_address), net.prefixlen) for net in collapse_addresses(nets)
