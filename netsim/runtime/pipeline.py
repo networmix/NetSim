@@ -3,10 +3,10 @@
 The engine heap orders events by ``(time, priority, eid)``; it knows
 nothing about dependencies. The coordinator turns kind priorities into
 **rounds**: a round at time ``t`` is the set of kind runs scheduled at
-``t`` before its ``ROUND_END`` sentinel. Work for a kind that has not run
-yet in the active round joins it; work for a kind that already ran joins
-the successor round at the same time; work due later belongs to that
-later time. Every round counts against a convergence limit.
+``t`` before its ``ROUND_END`` sentinel. Work for a higher band that has
+not run yet joins the active round; work at or below the round's visited
+band frontier joins the successor round at the same time. Work due later
+belongs to that later time. Every round counts against a convergence limit.
 """
 
 from __future__ import annotations
@@ -154,6 +154,7 @@ class Pipeline:
         self.round_gen: int = 0
         self.rounds_at_time: int = 0
         self.ran_this_round: set[int] = set()
+        self._round_frontier = -1
         self.successor: dict[int, set[Any]] = {}
         self.scheduled: set[tuple[int, float, int]] = set()
         self.round_end_scheduled: dict[float, int] = {}
@@ -200,8 +201,9 @@ class Pipeline:
         if target > now:
             self._ensure_event(kind, target, generation=0)
             return
-        # Work due now: current round if the kind has not run yet, else the successor.
-        if self.round_time == now and kind.offset in self.ran_this_round:
+        # Only forward work joins this round, even if a lower band never ran.
+        # Retain the frontier between runs for interleaved NORMAL/URGENT events.
+        if self.round_time == now and kind.offset <= self._round_frontier:
             self.successor.setdefault(kind.offset, set()).add(entity)
             return
         self._ensure_event(kind, now, self._generation_for(now))
@@ -223,6 +225,7 @@ class Pipeline:
             self.round_gen = 0
             self.rounds_at_time = 0
             self.ran_this_round = set()
+            self._round_frontier = -1
             self.successor = {}
         return self.round_gen
 
@@ -269,10 +272,11 @@ class Pipeline:
         # re-dirtying itself) must create fresh work for the successor round.
         claimed = kind._claim_due(now)
         due = sorted(claimed, key=repr)
-        if not due:
-            self.ran_this_round.add(kind.offset)
-            return
+        # A retry can revisit an earlier band without moving the frontier back.
+        self._round_frontier = max(self._round_frontier, kind.offset)
         self.ran_this_round.add(kind.offset)
+        if not due:
+            return
         self.last_origins.append((kind.name, now, gen))
         self.last_origins = self.last_origins[-8:]
         try:
@@ -301,6 +305,7 @@ class Pipeline:
         if successor:
             self.round_gen += 1
             self.ran_this_round = set()
+            self._round_frontier = -1
             self.successor = {}
             gen = self.round_gen
             for offset in sorted(successor):
@@ -310,6 +315,7 @@ class Pipeline:
         # The round is closed: later work at this time starts a fresh round.
         self.round_gen += 1
         self.ran_this_round = set()
+        self._round_frontier = -1
         self.round_end_scheduled.pop(now, None)  # bookkeeping must not grow with time
         if self.on_settled is not None:
             self.on_settled(now)
@@ -398,6 +404,8 @@ def carrier_affected(delta: StateDelta, state: NetworkState) -> set[Any]:
                         peer = derive.peer_endpoint(root, name, iface)
                         if peer is not None:
                             out.add(peer)
+    # Direct lookup keeps a device-wide change linear; rebuilding its Ethernet
+    # set for each endpoint here would enumerate every interface N times.
     return {e for e in out if isinstance(_interface(state, e), EthernetNode)}
 
 
