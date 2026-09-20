@@ -37,16 +37,6 @@ END_DX6 = 7
 END_B6_ENCAPS = 8
 
 GATE_B_BEHAVIORS = frozenset({END, END_X, END_DT46})
-BEHAVIOR_NAMES = {
-    END: 'End',
-    END_X: 'End.X',
-    END_DT46: 'End.DT46',
-    END_DT4: 'End.DT4',
-    END_DT6: 'End.DT6',
-    END_DX4: 'End.DX4',
-    END_DX6: 'End.DX6',
-    END_B6_ENCAPS: 'End.B6.Encaps',
-}
 
 # Flavors are bit flags (RFC 8986 §4.16, RFC 9800 §4).
 PSP = 1
@@ -392,7 +382,25 @@ UNSUPPORTED_FLAVOR = 'UNSUPPORTED_FLAVOR'
 
 
 def behavior_name(behavior: int) -> str:
-    return BEHAVIOR_NAMES.get(behavior, str(behavior))
+    """Name of a behaviour (branches, not a shared lookup table: this runs on
+    the timeline's extraction path)."""
+    if behavior == END:
+        return 'End'
+    if behavior == END_X:
+        return 'End.X'
+    if behavior == END_DT46:
+        return 'End.DT46'
+    if behavior == END_DT4:
+        return 'End.DT4'
+    if behavior == END_DT6:
+        return 'End.DT6'
+    if behavior == END_DX4:
+        return 'End.DX4'
+    if behavior == END_DX6:
+        return 'End.DX6'
+    if behavior == END_B6_ENCAPS:
+        return 'End.B6.Encaps'
+    return str(behavior)
 
 
 def check_gate_b(behavior: int, flavors: int) -> str | None:
