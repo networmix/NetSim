@@ -311,3 +311,14 @@ The timing/memory tables above remain the pre-merge qualification record.
 This integration update makes no new performance claim. C5 adds no further
 shared contract fields or validation changes; processing_delay's new default
 and the restart ownership/generation rule come from main.
+
+Main advanced again during verification. Merged `f2dae73`, including the
+additional C1/C2 integration checks and obsolete-listener replacement on agent
+restart. No further C5 code changes were needed. Final merged-state checks:
+
+- `make check-ci`: format, lint and pyright pass; **1,465 passed, 14 skipped**,
+  **95.29%** coverage, 22.58 s pytest time.
+- `make check-ft`: format, lint and pyright pass; **1,465 passed, 14 skipped**,
+  **95.29%** coverage, 20.25 s pytest time.
+- Real NetGraph adapter and window tests: **174 passed**, 1.70 s.
+- `git diff --check`: pass.
