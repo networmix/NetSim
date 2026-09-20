@@ -34,7 +34,7 @@ from netsim.model.forwarding import (
     Prefix,
 )
 from netsim.model.lpm import FrozenPrefixTable, PrefixTable
-from netsim.model.state import PMap, empty_pmap, record
+from netsim.model.state import PMap, PMapBuilder, empty_pmap, record
 
 # Special next-hops (RFC 8349 special-next-hop plus SRv6 local behaviours).
 BLACKHOLE = 1
@@ -153,38 +153,33 @@ class Route:
 
 @record
 class RibState:
-    """Rows sharded by prefix length; ``prefixes`` is the LPM index of
-    prefixes that have at least one row."""
+    """Rows sharded by prefix length, indexed by prefix and source client.
+
+    Prefix tuples are ranked for resolution; client tuples are sorted by
+    row key. Both indexes share the immutable rows in ``shards``.
+    """
 
     af: int
     version: int = 0
     shards: PMap[int, PMap[RowKey, Route]] = field(default_factory=empty_pmap)
-    prefixes: FrozenPrefixTable[int] = field(
+    prefixes: FrozenPrefixTable[tuple[Route, ...]] = field(
         default_factory=lambda: PrefixTable(32).freeze()
     )
+    clients: PMap[ClientId, tuple[Route, ...]] = field(default_factory=empty_pmap)
 
     @classmethod
     def empty(cls, af: int) -> RibState:
         return cls(af=af, prefixes=PrefixTable(32 if af == IPV4 else 128).freeze())
 
     def rows(self, prefix: Prefix) -> tuple[Route, ...]:
-        shard = self.shards.get(prefix[1])
-        if shard is None:
-            return ()
-        return tuple(r for k, r in shard.sorted_items() if k[0] == prefix[0])
+        """Candidates in rank order, with no scan or sort at read time."""
+        return self.prefixes.get(*prefix, ())
 
     def rows_of(self, client: ClientId) -> tuple[Route, ...]:
-        out = [
-            r
-            for shard in self.shards.values()
-            for r in shard.values()
-            if r.source == client
-        ]
-        out.sort(key=lambda r: r.key)
-        return tuple(out)
+        return self.clients.get(client, ())
 
     def candidates(self, prefix: Prefix) -> tuple[Route, ...]:
-        return tuple(sorted(self.rows(prefix), key=_rank))
+        return self.rows(prefix)
 
     def best_groups(self, prefix: Prefix) -> Iterator[tuple[Route, ...]]:
         """Groups of equal (distance, metric, source), best first."""
@@ -212,13 +207,6 @@ def _rank(r: Route) -> tuple[int, int, str, int, tuple[Any, ...]]:
     return (r.distance, r.metric, r.source.name, r.source.instance, r.distinguisher)
 
 
-def _mutable_prefix_table(rib: RibState) -> PrefixTable[int]:
-    t: PrefixTable[int] = PrefixTable(32 if rib.af == IPV4 else 128)
-    for net, plen, count in rib.prefixes.items():
-        t.insert(net, plen, count)
-    return t
-
-
 def rib_apply(
     rib: RibState,
     *,
@@ -233,36 +221,46 @@ def rib_apply(
     ignores missing keys. ``add`` upserts by key and is a no-op for an
     identical row.
     """
-    changed = False
-    shard_builders: dict[int, Any] = {}
-    counts: dict[Prefix, int] = {}
+    shard_builders: dict[int, PMapBuilder[RowKey, Route]] = {}
+    prefix_rows: dict[Prefix, dict[RowKey, Route]] = {}
+    client_rows: dict[ClientId, dict[RowKey, Route]] = {}
 
-    def shard(plen: int):
+    def shard(plen: int) -> PMapBuilder[RowKey, Route]:
         b = shard_builders.get(plen)
         if b is None:
             b = shard_builders[plen] = rib.shards.get(plen, PMap()).builder()
         return b
 
+    def by_prefix(prefix: Prefix) -> dict[RowKey, Route]:
+        rows = prefix_rows.get(prefix)
+        if rows is None:
+            rows = prefix_rows[prefix] = {r.key: r for r in rib.rows(prefix)}
+        return rows
+
+    def by_client(client: ClientId) -> dict[RowKey, Route]:
+        rows = client_rows.get(client)
+        if rows is None:
+            rows = client_rows[client] = {r.key: r for r in rib.rows_of(client)}
+        return rows
+
     def put(route: Route) -> None:
-        nonlocal changed
         if route.af != rib.af:
             raise ValueError('route family does not match the RIB')
         b = shard(route.prefix[1])
-        old = b.get(route.key)
+        key = route.key
+        old = b.get(key)
         if old == route:
             return
-        if old is None:
-            counts[route.prefix] = counts.get(route.prefix, 0) + 1
-        b.set(route.key, route)
-        changed = True
+        b.set(key, route)
+        by_prefix(route.prefix)[key] = route
+        by_client(route.source)[key] = route
 
     def drop(key: RowKey) -> None:
-        nonlocal changed
         b = shard(key[1])
         if key in b:
             b.remove(key)
-            counts[(key[0], key[1])] = counts.get((key[0], key[1]), 0) - 1
-            changed = True
+            del by_prefix((key[0], key[1]))[key]
+            del by_client(key[2])[key]
 
     if sync is not None:
         client, rows = sync
@@ -278,7 +276,7 @@ def rib_apply(
         drop(key)
     for r in add:
         put(r)
-    if not changed:
+    if not prefix_rows:
         return rib
     sb = rib.shards.builder()
     for plen, b in shard_builders.items():
@@ -287,17 +285,30 @@ def rib_apply(
             sb.remove(plen)
         else:
             sb.set(plen, new)
-    table = _mutable_prefix_table(rib)
-    for (net, plen), delta in counts.items():
-        if delta == 0:
-            continue
-        current = table.get(net, plen, 0) + delta
-        if current <= 0:
-            if (net, plen) in table:
-                table.remove(net, plen)
+    # Copy each affected length once. Unchanged length dicts belong to a
+    # frozen snapshot and are only shared read-only; the fresh outer dict
+    # and edited inner dicts are handed over without a second freeze copy.
+    tables = dict(rib.prefixes._tables)
+    lengths: set[int] = set()
+    for (net, plen), rows in prefix_rows.items():
+        if plen not in lengths:
+            tables[plen] = dict(tables.get(plen, {}))
+            lengths.add(plen)
+        if rows:
+            tables[plen][net] = tuple(sorted(rows.values(), key=_rank))
         else:
-            table.insert(net, plen, current)
-    return RibState(rib.af, rib.version + 1, sb.build(), table.freeze())
+            tables[plen].pop(net, None)
+    for plen in lengths:
+        if not tables[plen]:
+            del tables[plen]
+    prefixes = FrozenPrefixTable._owned(rib.prefixes.bits, tables, rib.prefixes._masks)
+    cb = rib.clients.builder()
+    for client, rows in client_rows.items():
+        if rows:
+            cb.set(client, tuple(rows[k] for k in sorted(rows)))
+        else:
+            cb.remove(client)
+    return RibState(rib.af, rib.version + 1, sb.build(), prefixes, cb.build())
 
 
 # ---------------------------------------------------------------------------

@@ -593,39 +593,48 @@ def _route_events(
         nrib = ndev.ribs.get(af)
         oshards = orib.shards if orib is not None else {}
         nshards = nrib.shards if nrib is not None else {}
+        oprefixes = orib.prefixes.shards() if orib is not None else {}
+        nprefixes = nrib.prefixes.shards() if nrib is not None else {}
         for plen in sorted(set(oshards) | set(nshards)):
-            os_, ns_ = oshards.get(plen), nshards.get(plen)
-            if os_ is ns_:
+            if oshards.get(plen) is nshards.get(plen):
                 continue
-            okeys = set(os_.keys()) if os_ is not None else set()
-            nkeys = set(ns_.keys()) if ns_ is not None else set()
-            for key in sorted(
-                okeys | nkeys,
-                key=lambda k: (k[0], k[1], k[2].name, k[2].instance, repr(k[3])),
-            ):
-                orow = os_.get(key) if os_ is not None else None
-                nrow = ns_.get(key) if ns_ is not None else None
-                if orow is nrow or orow == nrow:
+            os_, ns_ = oprefixes.get(plen, {}), nprefixes.get(plen, {})
+            # Prefix tuples share identity unless their candidate rows changed.
+            # Preserve the prior length/network/client/distinguisher event order.
+            for net in sorted(set(os_) | set(ns_)):
+                old, new = os_.get(net, ()), ns_.get(net, ())
+                if old is new:
                     continue
-                row = nrow if nrow is not None else orow
-                assert row is not None
-                emit(
-                    RouteEvent,
-                    device=name,
-                    af=int(af),
-                    prefix=_prefix_str((key[0], key[1]), int(af)),
-                    source=key[2].name,
-                    instance=key[2].instance,
-                    distinguisher=repr(key[3]) if key[3] else '',
-                    action='add'
-                    if orow is None
-                    else ('delete' if nrow is None else 'update'),
-                    distance=row.distance,
-                    metric=row.metric,
-                    nexthops=tuple(_nexthop_str(nh, int(af)) for nh in row.nexthops)
-                    if nrow is not None
-                    else (),
-                )
+                orows = {r.key: r for r in old}
+                nrows = {r.key: r for r in new}
+                okeys, nkeys = orows.keys(), nrows.keys()
+                for key in sorted(
+                    okeys | nkeys,
+                    key=lambda k: (k[0], k[1], k[2].name, k[2].instance, repr(k[3])),
+                ):
+                    orow = orows.get(key)
+                    nrow = nrows.get(key)
+                    if orow is nrow or orow == nrow:
+                        continue
+                    row = nrow if nrow is not None else orow
+                    assert row is not None
+                    emit(
+                        RouteEvent,
+                        device=name,
+                        af=int(af),
+                        prefix=_prefix_str((key[0], key[1]), int(af)),
+                        source=key[2].name,
+                        instance=key[2].instance,
+                        distinguisher=repr(key[3]) if key[3] else '',
+                        action='add'
+                        if orow is None
+                        else ('delete' if nrow is None else 'update'),
+                        distance=row.distance,
+                        metric=row.metric,
+                        nexthops=tuple(_nexthop_str(nh, int(af)) for nh in row.nexthops)
+                        if nrow is not None
+                        else (),
+                    )
 
 
 def _fib_events(
