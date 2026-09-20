@@ -170,15 +170,43 @@ def test_exactly_five_csids_fill_the_eighty_argument_bits():
     assert c.compress(original) == (ip('5f00:0:1:2:3:4:5:6'), ip('5f00:0:7::'))
 
 
-def test_terminal_tail_fits_with_sixteen_bits_but_not_zero_bits():
+@pytest.mark.parametrize('terminal_flavors', [0, NEXT_CSID])
+def test_terminal_tail_fits_with_sixteen_bits_but_not_zero_bits(terminal_flavors):
     original = tuple(sid(f'5f00:0:{n:x}::', F3216_GIB) for n in range(1, 7))
-    terminal = sid('5f00:0:e104::', F3216_TERMINAL)
+    # B|F with LNL=AL=0 identifies the project's terminal tail; the
+    # NEXT_CSID flag does not turn it into a shiftable container starter.
+    terminal = sid('5f00:0:e104::', F3216_TERMINAL, terminal_flavors)
     # Four appends use 64/80 bits; 16-bit D4 exactly consumes the tail.
     assert c.compress((*original[:5], terminal)) == (ip('5f00:0:1:2:3:4:5:e104'),)
     # Five appends use all 80, so D4 passes through as its own full SID.
     assert c.compress((*original, terminal)) == (
         ip('5f00:0:1:2:3:4:5:6'),
         ip('5f00:0:e104::'),
+    )
+
+
+@pytest.mark.parametrize(
+    'address, structure',
+    [
+        ('5f00:0:2::', SidStructure(32, 16, 0, 0)),
+        ('5f00:0:2:e002::', SidStructure(32, 16, 16, 0)),
+    ],
+)
+def test_zero_argument_length_does_not_make_node_metadata_a_terminal(
+    address, structure
+):
+    original = (
+        sid('5f00:0:e001::'),
+        sid(address, structure),
+        sid('5f00:0:e003::'),
+    )
+    # RFC 9800 §6.1 requires AL=128-LBL-LNFL: these node/composite
+    # structures need 80/64 bits, not 0. Although their 16/32-bit prefixes
+    # fit E001's 80-bit argument, they are unknown and must remain literal.
+    assert c.compress(original) == (
+        ip('5f00:0:e001::'),
+        ip(address),
+        ip('5f00:0:e003::'),
     )
 
 
