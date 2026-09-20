@@ -596,8 +596,10 @@ class NhtClient:
         if key.owner != self.client:
             raise ValueError('NHT key does not belong to this client')
 
-    def register(self, key: NhtKey) -> None:
+    def register(self, key: NhtKey) -> NhtKey:
+        """Register and return the canonical key, including the scope generation."""
         self._check(key)
+        key = nht.registration_key(self.device.node, key)
 
         def apply(state: NetworkState) -> NetworkState:
             self.device._node_in(state)
@@ -606,6 +608,7 @@ class NhtClient:
             )
 
         self.device.network.update(apply, ('nht_register', self.device.name))
+        return key
 
     def unregister(self, key: NhtKey) -> None:
         self._check(key)
@@ -616,29 +619,37 @@ class NhtClient:
 
     def result(self, key: NhtKey) -> NhtResult | None:
         self._check(key)
-        table = self.device.node.nht
+        dev = self.device.node
+        key = nht.registered_key(dev, key)
+        table = dev.nht
         return table.registrations.get(key) if table is not None else None
 
     def resolve(
-        self, key: NhtKey, *, exclude_rows: frozenset[RowKey] = frozenset()
+        self,
+        key: NhtKey,
+        *,
+        exclude_rows: frozenset[RowKey] = frozenset(),
+        ctx: nht.LocalContext | None = None,
     ) -> NhtResult:
-        from netsim.model.derive import DeviceContext
+        """Query a detached snapshot, or capture the device's current local inputs."""
         from netsim.model.routing import ResolutionPolicy
 
         self._check(key)
-        state = self.device.network.state
-        dev = self.device.node
+        ctx = ctx if ctx is not None else nht.local_context(self.device.node)
         return nht.resolve(
-            DeviceContext(state, self.device.name),
-            dev.config.resolution_policy or ResolutionPolicy(),
+            ctx,
+            ctx.config.resolution_policy or ResolutionPolicy(),
             key,
             exclude_rows=exclude_rows,
-            input_epoch=dev.resolver_input_epoch.get(key.af, 0),
+            input_epoch=ctx.resolver_input_epoch.get(key.af, 0),
         )
 
-    def installed(self, key: NhtKey) -> LookupView:
+    def installed(
+        self, key: NhtKey, *, ctx: nht.LocalContext | None = None
+    ) -> LookupView:
         self._check(key)
-        return nht.installed(self.device.network.state, self.device.name, key)
+        ctx = ctx if ctx is not None else nht.local_context(self.device.node)
+        return nht.installed(ctx, key)
 
 
 class RibClient:
