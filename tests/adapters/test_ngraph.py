@@ -95,7 +95,8 @@ class TestFromNetwork:
             g, DemandSet({'traffic': [TrafficDemand('^R1$', '^R4$', 100)]})
         )
         ids = adapter.demands_from(g, net, scenario.demand_set.sets, capacity_unit=1e6)
-        assert ids == ['traffic:0:R1>R4']
+        assert ids == ['traffic:0:R1>*']  # combine: one anycast destination
+        assert net.netsim_demand_destinations[ids[0]] == '{R4}'
         net.converge()
         rep = net.placement
         assert rep.delivered_total == pytest.approx(100e6)
@@ -180,7 +181,15 @@ class TestFromNetwork:
             {'c': [TrafficDemand('^R[12]$', '^R[34]$', 40, mode='combine')]},
             capacity_unit=1e6,
         )
-        assert all(net.state.demands[i].rate == pytest.approx(10e6) for i in ids2)
+        # combine: an even share per source towards one anycast destination
+        assert len(ids2) == 2 and all(
+            net.state.demands[i].rate == pytest.approx(20e6) for i in ids2
+        )
+        anycast = {net.state.demands[i].dst for i in ids2}
+        assert len(anycast) == 1
+        for t in ('R3', 'R4'):
+            addrs = {h for h, _ in net.device(t)['lo0'].node.config.ipv4}
+            assert anycast <= addrs
         with pytest.raises(ValueError):
             adapter.from_network(g, addressing='weird')
 
@@ -271,13 +280,58 @@ def test_demand_volume_follows_netgraph_expansion_semantics():
     """``pairwise`` splits the volume over the pairs; ``combine`` is one
     aggregate of the same total. Both offer ``volume`` in total."""
     graph = diamond_stub()
-    for mode in ('pairwise', 'combine'):
-        sets = {'t': [TrafficDemand('^R1$', '^R[234]$', 12.0, mode=mode)]}
-        net = adapter.from_network(graph)
-        ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
-        rates = [net.state.demands[i].rate for i in ids]
-        assert len(rates) == 3 and sum(rates) == pytest.approx(12.0), mode
-        assert all(r == pytest.approx(4.0) for r in rates)
+    sets = {'t': [TrafficDemand('^R1$', '^R[234]$', 12.0, mode='pairwise')]}
+    net = adapter.from_network(graph)
+    ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
+    rates = [net.state.demands[i].rate for i in ids]
+    assert len(rates) == 3 and all(r == pytest.approx(4.0) for r in rates)
+    sets = {'t': [TrafficDemand('^R1$', '^R[234]$', 12.0, mode='combine')]}
+    net = adapter.from_network(graph)
+    ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
+    assert [net.state.demands[i].rate for i in ids] == [pytest.approx(12.0)]
+    net.converge()
+    assert net.placement.delivered_total == pytest.approx(12.0)
+
+
+def test_combine_reaches_only_reachable_targets_like_netgraph():
+    """A target cut off from the graph takes no share: the anycast prefix is
+    reached at the nearest connected target, as NetGraph's pseudo sink does."""
+    graph = diamond_stub()
+    graph.nodes['R4'].disabled = True  # only R2 and R3 stay reachable from R1
+    sets = {'t': [TrafficDemand('^R1$', '^R[234]$', 20.0, mode='combine')]}
+    net = adapter.from_network(graph)
+    ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
+    net.converge()
+    assert net.placement.delivered_total == pytest.approx(20.0)
+    assert net.placement.demands[ids[0]].drops == ()
+
+
+def test_netgraph_priority_direction_is_translated():
+    """NetGraph serves lower priority numbers first; NetSim higher ones."""
+    from netsim.model.flows import LOSSY
+
+    graph = diamond_stub()
+    net = adapter.from_network(graph, capacity_unit=1e6)
+    net.set_capacity_model(LOSSY)
+    adapter.demands_from(
+        graph,
+        net,
+        {
+            'p': [
+                TrafficDemand('^R1$', '^R4$', 150, mode='pairwise', priority=10),
+                TrafficDemand('^R1$', '^R4$', 150, mode='pairwise', priority=0),
+            ]
+        },
+        capacity_unit=1e6,
+    )
+    net.converge()
+    urgent = net.placement.demands['p:1:R1>R4']
+    later = net.placement.demands['p:0:R1>R4']
+    assert urgent.delivered == pytest.approx(150e6)
+    assert later.delivered < 150e6
+    assert net.netsim_demand_priorities == {'p:0:R1>R4': 10, 'p:1:R1>R4': 0}
+    assert net.state.demands['p:1:R1>R4'].priority == 0
+    assert net.state.demands['p:0:R1>R4'].priority == -10
 
 
 def test_real_ngraph_total_demand_matches_netgraph():
@@ -309,3 +363,38 @@ def test_real_ngraph_total_demand_matches_netgraph():
     ]
     net, ids, _ = adapter.from_scenario(scenario, capacity_unit=1.0)
     assert sum(net.state.demands[i].rate for i in ids) == pytest.approx(total)
+
+
+def test_real_ngraph_combine_placed_volume_matches_netgraph():
+    pytest.importorskip('ngraph', reason='netsim[ngraph] extra not installed')
+    from ngraph.scenario import Scenario as NgScenario
+
+    text = """
+network:
+  nodes:
+    A: {}
+    B: {}
+    C: {}
+  links:
+    - source: A
+      target: B
+      capacity: 100
+demands:
+  d:
+    - source: ^A$
+      target: ^[BC]$
+      mode: combine
+      volume: 20
+workflow:
+  - type: TrafficMatrixPlacement
+    name: tm
+    demand_set: d
+    iterations: 0
+"""
+    scenario = NgScenario.from_yaml(text)
+    scenario.run()
+    ng = scenario.results.to_dict()['steps']['tm']['data']['baseline']['summary']
+    net, ids, _ = adapter.from_scenario(scenario, capacity_unit=1.0)
+    net.converge()
+    assert ng['total_placed'] == pytest.approx(20.0)
+    assert net.placement.delivered_total == pytest.approx(ng['total_placed'])

@@ -511,6 +511,9 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
             continue
         seen.add(id(o))
         if isinstance(o, FrozenPrefixTable):
+            if type(o) is not FrozenPrefixTable:
+                # PrefixTable (the mutable builder) subclasses the frozen table.
+                raise TypeError(f'mutable {type(o).__name__} at {p}')
             for plen, table in o.shards().items():
                 for net_, value in table.items():
                     stack.append((value, f'{p}[{net_}/{plen}]'))

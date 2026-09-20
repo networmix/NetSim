@@ -230,3 +230,22 @@ def test_debug_validation_accepts_frozen_prefix_tables():
     R['R1'].add_route('10.9.9.9/32', [('eth3', '10.1.13.1')])
     net.converge()
     assert R['R1'].fib(4).lookup(to_int('10.9.9.9')[0]) is not None
+
+
+def test_debug_validation_rejects_mutable_prefix_table_builders():
+    import dataclasses
+
+    from netsim.model.lpm import PrefixTable
+    from netsim.model.state import validate_immutable
+    from tests.model.test_network import build_diamond
+
+    net, R = build_diamond()
+    builder = PrefixTable(32)
+    rib = dataclasses.replace(net.state.devices['R1'].ribs[4], prefixes=builder)
+    dev = dataclasses.replace(
+        net.state.devices['R1'], ribs=net.state.devices['R1'].ribs.set(4, rib)
+    )
+    state = dataclasses.replace(net.state, devices=net.state.devices.set('R1', dev))
+    with pytest.raises(TypeError, match='mutable PrefixTable'):
+        validate_immutable(state)
+    validate_immutable(net.state)  # frozen tables still pass

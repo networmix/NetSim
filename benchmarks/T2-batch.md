@@ -104,11 +104,7 @@ have deterministic ordering. In particular:
   exceptions during final validation or post-commit observation.
 
 Existing out-of-scope issue, independently reproduced on the base: setting
-`net.debug_validate = True` and then adding a route raises
-`TypeError: unrecognized object FrozenPrefixTable ... .prefixes` from
-`state.validate_immutable`. T2 does not alter `state.py`, `lpm.py` or `routing.py`
-to address this. Normal checks run with the existing default debug setting;
-the new once-per-batch debug-validation test covers a topology without RIBs.
+Historical note: at the time of this measurement, `net.debug_validate = True` followed by adding a route raised `TypeError: unrecognized object FrozenPrefixTable`; the validator now accepts frozen prefix tables and rejects the mutable builder (fixed on the integration branch).
 
 Local checks do not replace CI. Integration with the other scale branches still
 needs the integrator's combined test run.

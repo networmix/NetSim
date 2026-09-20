@@ -116,6 +116,7 @@ class Study:
         )
         self.capacity_unit = float(getattr(network, 'netsim_capacity_unit', 1.0))
         self.destinations = dict(getattr(network, 'netsim_demand_destinations', {}))
+        self.priorities = dict(getattr(network, 'netsim_demand_priorities', {}))
         self.scenario: Any = None
 
     @classmethod
@@ -150,7 +151,7 @@ class Study:
                     'destination': self.destinations.get(
                         name, str(to_address(demand.dst, demand.af))
                     ),
-                    'priority': demand.priority,
+                    'priority': self.priorities.get(name, demand.priority),
                     'demand': offered,
                     'placed': placed,
                     'dropped': max(0.0, offered - placed),

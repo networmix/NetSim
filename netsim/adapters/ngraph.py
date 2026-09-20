@@ -26,6 +26,8 @@ DEFAULT_LOOPBACK_POOL = '10.255.0.0/16'
 DEFAULT_LINK_POOL = '10.0.0.0/8'
 DEFAULT_LOOPBACK_POOL_V6 = '2001:db8:ffff::/48'
 DEFAULT_LINK_POOL_V6 = '2001:db8::/32'
+DEFAULT_ANYCAST_POOL = '10.254.0.0/16'
+"""Anycast /32s that translate NetGraph ``combine`` demands (one per demand)."""
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,7 @@ def _populate_network(
     # it before forking, so no model-layer dependency on this adapter is needed.
     net.netsim_capacity_unit = capacity_unit  # type: ignore[attr-defined]
     net.netsim_demand_destinations = {}  # type: ignore[attr-defined]
+    net.netsim_demand_priorities = {}  # type: ignore[attr-defined]
     net.netsim_failure_parameters = failure_parameters  # type: ignore[attr-defined]
     for name in sorted(network.nodes):
         node = network.nodes[name]
@@ -342,30 +345,78 @@ def _populate_demands(
         for i, td in enumerate(demand_sets[set_name]):
             sources = _match(network, td.source)
             targets = _match(network, td.target)
-            pairs = [(s, t) for s in sources for t in targets if s != t]
-            if not pairs:
+            # NetGraph: lower priority numbers are served first; NetSim
+            # serves higher numbers first, so the sign flips here and the
+            # original value is kept for exported results.
+            ng_priority = int(getattr(td, 'priority', 0))
+            mode = str(getattr(td, 'mode', 'combine')).lower()
+            destinations = getattr(net, 'netsim_demand_destinations', None)
+            priorities = getattr(net, 'netsim_demand_priorities', None)
+            if mode == 'pairwise':
+                # ``pairwise``: the volume is split evenly over the pairs.
+                pairs = [(s, t) for s in sources for t in targets if s != t]
+                if not pairs:
+                    continue
+                per_pair = td.volume * capacity_unit / len(pairs)
+                for s, t in pairs:
+                    did = f'{set_name}:{i}:{s}>{t}'
+                    net.add_demand(
+                        did,
+                        s,
+                        _loopback_v4(net, t),
+                        per_pair,
+                        priority=-ng_priority,
+                        tag=set_name,
+                    )
+                    if destinations is not None:
+                        destinations[did] = t
+                    if priorities is not None:
+                        priorities[did] = ng_priority
+                    ids.append(did)
                 continue
-            # NetGraph semantics: ``pairwise`` splits the volume evenly over
-            # the expanded pairs; ``combine`` is one aggregate of ``volume``
-            # between the source and target sets, approximated here by the
-            # same even split (NetGraph originates an even share per source).
-            per_pair = td.volume * capacity_unit / len(pairs)
-            for s, t in pairs:
-                dst = _loopback_v4(net, t)
-                did = f'{set_name}:{i}:{s}>{t}'
+            # ``combine``: one aggregate between the source set and the target
+            # set. NetGraph attaches every target to a pseudo sink at cost 0
+            # and originates an even share at every source, so each source
+            # reaches its nearest target(s) by shortest path. The same
+            # forwarding is an anycast prefix announced by every target.
+            targets = [t for t in targets if t not in sources] or targets
+            if not sources or not targets:
+                continue
+            anycast = _anycast(net, f'{set_name}:{i}', targets)
+            per_source = td.volume * capacity_unit / len(sources)
+            for s in sources:
+                did = f'{set_name}:{i}:{s}>*'
                 net.add_demand(
-                    did,
-                    s,
-                    dst,
-                    per_pair,
-                    priority=int(getattr(td, 'priority', 0)),
-                    tag=set_name,
+                    did, s, anycast, per_source, priority=-ng_priority, tag=set_name
                 )
-                destinations = getattr(net, 'netsim_demand_destinations', None)
                 if destinations is not None:
-                    destinations[did] = t
+                    destinations[did] = f'{{{",".join(targets)}}}'
+                if priorities is not None:
+                    priorities[did] = ng_priority
                 ids.append(did)
     return ids
+
+
+def _anycast(net: Network, key: str, targets: list[str]) -> str:
+    """Allocate one anycast /32 for *key* and announce it on every target's
+    loopback (``lo0``). Allocation order is deterministic per network."""
+    table = getattr(net, 'netsim_anycast', None)
+    if table is None:
+        table = net.netsim_anycast = {}  # type: ignore[attr-defined]
+    pool = getattr(net, 'netsim_anycast_pool', None)
+    if pool is None:
+        pool = net.netsim_anycast_pool = ipaddress.ip_network(  # type: ignore[attr-defined]
+            DEFAULT_ANYCAST_POOL
+        ).hosts()
+    address = str(next(pool))
+    table[key] = (address, tuple(targets))
+    for t in targets:
+        lo = net.device(t)['lo0']
+        current = [
+            f'{ipaddress.IPv4Address(h)}/{plen}' for h, plen in lo.node.config.ipv4
+        ]
+        lo.configure(ipv4=[*current, f'{address}/32'])
+    return address
 
 
 def _loopback_v4(net: Network, device: str) -> str:
