@@ -253,6 +253,12 @@ All sources on a simulation share leases: an entity fails on its first lease
 and returns to its original state on its last release. A pre-disabled entity
 stays disabled. A `None` duration holds the lease permanently. Direct manual
 fail/restore calls during active leases are outside this ownership contract.
+Each acquisition or release stages its member transitions in one network
+batch. An aborted batch changes neither the tree nor the leases; if a
+post-commit observer raises, the matching lease transition remains recorded
+and the exception propagates. `registry.active_leases` exposes live tokens for
+recovery; retrying a consumed release is harmless. Scheduled committed faults
+arm their repair even when an observer raises.
 
 Renewal distributions are `exponential`, `lognormal`, `weibull`, or `constant`.
 Their arithmetic means come from `mtbf`/`mttr`; lognormal `sigma` is log-space
@@ -298,23 +304,33 @@ loss integral (bits), per-demand downtime (seconds) and unavailability,
 drop reasons (bit/s), and event counts. Process results additionally expose the
 concurrent leased-entity histogram as seconds at each count. Loss integrates
 the timeline's left-constant delivered samples, including the final interval;
-multiple transitions at one timestamp contribute no elapsed time.
+multiple transitions at one timestamp contribute no elapsed time. A single
+shortfall tolerance applies to flow drops, dropped-flow counts, downtime and
+all loss integrals: residuals at or below `max(1e-12 bit/s, 1e-9 * offered)` are
+roundoff. Comparisons use each demand's payload bit/s before output-unit
+conversion; tolerated residuals export as zero dropped with placed equal to
+offered. This does not alter the model's placement records.
 
 Flow rates in `to_ngraph()` use the scenario's capacity unit (default Gbit/s),
 or bit/s for native networks; loss is always bits. The baseline and failure
 records follow NetGraph's `FlowIterationResult` shape. This is format and
-failure-pattern compatibility: the existing NetSim adapter's demand expansion
-and capacity model remain unchanged. In particular, the included square-mesh
-scenario offers 144 units through NetSim's per-pair expansion versus 12 in
-NetGraph's workflow result. Do not treat their placed totals as equivalent
-without first aligning demand expansion and placement models.
+failure-pattern compatibility. The adapter splits pairwise volume like
+NetGraph: the included square-mesh scenario offers 12 units in both systems.
+Placed totals still depend on the capacity/placement model; NetSim's default
+UNCONSTRAINED model does not enforce NetGraph's lossless admission semantics.
 
 `Study(network, keep={...})` accepts `roots` and `deltas` (both default 0),
-`arrays`, `reports`, and `timeline` (default false). Metrics always retain
-placement samples for the current iteration/run. `arrays=True` exports edge
-utilization series; `timeline=True` exports event rows. Events/records grow with
-the run; bounded root/delta retention is not a bounded total-history guarantee.
-An undefined utilization is exported as JSON `null`.
+`arrays`, `reports`, and `timeline` (default false), plus `events` and `records`
+(default `None`, unbounded). `keep_events` and `keep_records` are accepted as
+aliases inside `keep`; conflicting aliases are rejected. These budgets pass
+through to `Simulation` and use its amortized trimming policy. Streaming
+per-demand accumulators preserve full-run loss, downtime and settle times even
+when history is evicted. `arrays=True` exports retained edge utilization series;
+`timeline=True` exports retained event rows. `event_counts` counts retained
+events; `dropped_events`/`dropped_records` disclose evictions, and `commits`
+includes evicted records. An undefined utilization is exported as JSON `null`.
+The lease event trace/history still grows with faults; these options do not
+promise a bound on total study memory.
 
 Importing `netsim.adapters.ngraph` registers the optional `NetSimStudy` workflow
 step. Timing and interface overrides live in node/link/risk-group `attrs.netsim`:

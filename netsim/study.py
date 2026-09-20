@@ -17,6 +17,7 @@ from typing import Any
 from netsim.core import Environment
 from netsim.model.addressing import to_address
 from netsim.model.network import Network
+from netsim.model.state import StateDelta
 from netsim.runtime.failures import (
     Draws,
     FailureSet,
@@ -62,30 +63,96 @@ class StudyResult:
         ]
 
 
-def _integrate(
-    series: list[tuple[float, float]],
-    offered: float,
-    start: float,
-    end: float,
-) -> tuple[float, float]:
-    """Left-constant delivered samples → loss bits and downtime seconds."""
-    value, cursor, loss, down = 0.0, start, 0.0, 0.0
-    for time, delivered in series:
-        if time <= start:
-            value = delivered
-            continue
-        if time > end:
-            break
-        dt = time - cursor
-        loss += max(0.0, offered - value) * dt
-        if value < offered:
-            down += dt
-        cursor, value = time, delivered
-    dt = end - cursor
-    loss += max(0.0, offered - value) * dt
-    if value < offered:
-        down += dt
-    return loss, down
+def _shortfall(offered: float, delivered: float) -> float:
+    """Unmet bit/s, ignoring <= max(1e-12 bit/s, 1e-9 * offered) roundoff.
+
+    Compare in payload bit/s, before any result-unit conversion. Use this same
+    residual for exported drops, integrals and downtime so they cannot disagree.
+    """
+    residual = offered - delivered
+    return residual if residual > max(1e-12, abs(offered) * 1e-9) else 0.0
+
+
+class _DeliveryIntegrals:
+    """One pass over placement samples, with O(D) accumulator storage.
+
+    A sample replaces the delivered values for all demands. Equal timestamps
+    have zero measure, so only their final values affect the next interval.
+    """
+
+    def __init__(self, offered: Mapping[str, float], start: float) -> None:
+        self.offered = dict(offered)
+        self.start = self.time = start
+        self.values: dict[str, float] = {}
+        self.loss = dict.fromkeys(offered, 0.0)
+        self.downtime = dict.fromkeys(offered, 0.0)
+
+    def sample(self, time: float, values: Iterable[tuple[str, float]]) -> None:
+        dt = max(0.0, time - self.time)
+        if dt:
+            for name, rate in self.offered.items():
+                shortfall = _shortfall(rate, self.values.get(name, 0.0))
+                self.loss[name] += shortfall * dt
+                if shortfall:
+                    self.downtime[name] += dt
+            self.time = time
+        self.values = dict(values)
+
+    def metrics(self, end: float) -> dict[str, dict[str, float]]:
+        dt = max(0.0, end - self.time)
+        result = {}
+        for name, rate in self.offered.items():
+            shortfall = _shortfall(rate, self.values.get(name, 0.0))
+            downtime = self.downtime[name] + (dt if shortfall else 0.0)
+            result[name] = {
+                'downtime': downtime,
+                'unavailability': downtime / (end - self.start)
+                if end > self.start
+                else 0.0,
+                'loss_integral': self.loss[name] + shortfall * dt,
+            }
+        return result
+
+    def total_loss(self, end: float) -> float:
+        return sum(row['loss_integral'] for row in self.metrics(end).values())
+
+
+class _StudyObservation:
+    """Streaming integrals survive event/record eviction without keeping roots."""
+
+    def __init__(self, sim: Simulation, start: float) -> None:
+        self.integrals = _DeliveryIntegrals(
+            {name: demand.rate for name, demand in sim.state.demands.sorted_items()},
+            start,
+        )
+        self.phase = self.integrals
+        self.last_commit_time = sim.env.now
+        self.max_utilization = 0.0
+        self.drop_reasons: set[str] = set()
+        self._placement(sim.env.now, sim.state.placement)
+        sim.network.on_delta.append(self.on_delta)
+
+    def _placement(self, time: float, report: Any) -> None:
+        values = (
+            tuple((name, result.delivered) for name, result in report.demands.items())
+            if report is not None
+            else ()
+        )
+        self.integrals.sample(time, values)
+        if self.phase is not self.integrals:
+            self.phase.sample(time, values)
+        if report is not None:
+            self.max_utilization = max(self.max_utilization, report.max_utilization())
+            self.drop_reasons.update(report.dropped_by_reason)
+
+    def on_delta(self, time: float, origin: Any, delta: StateDelta) -> None:
+        self.last_commit_time = time
+        if delta.old.placement is not delta.new.placement:
+            self._placement(time, delta.new.placement)
+
+    def start_phase(self, time: float) -> None:
+        self.phase = _DeliveryIntegrals(self.integrals.offered, time)
+        self.phase.sample(time, self.integrals.values.items())
 
 
 def _drop_reasons(network: Network) -> dict[str, float]:
@@ -101,12 +168,20 @@ class Study:
         self.network = network.fork()
         self.network.converge()
         self.keep = dict(keep or {})
+        for alias in ('keep_events', 'keep_records'):
+            if alias in self.keep:
+                key = alias.removeprefix('keep_')
+                if key in self.keep and self.keep[key] != self.keep[alias]:
+                    raise ValueError(f'conflicting keep options: {key}, {alias}')
+                self.keep[key] = self.keep.pop(alias)
         unknown = self.keep.keys() - {
             'roots',
             'deltas',
             'arrays',
             'reports',
             'timeline',
+            'events',
+            'records',
         }
         if unknown:
             raise ValueError(f'unknown keep options: {sorted(unknown)}')
@@ -128,22 +203,28 @@ class Study:
         study.scenario = scenario
         return study
 
-    def _simulation(self) -> Simulation:
-        return Simulation(
+    def _simulation(self, start: float = 0.0) -> Simulation:
+        sim = Simulation(
             Environment(),
             self.network.fork(),
             keep_roots=self.keep.get('roots', 0),
             keep_deltas=self.keep.get('deltas', 0),
             keep_arrays=self.keep.get('arrays', False),
             keep_reports=self.keep.get('reports', False),
+            keep_events=self.keep.get('events'),
+            keep_records=self.keep.get('records'),
         )
+        sim._study_observation = _StudyObservation(sim, start)  # type: ignore[attr-defined]
+        return sim
 
     def _record(self, network: Network, failures: FailureSet) -> dict[str, Any]:
         report = network.placement
         flows = []
         for name, demand in network.state.demands.sorted_items():
-            placed = report.demands[name].delivered / self.capacity_unit
+            shortfall = _shortfall(demand.rate, report.demands[name].delivered)
             offered = demand.rate / self.capacity_unit
+            dropped = shortfall / self.capacity_unit
+            placed = offered - dropped
             flows.append(
                 {
                     'source': demand.source,
@@ -153,7 +234,7 @@ class Study:
                     'priority': demand.priority,
                     'demand': offered,
                     'placed': placed,
-                    'dropped': max(0.0, offered - placed),
+                    'dropped': dropped,
                     'cost_distribution': {},
                     'data': {'demand_id': name},
                 }
@@ -186,16 +267,22 @@ class Study:
         start: float,
         end: float,
     ) -> dict[str, Any]:
-        per_demand = {}
-        for name, demand in self.network.state.demands.sorted_items():
-            loss, downtime = _integrate(
-                sim.timeline.delivered_series(name), demand.rate, start, end
+        observation: _StudyObservation | None = getattr(sim, '_study_observation', None)
+        if observation is not None:
+            integrals = observation.integrals
+        else:
+            integrals = _DeliveryIntegrals(
+                {
+                    name: demand.rate
+                    for name, demand in self.network.state.demands.sorted_items()
+                },
+                start,
             )
-            per_demand[name] = {
-                'downtime': downtime,
-                'unavailability': downtime / (end - start) if end > start else 0.0,
-                'loss_integral': loss,
-            }
+            for sample in sim.timeline.placement_events():
+                if sample.time > end:
+                    break
+                integrals.sample(sample.time, sample.demand_delivered)
+        per_demand = integrals.metrics(end)
         histogram: dict[int, float] = {}
         cursor, active = start, 0
         for time, count in registry.history:
@@ -216,19 +303,25 @@ class Study:
             'per_demand': per_demand,
             'concurrent_failure_histogram': {str(k): v for k, v in histogram.items()},
             'event_counts': dict(sorted(counts.items())),
-            'commits': len(sim.timeline.records),
+            'commits': len(sim.timeline.records) + sim.timeline.dropped_records,
+            'dropped_events': sim.timeline.dropped_events,
+            'dropped_records': sim.timeline.dropped_records,
             'fault_events': sum(
                 start <= event.start <= end for event in registry.trace
             ),
             'drop_reasons': _drop_reasons(sim.network),
             'observed_drop_reasons': sorted(
-                {
+                observation.drop_reasons
+                if observation is not None
+                else {
                     reason
                     for event in sim.timeline.placement_events()
                     for reason, _ in event.dropped
                 }
             ),
-            'max_utilization': max(
+            'max_utilization': observation.max_utilization
+            if observation is not None
+            else max(
                 (e.max_utilization for e in sim.timeline.placement_events()),
                 default=0.0,
             ),
@@ -257,6 +350,9 @@ class Study:
 
     @staticmethod
     def _settled_time(sim: Simulation, start: float) -> float:
+        observation: _StudyObservation | None = getattr(sim, '_study_observation', None)
+        if observation is not None:
+            return max(start, observation.last_commit_time)
         return max(
             (r.time for r in sim.timeline.records if r.time >= start), default=start
         )
@@ -292,7 +388,7 @@ class Study:
             )
         records = []
         for draw in unique.values():
-            sim = self._simulation()
+            sim = self._simulation(start=t0)
             registry = sim.failures(Schedule(()), risk_groups=self.risk_groups)
             tokens: list[int] = []
             sim.at(
@@ -306,10 +402,15 @@ class Study:
             failed_at = self._settled_time(sim, t0)
             record = self._record(sim.network, draw)
             failure_drops = _drop_reasons(sim.network)
-            windows = [(t0, failed_at)]
+            observation: _StudyObservation | None = getattr(
+                sim, '_study_observation', None
+            )
+            assert observation is not None
+            transient_loss = observation.phase.total_loss(failed_at)
             recovery_time = None
             if restore:
                 recovery_start = sim.env.now
+                observation.start_phase(recovery_start)
                 sim.at(
                     recovery_start,
                     lambda registry=registry, token=tokens[0]: registry.release(token),
@@ -318,16 +419,12 @@ class Study:
                 sim.run()
                 recovered_at = self._settled_time(sim, recovery_start)
                 recovery_time = recovered_at - recovery_start
-                windows.append((recovery_start, recovered_at))
+                transient_loss += observation.phase.total_loss(recovered_at)
             extras = self._metrics(sim, registry, t0, sim.env.now)
-            offered = sum(d.rate for d in self.network.state.demands.values())
             extras.update(
                 settle_time=failed_at - t0,
                 recovery_settle_time=recovery_time,
-                bits_lost_transient=sum(
-                    _integrate(sim.timeline.delivered_series(), offered, a, b)[0]
-                    for a, b in windows
-                ),
+                bits_lost_transient=transient_loss,
                 drop_reasons=failure_drops,
                 fault_events=1,
             )

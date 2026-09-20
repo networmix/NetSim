@@ -76,10 +76,82 @@ Carlo or that larger workloads have the same cost.
 - Flow rates use the imported capacity unit; loss integrals use bits. Empty
   failure patterns use NetGraph's empty-string ID. Replays preserve sampling
   multiplicities. Histograms count leased entities, not independent leases.
-- NetGraph compatibility covers failure patterns and result format. Existing
-  demand/placement semantics are preserved: the square-mesh adapter baseline
-  offers 144 units while NetGraph's placement workflow reports 12. The test
-  pins this known difference; aligning demand expansion is outside T6.
-- Root/delta retention is bounded by `keep`; event/record history still grows
-  with the current run. The study drops each simulation after extracting its
-  metrics. No new total-history budget or process parallelism is claimed.
+- NetGraph compatibility covers failure patterns and result format. The
+  integrated adapter splits pairwise demand volume: the square-mesh baseline
+  offers 12 units in both NetSim and NetGraph. Placed totals still depend on
+  their different capacity/placement models.
+- `keep` accepts root/delta budgets plus `events`/`records` budgets (aliases
+  `keep_events`/`keep_records`), passed through to Simulation. Streaming
+  per-demand accumulators preserve complete integrals with bounded history.
+  Event rows, edge series and typed event counts describe retained history;
+  eviction counts are explicit. Lease history remains proportional to faults.
+  No bound on total study memory or process parallelism is claimed.
+
+## T6B adversarial follow-up (2026-09-20)
+
+Merged `network-layer-gate-a` first (fast-forward to `7d4976a`). Baseline
+`make check-ci`: **555 passed, 3 skipped, 94.07%** coverage. Twelve targeted
+regressions then failed on that code before any fix: healthy 15/7-bit/s demands
+counted a dropped flow, quadratic tuple visits, unavailable keep options,
+partial multi-entity observer transitions, corrupt acquire/release state after
+pre-commit aborts, and missing scheduled repairs after post-commit errors.
+
+Changes:
+
+- One residual policy everywhere: ignore <= `max(1e-12 bit/s, 1e-9 * offered)`
+  per demand, before capacity-unit conversion. Tolerated residuals normalize
+  exported placed to offered and dropped to zero; physical model records stay
+  untouched. Tests cover relative and absolute thresholds, real shortfalls,
+  bit/s versus Gbit/s export, and a small failed demand beside a large healthy
+  one (aggregate tolerances must not hide the small demand's loss).
+- Integrate all delivered values together. The study streams into per-demand
+  accumulators with O(D) storage; offline timeline reduction visits each sample
+  tuple once. Same-timestamp replacements, missing values and the final interval
+  are covered. History budgets do not truncate full-run availability or settle
+  times. Event counts and optional series intentionally describe retained
+  history, with explicit eviction counters.
+- Lease changes stage in one `Network.batch()`. Registry changes roll back when
+  the root did not commit; post-commit exceptions propagate with matching
+  registry state preserved. Active tokens remain discoverable; consumed
+  releases are idempotent. Scheduled faults arm repairs in `finally` only when
+  their lease survived. Tests include existing overlaps, acquire/release errors,
+  nested-batch rejection, and pre-disabled entities.
+- Corrected the stale demand-volume documentation: integrated square-mesh
+  demand is 12 in both systems. Added events/records budget pass-through and
+  their `keep_events`/`keep_records` aliases to `Study(keep=...)`.
+
+Metrics A/B/A command:
+`venv/bin/python -m tests.runtime.benchmark_study_metrics --old 7d4976a`.
+One CPython 3.14.5 process, GC enabled, 20 repetitions per block, 16 identical
+placement samples, setup excluded. Old and new per-demand results and total
+loss agree on the benchmark's exactly representable rates.
+
+| Demands | A1 old ms | B new ms | A2 old ms | One-sample tuple visits old → new |
+|---|---:|---:|---:|---:|
+| 100 | 0.962210 | 0.273244 | 0.981579 | 5,050 → 100 |
+| 1,000 | 64.972983 | 2.892677 | 65.658633 | 500,500 → 1,000 |
+
+The run began after three quiet observations two seconds apart; a monitor
+sampled every second and found no other Python worker above 10% CPU during
+A/B/A. No local tests ran concurrently; normal desktop applications remained
+open. These timings isolate metrics extraction, not end-to-end simulation.
+The operation-count regressions establish linear tuple visitation without
+relying on machine timing.
+
+Separate integration lead, outside T6B: a native single demand of `1e-8` bit/s
+reproduced `ZeroDivisionError` in `model/flows.py` source-share normalization
+when `Fraction.limit_denominator` rounded the class total to zero. This is a
+placement-layer issue, unchanged here; the absolute-floor test uses `1e-4`
+bit/s to exercise the study tolerance without depending on that defect.
+
+Final T6B verification:
+
+- `make check-ci`: format/lint/types pass; **581 passed, 3 skipped**;
+  **94.14%** coverage on CPython 3.14.5.
+- `make check-ft`: format/lint/types pass; **581 passed, 3 skipped**;
+  **94.14%** coverage on free-threaded 3.14.5.
+- `PYTHONPATH="$PWD" /Users/networmix/ws/NetGraph/venv/bin/python -m pytest
+  tests/adapters -p no:cacheprovider -o addopts='' -q`: **19 passed**.
+- `git diff --check`: clean. No public model/routing/placement API was changed;
+  `LeaseRegistry.active_leases` is the new recovery inspection property, and
+  consumed release tokens are now safe to retry. Local checks do not replace CI.
