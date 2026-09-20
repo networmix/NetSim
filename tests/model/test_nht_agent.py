@@ -11,6 +11,7 @@ from netsim.model.state import validate_immutable
 from netsim.runtime import Simulation
 from tests.model.test_network import A, build_diamond
 from tests.model.test_nht import route
+from tests.model.test_nht_context import scoped_pair
 from tests.model.test_policies import diamond, state_of
 from tests.model.test_srdb_source import claims, literal_policy
 
@@ -149,6 +150,75 @@ def test_agent_route_output_preserves_link_state_cost_profile():
     answer = samples(routers['R1'], plugin)[-1][1]
     assert answer.eligible and answer.cost == 37 and answer.cost_source == client
     assert client in routers['R1'].rib(4).link_state_sources
+
+
+@dataclass(frozen=True)
+class ScopedTracker:
+    key: c.NhtKey
+    config: c.AgentConfig = c.AgentConfig(run_delay=0)
+
+    @property
+    def client(self):
+        return self.key.owner
+
+    @property
+    def profile(self):
+        return c.ClientProfile(self.client, 115)
+
+    def subscriptions(self):
+        return ()
+
+    def on_init(self, ctx):
+        return c.AgentOutput(state=(), nht_ops=(c.NhtOp(c.REGISTER_NHT, self.key),))
+
+    def on_run(self, ctx):
+        return c.AgentOutput(
+            state=ctx.agent_state
+            + (
+                (
+                    tuple(cause.kind for cause in ctx.causes),
+                    tuple(ctx.nht.sorted_items()),
+                ),
+            )
+        )
+
+
+def test_agent_registration_binds_scope_and_never_rebinds_after_recreation():
+    net, head, request = scoped_pair()
+    plugin = ScopedTracker(replace(request, owner=c.ClientId('scope-watch')))
+    net.add_agent(head, plugin)
+    sim = Simulation(Environment(), net)
+    publications = []
+
+    def observe(_time, origin, delta):
+        if origin[:2] == ('kind', 'agent'):
+            publications.append(delta.new.devices[head.name].nht.registrations)
+
+    net.on_delta.insert(0, observe)
+    sim.settle()
+    ((bound, answer),) = publications[0].items()
+    assert bound == replace(plugin.key, interface_generation=head['e'].generation)
+    assert answer.eligible  # Already bound and answered in the initial publication.
+    assert samples(head, plugin)[-1][0] == (c.CAUSE_NHT,)
+    head.remove_interface('e')
+    sim.settle()
+    stale = head.node.nht.registrations[bound]
+    assert stale.reason == 'SCOPE_STALE' and not stale.eligible
+    assert samples(head, plugin)[-1][0] == (c.CAUSE_NHT,)
+    agent = head.node.agents[plugin.client.name]
+    head.add_ethernet('e', unnumbered=True)
+    net.add_link(('a', 'e'), ('b', 'e'))
+    sim.settle()
+    assert head['e'].generation != bound.interface_generation
+    assert head.node.nht.registrations[bound] is stale
+    assert head.node.agents[plugin.client.name] is agent
+    assert head.nht_client(plugin.client).resolve(plugin.key).eligible
+    # Explicit purge/re-registration is a new scope, not resurrection of the old one.
+    sim.reset_agent(head.name, plugin.client.name, purge=True)
+    sim.settle()
+    ((fresh, answer),) = head.node.nht.registrations.items()
+    assert fresh.interface_generation == head['e'].generation and fresh != bound
+    assert answer.eligible
 
 
 @dataclass(frozen=True)

@@ -423,7 +423,10 @@ class _Resolver:
         self.ctx = ctx
         self.policy = policy
         dev = getattr(ctx, 'dev', None)
-        table = getattr(dev, 'srv6_policies', None)
+        # Detached contexts carry only the local table, without a device handle.
+        table = getattr(ctx, 'srv6_policies', None)
+        if table is None:
+            table = getattr(dev, 'srv6_policies', None)
         self.programs = policy_programs(table)
         self.bsids = table.bsids if table else PMap()
         self.memo: dict[
