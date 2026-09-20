@@ -10,6 +10,7 @@ so ``ngraph`` is imported only where its own classes are constructed.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import ipaddress
 import re
@@ -92,6 +93,27 @@ class _Pools:
         self.links_v6 = ipaddress.ip_network(link_v6).subnets(new_prefix=127)
 
 
+class _MetadataGuard:
+    """Restore the adapter's ``netsim_*`` attributes if an import aborts, so
+    exported labels never disagree with the committed tree."""
+
+    def __init__(self, net: Network) -> None:
+        self.net = net
+        self.saved = {
+            k: copy.copy(v) for k, v in vars(net).items() if k.startswith('netsim_')
+        }
+
+    def __enter__(self) -> _MetadataGuard:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type is not None:
+            for k in [k for k in vars(self.net) if k.startswith('netsim_')]:
+                delattr(self.net, k)
+            for k, v in self.saved.items():
+                setattr(self.net, k, v)
+
+
 def from_network(
     network: Any,
     *,
@@ -104,7 +126,7 @@ def from_network(
 ) -> Network:
     """Build a NetSim ``Network`` from a NetGraph ``Network``."""
     net = Network(seed=seed)
-    with net.batch():
+    with _MetadataGuard(net), net.batch():
         _populate_network(
             net,
             network,
@@ -327,10 +349,40 @@ def demands_from(
     demand_sets: dict[str, list[Any]],
     *,
     capacity_unit: float = 1e9,
+    strict: bool = True,
 ) -> list[str]:
     """Expand NetGraph ``TrafficDemand`` entries into NetSim demands (loopback destinations)."""
-    with net.batch():
-        return _populate_demands(network, net, demand_sets, capacity_unit=capacity_unit)
+    with _MetadataGuard(net), net.batch():
+        return _populate_demands(
+            network, net, demand_sets, capacity_unit=capacity_unit, strict=strict
+        )
+
+
+SUPPORTED_FLOW_POLICIES = frozenset(
+    {'SHORTEST_PATHS_ECMP', 'SHORTEST_PATHS_ECMP_LOSSY', 1, 6}
+)
+"""NetGraph presets whose forwarding NetSim reproduces (hop-by-hop ECMP over
+the oracle IGP; the lossy variant maps to the LOSSY capacity model)."""
+
+
+def _check_supported(td: Any, where: str) -> None:
+    """Reject NetGraph demand options the adapter does not translate."""
+    paths = getattr(td, 'static_paths', ()) or ()
+    if paths:
+        raise ValueError(
+            f'{where}: static_paths are not supported (Gate B: SR policies)'
+        )
+    group_mode = getattr(td, 'group_mode', None)
+    if group_mode not in (None, 'flatten'):
+        raise ValueError(f'{where}: group_mode {group_mode!r} is not supported')
+    policy = getattr(td, 'flow_policy', None)
+    if policy is not None:
+        key = getattr(policy, 'name', policy)
+        value = getattr(policy, 'value', policy)
+        if key not in SUPPORTED_FLOW_POLICIES and value not in SUPPORTED_FLOW_POLICIES:
+            raise ValueError(
+                f'{where}: flow_policy {key!r} is not supported (only shortest-path ECMP)'
+            )
 
 
 def _populate_demands(
@@ -339,10 +391,23 @@ def _populate_demands(
     demand_sets: dict[str, list[Any]],
     *,
     capacity_unit: float = 1e9,
+    strict: bool = True,
 ) -> list[str]:
+    """Expand demands. Semantics kept from NetGraph: ``pairwise`` splits the
+    volume over the pairs; ``combine`` sends an even share from every source
+    to one anycast prefix announced by all targets (the nearest target wins,
+    as with NetGraph's pseudo sink), targets that are also sources are
+    excluded. Known approximation: NetGraph re-splits a combined volume over
+    the sources that can reach a target in each iteration, NetSim keeps each
+    source's share fixed (a cut-off source drops its share). With ``strict``
+    the options that are not translated (static paths, group modes, WCMP and
+    TE flow policies) raise instead of being silently approximated."""
     ids: list[str] = []
+    used = _used_ipv4(net)
     for set_name in sorted(demand_sets):
         for i, td in enumerate(demand_sets[set_name]):
+            if strict:
+                _check_supported(td, f'{set_name}[{i}]')
             sources = _match(network, td.source)
             targets = _match(network, td.target)
             # NetGraph: lower priority numbers are served first; NetSim
@@ -379,10 +444,11 @@ def _populate_demands(
             # and originates an even share at every source, so each source
             # reaches its nearest target(s) by shortest path. The same
             # forwarding is an anycast prefix announced by every target.
-            targets = [t for t in targets if t not in sources] or targets
+            source_set = set(sources)
+            targets = [t for t in targets if t not in source_set]
             if not sources or not targets:
-                continue
-            anycast = _anycast(net, f'{set_name}:{i}', targets)
+                continue  # as NetGraph: overlap can empty the target set
+            anycast = _anycast(net, f'{set_name}:{i}', targets, used)
             per_source = td.volume * capacity_unit / len(sources)
             for s in sources:
                 did = f'{set_name}:{i}:{s}>*'
@@ -397,26 +463,51 @@ def _populate_demands(
     return ids
 
 
-def _anycast(net: Network, key: str, targets: list[str]) -> str:
-    """Allocate one anycast /32 for *key* and announce it on every target's
-    loopback (``lo0``). Allocation order is deterministic per network."""
+def _used_ipv4(net: Network) -> set[int]:
+    """Every IPv4 host address configured on any interface of the tree."""
+    out: set[int] = set()
+    for dev in net.state.devices.values():
+        for node in dev.interfaces.values():
+            for host, _plen in getattr(node.config, 'ipv4', ()) or ():
+                out.add(host)
+    for address, _targets in (getattr(net, 'netsim_anycast', None) or {}).values():
+        out.add(int(ipaddress.IPv4Address(address)))
+    return out
+
+
+def _anycast(net: Network, key: str, targets: list[str], used: set[int]) -> str:
+    """Allocate one anycast /32 for *key* from the anycast pool, skipping every
+    address the tree already uses, and announce it on each target's ``lo0``.
+    The allocation cursor lives in the adapter metadata (copied by
+    ``Network.fork``), so a fork never re-issues an address of its base."""
     table = getattr(net, 'netsim_anycast', None)
     if table is None:
         table = net.netsim_anycast = {}  # type: ignore[attr-defined]
-    pool = getattr(net, 'netsim_anycast_pool', None)
-    if pool is None:
-        pool = net.netsim_anycast_pool = ipaddress.ip_network(  # type: ignore[attr-defined]
-            DEFAULT_ANYCAST_POOL
-        ).hosts()
-    address = str(next(pool))
-    table[key] = (address, tuple(targets))
+    pool = ipaddress.ip_network(
+        getattr(net, 'netsim_anycast_pool', DEFAULT_ANYCAST_POOL)
+    )
+    cursor = int(getattr(net, 'netsim_anycast_cursor', 0))
+    hosts = pool.num_addresses - 2
+    address = None
+    while cursor < hosts:
+        candidate = int(pool.network_address) + 1 + cursor
+        cursor += 1
+        if candidate not in used:
+            address = candidate
+            break
+    net.netsim_anycast_cursor = cursor  # type: ignore[attr-defined]
+    if address is None:
+        raise ValueError(f'anycast pool {pool} exhausted while importing {key}')
+    used.add(address)
+    text = str(ipaddress.IPv4Address(address))
+    table[key] = (text, tuple(targets))
     for t in targets:
         lo = net.device(t)['lo0']
         current = [
             f'{ipaddress.IPv4Address(h)}/{plen}' for h, plen in lo.node.config.ipv4
         ]
-        lo.configure(ipv4=[*current, f'{address}/32'])
-    return address
+        lo.configure(ipv4=[*current, f'{text}/32'])
+    return text
 
 
 def _loopback_v4(net: Network, device: str) -> str:
@@ -453,12 +544,13 @@ def from_scenario(
     failure_policy: str | None = None,
     demand_set: str | None = None,
     iterations: int = 0,
+    strict: bool = True,
     **kw: Any,
 ) -> tuple[Network, list[str], FailureSchedule | None]:
     """NetGraph ``Scenario`` → ``(Network, demand ids, FailureSchedule | None)``."""
     seed = int(getattr(scenario, 'seed', 0) or 0)
     net = Network(seed=seed)
-    with net.batch():
+    with _MetadataGuard(net), net.batch():
         _populate_network(
             net,
             scenario.network,
@@ -470,7 +562,7 @@ def from_scenario(
         if demand_set is not None:
             sets = {demand_set: sets[demand_set]}
         ids = _populate_demands(
-            scenario.network, net, sets, capacity_unit=capacity_unit
+            scenario.network, net, sets, capacity_unit=capacity_unit, strict=strict
         )
     schedule = None
     if iterations:

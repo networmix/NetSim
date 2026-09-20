@@ -8,6 +8,7 @@ import pytest
 from netsim.adapters import ngraph as adapter
 from netsim.adapters.core import edge_arrays
 from netsim.model import forwarding as fw
+from netsim.model.addressing import to_int
 
 
 @dataclass
@@ -398,3 +399,111 @@ workflow:
     net.converge()
     assert ng['total_placed'] == pytest.approx(20.0)
     assert net.placement.delivered_total == pytest.approx(ng['total_placed'])
+
+
+class TestCombineAllocation:
+    def test_anycast_skips_addresses_already_in_the_tree(self):
+        graph = diamond_stub()
+        net = adapter.from_network(graph)
+        first = str(
+            next(
+                __import__('ipaddress').ip_network(adapter.DEFAULT_ANYCAST_POOL).hosts()
+            )
+        )
+        net.device('R1')['lo0'].configure(
+            ipv4=[f'{adapter._loopback_v4(net, "R1")}/32', f'{first}/32']
+        )  # R1 already owns the pool's first address
+        sets = {'t': [TrafficDemand('^R1$', '^R4$', 20.0, mode='combine')]}
+        ids = adapter.demands_from(graph, net, sets, capacity_unit=1.0)
+        dst = net.state.demands[ids[0]].dst
+        assert dst != to_int(first)[0]
+        net.converge()
+        assert net.placement.demands[ids[0]].delivered == pytest.approx(20.0)
+        e = net.links[net.ngraph_link_ids['R1|R3|0']].edge('R1')
+        assert net.placement.offered[e] > 0  # traffic really leaves R1
+
+    def test_fork_keeps_the_allocator_and_the_labels(self):
+        graph = diamond_stub()
+        net = adapter.from_network(graph)
+        ids = adapter.demands_from(
+            graph,
+            net,
+            {'a': [TrafficDemand('^R1$', '^R4$', 20.0, mode='combine', priority=3)]},
+            capacity_unit=1.0,
+        )
+        fork = net.fork()
+        ids2 = adapter.demands_from(
+            graph,
+            fork,
+            {'b': [TrafficDemand('^R1$', '^R3$', 30.0, mode='combine')]},
+            capacity_unit=1.0,
+        )
+        assert fork.state.demands[ids2[0]].dst != net.state.demands[ids[0]].dst
+        assert fork.netsim_demand_priorities[ids[0]] == 3
+        assert fork.netsim_demand_destinations[ids[0]] == '{R4}'
+        assert ids[0] not in net.netsim_demand_destinations or 'b' not in str(
+            net.netsim_anycast.keys()
+        )
+        fork.converge()
+        assert fork.placement.demands[ids2[0]].delivered == pytest.approx(30.0)
+
+    def test_full_overlap_yields_no_demand(self):
+        graph = diamond_stub()
+        net = adapter.from_network(graph)
+        ids = adapter.demands_from(
+            graph,
+            net,
+            {'o': [TrafficDemand('^R[12]$', '^R[12]$', 20.0, mode='combine')]},
+            capacity_unit=1.0,
+        )
+        assert ids == [] and len(net.state.demands) == 0
+
+    def test_metadata_rolls_back_when_an_import_aborts(self):
+        graph = diamond_stub()
+        net = adapter.from_network(graph)
+        adapter.demands_from(
+            graph,
+            net,
+            {'p': [TrafficDemand('^R1$', '^R4$', 20.0, mode='pairwise', priority=1)]},
+            capacity_unit=1.0,
+        )
+        before = dict(net.netsim_demand_priorities)
+        root = net.state
+        with pytest.raises(ValueError):
+            adapter.demands_from(
+                graph,
+                net,
+                {
+                    'p': [
+                        TrafficDemand('^R1$', '^R4$', 20.0, mode='pairwise', priority=9)
+                    ],
+                    'q': [TrafficDemand('^R1$', '^R4$', -1.0, mode='pairwise')],
+                },
+                capacity_unit=1.0,
+            )
+        assert net.state is root
+        assert net.netsim_demand_priorities == before
+
+    def test_strict_rejects_untranslated_options(self):
+        graph = diamond_stub()
+        net = adapter.from_network(graph)
+
+        class Rich(TrafficDemand):
+            pass
+
+        td = Rich('^R1$', '^R4$', 1.0, mode='pairwise')
+        td.flow_policy = type('P', (), {'name': 'TE_WCMP_UNLIM', 'value': 3})()
+        with pytest.raises(ValueError, match='flow_policy'):
+            adapter.demands_from(graph, net, {'x': [td]}, capacity_unit=1.0)
+        ids = adapter.demands_from(
+            graph, net, {'x': [td]}, capacity_unit=1.0, strict=False
+        )
+        assert len(ids) == 1
+        td2 = Rich('^R1$', '^R4$', 1.0, mode='pairwise')
+        td2.static_paths = (('R1', 'R4'),)
+        with pytest.raises(ValueError, match='static_paths'):
+            adapter.demands_from(graph, net, {'y': [td2]}, capacity_unit=1.0)
+        td3 = Rich('^R1$', '^R4$', 1.0, mode='pairwise')
+        td3.group_mode = 'per_group'
+        with pytest.raises(ValueError, match='group_mode'):
+            adapter.demands_from(graph, net, {'z': [td3]}, capacity_unit=1.0)

@@ -9,6 +9,7 @@ owns the per-(device, AF) resolver input epochs.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
@@ -358,6 +359,12 @@ class Network:
         net.capacity_model = self.capacity_model
         net.debug_validate = self.debug_validate
         net.ngraph_link_ids = dict(self.ngraph_link_ids)
+        # Adapter metadata (units, demand labels, allocators) lives beside the
+        # tree; a fork keeps its own copy so imports into the fork stay
+        # consistent with what the shared root already contains.
+        for name, value in vars(self).items():
+            if name.startswith('netsim_'):
+                setattr(net, name, copy.copy(value))
         return net
 
     def update(

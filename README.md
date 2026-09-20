@@ -377,6 +377,16 @@ The command requires NetGraph, registers the step before parsing, runs
 including all workflow steps. Without `--results`, it writes `results.json` in
 the current directory. Core imports and `netsim --help` work without NetGraph.
 
+NetGraph demand semantics carried by the adapter: `pairwise` splits the
+volume over the expanded pairs; `combine` announces one anycast prefix on
+every target and sends an even share from every source (the nearest target
+wins, as with NetGraph's pseudo sink; a source that cannot reach any target
+drops its share, whereas NetGraph re-splits the volume over the reachable
+sources per iteration); NetGraph priorities (lower served first) map to
+NetSim priorities (higher served first) and the original value is exported.
+Static paths, group modes and WCMP or TE flow policies are not translated:
+`from_scenario(..., strict=True)` (the default) rejects them.
+
 ## Development
 
 ```bash
