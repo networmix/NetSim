@@ -162,7 +162,7 @@ def test_cold_start_link_local_exchange_and_generation_stamps():
         validate_immutable(sim.state.devices[device].agents['wire'].state)
 
 
-def test_physical_failure_during_carrier_delay_rejects_real_outbox():
+def test_physical_failure_during_carrier_delay_silently_loses_real_outbox():
     net = wire_network(delay=1)
     for device, iface in [('R1', 'e1'), ('R2', 'e2')]:
         net.devices[device][iface].configure(carrier_delay_down=1)
@@ -173,12 +173,11 @@ def test_physical_failure_during_carrier_delay_rejects_real_outbox():
     sim.run_until(10.25)
     assert sim.state.devices['R1'].interfaces['e1'].oper.oper == OperState.UP
     command(sim, 'send')
-    (rejection,) = observed(sim, kind=c.Rejection)
-    assert rejection.reason == 'LINK_DOWN'
-    assert rejection.generation == sim.agents.generation('R1', 'wire')
+    assert not observed(sim, kind=c.Rejection)
     sim.run_until(11)
     assert not observed(sim, 'R2', c.Delivery)
-    assert sim.transport.budget()['datagrams_dropped'] == 1
+    assert sim.transport.budget()['datagrams_dropped'] == 2
+    assert sim.transport.budget()['datagrams_lost_physical'] == 2
 
 
 def test_real_datagram_fifo_under_delay_change():
@@ -501,10 +500,6 @@ def test_fresh_runtime_reestablishes_sessions_with_initial_listeners():
     assert sim.state.transport.connections[1].state == c.ESTABLISHED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='C1: AgentRuntime._context must rebase a scoped remote endpoint to local.scope',
-)
 def test_connection_view_remote_scope_is_local_to_the_observing_agent():
     sim = session()
     sim.run_until(0.125)

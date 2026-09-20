@@ -228,10 +228,11 @@ def test_inbox_full_retries_admitted_messages_without_reordering():
     sim.run_until(0.125)
     message(sim, ga, cid, 'first')
     message(sim, ga, cid, 'second')
-    sim.agents.full = True
+    sim.agents.blocked.add(('R2', 'ref'))
     sim.run_until(0.25)
     assert sim.transport.budget()['queued_messages'] == 2
-    sim.agents.full = False
+    assert sim.agents.entries[-1][2].reason == 'INBOX_FULL'
+    sim.agents.blocked.clear()
     sim.run_until(0.375)
     assert [(e.payload, e.seq) for _, _, e in deliveries(sim)] == [
         ('first', 0),

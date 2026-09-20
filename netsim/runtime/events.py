@@ -8,6 +8,8 @@ triggering delta and the ``settled_root`` captured just before delivery.
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from netsim import core
@@ -99,9 +101,54 @@ def _succeed_settled(ev: core.Event, delta: StateDelta, root: NetworkState) -> N
         ev.succeed((delta, root))
 
 
+@dataclass(frozen=True, slots=True)
+class StatAggregate:
+    count: int
+    sum: float
+    min: float
+    max: float
+    last: float
+    last_time: float
+
+
 class Stats:
-    def __init__(self) -> None:
-        self.counters: dict[str, list[tuple[float, float]]] = {}
+    """Constant retention per key, with optional bounded diagnostic samples.
+
+    ``aggregates`` always covers every increment. ``samples=N`` retains only
+    the last N (time, value) pairs per key in ``samples``. The legacy read API
+    ``counters`` returns a single (last_time, cumulative_sum) pair per key,
+    preserving existing sum-based consumers independently of sampling.
+    """
+
+    def __init__(self, *, samples: int = 0) -> None:
+        if isinstance(samples, bool) or not isinstance(samples, int) or samples < 0:
+            raise ValueError('samples must be a non-negative integer')
+        self._sample_limit = samples
+        self.aggregates: dict[str, StatAggregate] = {}
+        self.samples: dict[str, deque[tuple[float, float]]] = {}
+
+    @property
+    def counters(self) -> dict[str, list[tuple[float, float]]]:
+        return {
+            key: [(value.last_time, value.sum)]
+            for key, value in self.aggregates.items()
+        }
 
     def add(self, name: str, time: float, value: float = 1.0) -> None:
-        self.counters.setdefault(name, []).append((time, value))
+        old = self.aggregates.get(name)
+        self.aggregates[name] = (
+            StatAggregate(
+                old.count + 1,
+                old.sum + value,
+                min(old.min, value),
+                max(old.max, value),
+                value,
+                time,
+            )
+            if old
+            else StatAggregate(1, value, value, value, value, time)
+        )
+        if self._sample_limit:
+            if name not in self.samples:
+                self.samples[name] = deque(maxlen=self._sample_limit)
+            self.samples[name].append((time, value))

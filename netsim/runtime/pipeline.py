@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable
 from netsim import core
 from netsim.model import derive, srv6
 from netsim.model.interfaces import EthernetNode, PortChannelNode
-from netsim.model.network import published_failure
+from netsim.model.network import mark_published, published_failure
 from netsim.model.state import NetworkState, StateDelta
 
 ROUND_END = core.DEFERRED + 8
@@ -296,19 +296,29 @@ class Pipeline:
             return
         self.last_origins.append((kind.name, now, gen))
         self.last_origins = self.last_origins[-8:]
+        published = False
         try:
             try:
                 self.network.update(
                     lambda state: kind.run(state, now, due), ('kind', kind.name, gen)
                 )
             except Exception as observer_error:
-                if published_failure(observer_error) and kind.after_run is not None:
-                    kind.after_run(now, due)
+                published = published_failure(observer_error)
+                if published and kind.after_run is not None:
+                    try:
+                        kind.after_run(now, due)
+                    except Exception as finalization_error:
+                        raise ExceptionGroup(
+                            'publication observers and finalization failed',
+                            [observer_error, finalization_error],
+                        ) from None
                 raise
+            published = True
             if kind.after_run is not None:
                 kind.after_run(now, due)
         except Exception as error:
-            if published_failure(error):
+            if published or published_failure(error):
+                mark_published(error)
                 # Published: the claimed work is consumed exactly once; an
                 # observer failure is reported but never re-executes the run.
                 raise

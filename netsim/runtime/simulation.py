@@ -34,6 +34,7 @@ class Simulation:
         *,
         settle_delay: float = 0.0,
         event_budget: int | None = None,
+        stats_samples: int = 0,
         max_rounds_per_timestamp: int = 10_000,
         keep_roots: int | None = 256,
         keep_deltas: int = 64,
@@ -66,7 +67,7 @@ class Simulation:
             keep_reports=keep_reports,
         )
         self._failure_registry: LeaseRegistry | None = None
-        self.stats = Stats()
+        self.stats = Stats(samples=stats_samples)
         self.bus = EventBus(env, network)
         ref: dict[str, Any] = {}
         # Runtime-owned bands (Gate C): agents and transport keep their

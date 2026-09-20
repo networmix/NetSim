@@ -13,6 +13,9 @@ The runtime interface used by publication (``netsim.runtime.agents``):
 deliveries call back ``AgentRuntime.deliver``.
 
 Integration decisions:
+- Datagram admission uses only local eligibility/configuration. A dead wire
+  silently loses an admitted datagram, counted by budget.datagrams_lost_physical;
+  LINK_DOWN/RX_DOWN are never agent-visible rejections.
 - Accepted sends return None; rejected sends return and enqueue Rejection.
   Open returns its new integer connection id. Other lifecycle successes
   return None. Session operations publish through Network.update and must be
@@ -28,9 +31,20 @@ Integration decisions:
 - Sequence numbers start at zero independently in each direction. Admission
   accounts Message.size (modeled bytes), including in-flight messages. Inbox
   backpressure retains accepted messages until delivery or explicit timeout.
-- Derivation entity 0 is reserved for listener cleanup; real connection ids
-  start at 1. Closed connections remain observable in the immutable tree;
-  their runtime queues and timers are retired. Budget stale_events counts
+- Control notifications (SessionEvent/Rejection) must be admitted by C1's
+  bounded control allowance; False raises RuntimeError. Data inbox refusal
+  reports INBOX_FULL to the sender; admitted reliable messages remain queued.
+- C1 reads connections_of(device, agent, generation) and connection_counters(cid)
+  instead of scanning budget/the connection table. After a published receipt
+  consumes its captured prefix, C1 calls consumed(device, agent, generation,
+  captured_inbox); rejected receipts must not acknowledge entries.
+- Listener cleanup uses ('listeners', device) entities; integer connection
+  ids start at 1 (legacy maintenance entity 0 still handles all listeners).
+  set_down_retention(N), default 64, retains the last N DOWN records fully
+  consumed by both owners; removal/reset retires an owner's obligation.
+  Unconsumed DOWN events are never compacted. Excess records are removed in
+  the next TRANSPORT run. Their queues/timers are retired at DOWN regardless.
+  Budget stale_events counts
   inert scheduled shells; periodic heap compaction preserves engine ordering.
 """
 
@@ -86,6 +100,7 @@ class _Queued:
     message: c.Message
     seq: int
     release: float
+    inbox_reported: bool = False
 
 
 @dataclass(slots=True)
@@ -209,7 +224,7 @@ class TransportRuntime:
     a CONNECTING request is itself pending work and has the same timeout.
     """
 
-    def __init__(self, sim: Simulation) -> None:
+    def __init__(self, sim: Simulation, *, down_retention: int = 64) -> None:
         self.sim = sim
         self._kind = Kind(derive.TRANSPORT, COALESCE, self._run, self.affected)
         self._channels: dict[tuple[str, str, int, str, int], deque[_Datagram]] = {}
@@ -221,10 +236,18 @@ class TransportRuntime:
         self._sessions: dict[int, _Session] = {}
         self._indexed_transport: c.TransportState | None = None
         self._connection_deps: dict[int, tuple[str, ...]] = {}
+        self._connection_owners: dict[int, tuple[tuple[str, str, int], ...]] = {}
+        self._by_owner: dict[tuple[str, str, int], set[int]] = {}
         self._by_device: dict[str, set[int]] = {}
         self._listener_devices: dict[str, set[Any]] = {}
+        self._down_waiting: dict[int, dict[tuple[str, str, int], c.SessionEvent]] = {}
+        self._closed_ready: dict[int, None] = {}
+        self._compact_ids: set[int] = set()
+        self._down_retention = 0
+        self.set_down_retention(down_retention)
         self._inflight = 0
         self._dropped = 0
+        self._lost_physical = 0
         self._rejected = 0
         self._inbox_rejected = 0
         self._stale = 0
@@ -301,11 +324,17 @@ class TransportRuntime:
             generation=generation,
         )
         self._rejected += 1
-        if self._live(device, agent, generation) and not self.sim.agents.deliver(
-            device, agent, rejection
-        ):
-            self._inbox_rejected += 1
+        if self._live(device, agent, generation):
+            self._control(device, agent, rejection)
         return rejection
+
+    def _control(self, device: str, agent: str, entry: c.InboxEntry) -> None:
+        if not self.sim.agents.deliver(device, agent, entry):
+            self._inbox_rejected += 1
+            raise RuntimeError(
+                f'transport control inbox overflow: {device}/{agent} '
+                f'{type(entry).__name__}'
+            )
 
     def _listeners(self, device: str, port: int) -> tuple[tuple[str, int], ...]:
         agents = self.sim.network.state.devices[device].agents
@@ -338,22 +367,6 @@ class TransportRuntime:
                 'INTERFACE_DOWN',
                 interface=datagram.interface,
             )
-        candidates = wires(state, device, datagram.interface)
-        wire = None
-        reason = 'LINK_DOWN'
-        for candidate in candidates:
-            reason = candidate.blocked(state, family, effective=True)
-            if reason is None:
-                wire = candidate
-                break
-        if wire is None:
-            return self._reject(
-                device,
-                agent,
-                generation,
-                reason or 'LINK_DOWN',
-                interface=datagram.interface,
-            )
         address = (
             MacAddress(node.mac).link_local_int()
             if datagram.link_local
@@ -364,6 +377,19 @@ class TransportRuntime:
                 device, agent, generation, 'NO_SOURCE', interface=datagram.interface
             )
         config = state.devices[device].agents[agent].config
+        candidates = wires(state, device, datagram.interface)
+        wire = next(
+            (w for w in candidates if w.blocked(state, family, effective=True) is None),
+            None,
+        )
+        if wire is None:
+            # Admission is local. Raw link and remote receive failures are
+            # internal loss, including before carrier/hold detection.
+            if candidates:
+                future(self.sim.env.now, candidates[0].delay + config.processing_delay)
+            self._lost_physical += 1
+            self._dropped += 1
+            return None
         target = future(self.sim.env.now, wire.delay + config.processing_delay)
         key = device, agent, generation, datagram.interface, node.generation
         queue = self._channels.setdefault(key, deque())
@@ -396,16 +422,18 @@ class TransportRuntime:
                 del self._owners[owner]
         self._inflight -= 1
         state = self.sim.network.state
-        if (
-            not self._live(*key[:3])
-            or entry.wire.blocked(
-                state,
-                _datagram_family(interface(state, key[0], key[3]), entry.datagram),
-                effective=True,
-            )
-            is not None
-        ):
+        if not self._live(*key[:3]):
             self._dropped += 1
+            return
+        blocked = entry.wire.blocked(
+            state,
+            _datagram_family(interface(state, key[0], key[3]), entry.datagram),
+            effective=True,
+        )
+        if blocked is not None:
+            self._dropped += 1
+            if blocked != 'STALE_ENDPOINT':
+                self._lost_physical += 1
             return
         delivery = c.Delivery(
             self.sim.env.now,
@@ -425,10 +453,10 @@ class TransportRuntime:
                 else:
                     self._inbox_rejected += 1
                     overflow = True
-        if overflow:
-            self._reject(*key[:3], c.OVERFLOW, interface=key[3])
         if not delivered:
             self._dropped += 1
+        if overflow:
+            self._reject(*key[:3], 'INBOX_FULL', interface=key[3])
 
     def _cancel_datagrams(self, device: str, agent: str, generation: int) -> None:
         self._cancelled[device, agent] = max(
@@ -454,14 +482,27 @@ class TransportRuntime:
             return
         before = previous.connections if previous is not None else None
         after = transport.connections if transport is not None else None
-        for cid in diff_pmap(before, after).keys:
+        for cid in diff_pmap(before, after, by_identity=True).keys:
+            for owner in self._connection_owners.pop(cid, ()):
+                bucket = self._by_owner[owner]
+                bucket.remove(cid)
+                if not bucket:
+                    del self._by_owner[owner]
             for device in self._connection_deps.pop(cid, ()):
                 bucket = self._by_device[device]
                 bucket.remove(cid)
                 if not bucket:
                     del self._by_device[device]
             conn = after.get(cid) if after is not None else None
-            if conn is None or conn.state == c.DOWN:
+            if conn is None:
+                continue
+            owners = [(conn.a_device, conn.a_agent, conn.a_generation)]
+            if conn.b_device is not None and conn.b_agent is not None:
+                owners.append((conn.b_device, conn.b_agent, conn.b_generation))
+            self._connection_owners[cid] = tuple(sorted(set(owners)))
+            for owner in owners:
+                self._by_owner.setdefault(owner, set()).add(cid)
+            if conn.state == c.DOWN:
                 continue
             deps = set(conn.deps)
             deps.add(conn.a_device)
@@ -484,13 +525,104 @@ class TransportRuntime:
                 self._listener_devices.setdefault(new.device, set()).add(key)
         self._indexed_transport = transport
 
+    def connections_of(
+        self, device: str, agent: str, generation: int
+    ) -> tuple[int, ...]:
+        """Committed connection ids for one owner, including retained DOWN records."""
+        self._index(self.sim.network.state.transport)
+        return tuple(sorted(self._by_owner.get((device, agent, generation), ())))
+
+    def connection_counters(self, cid: int) -> tuple[dict[str, int], dict[str, int]]:
+        """Detached per-direction admission counts, without building a global budget."""
+        runtime = self._sessions.get(cid)
+        if runtime is None:
+            return ({'messages': 0, 'bytes': 0}, {'messages': 0, 'bytes': 0})
+        a, b = runtime.directions
+        return (
+            {'messages': len(a.queue), 'bytes': a.size},
+            {'messages': len(b.queue), 'bytes': b.size},
+        )
+
+    def set_down_retention(self, limit: int) -> None:
+        """Keep the last N fully acknowledged DOWN records (default 64).
+
+        Unconsumed notifications are never compacted. Call ``consumed`` only
+        after a successful receipt consumes its captured inbox prefix. Agent
+        removal/reset retires that generation's acknowledgement obligation.
+        Removal runs in the next TRANSPORT band; active sessions are unaffected.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError('DOWN retention must be a non-negative integer')
+        self._down_retention = limit
+        self._trim_closed()
+
+    def _trim_closed(self) -> None:
+        pending = set()
+        while len(self._closed_ready) > self._down_retention:
+            cid = next(iter(self._closed_ready))
+            del self._closed_ready[cid]
+            self._compact_ids.add(cid)
+            pending.add(('compact', cid))
+        if pending:
+            self.sim.pipeline.mark(self._kind, pending, self.sim.env.now)
+
+    def _acknowledged(self, cid: int) -> None:
+        if self._down_waiting.get(cid) == {}:
+            del self._down_waiting[cid]
+            self._closed_ready[cid] = None
+            self._trim_closed()
+
+    def consumed(
+        self,
+        device: str,
+        agent: str,
+        generation: int,
+        entries: tuple[c.InboxEntry, ...],
+    ) -> None:
+        """C1 publication hook: acknowledge DOWN entries in the consumed prefix."""
+        owner = device, agent, generation
+        for entry in entries:
+            if not isinstance(entry, c.SessionEvent) or entry.state != c.DOWN:
+                continue
+            waiting = self._down_waiting.get(entry.connection)
+            if waiting is not None and waiting.get(owner) is entry:
+                del waiting[owner]
+                self._acknowledged(entry.connection)
+
+    def _retire_owner(self, owner: tuple[str, str, int]) -> None:
+        for cid in self.connections_of(*owner):
+            self._retire_session(cid)
+            waiting = self._down_waiting.get(cid)
+            if waiting is not None:
+                waiting.pop(owner, None)
+                self._acknowledged(cid)
+            elif cid not in self._closed_ready and cid not in self._compact_ids:
+                # A fresh Simulation has no inboxes from the old runtime.
+                conn = self.sim.network.state.transport.connections[cid]
+                if conn.state == c.DOWN and not any(
+                    self._live(*key) for key in self._connection_owners.get(cid, ())
+                ):
+                    self._down_waiting[cid] = {}
+                    self._acknowledged(cid)
+
     def affected(self, delta: StateDelta, state: NetworkState) -> set[Any]:
         transport = state.transport
-        self._index(transport)
         if transport is None:
             return set()
+        out: set[Any] = set()
         if delta.transport_changed():
-            return set(transport.connections)
+            before = delta.old.transport
+            old = before.connections if before else None
+            diff = diff_pmap(old, transport.connections, by_identity=True)
+            out.update(diff.added + diff.changed)
+            old_listeners = before.listeners if before else None
+            for key in diff_pmap(
+                old_listeners, transport.listeners, by_identity=True
+            ).keys:
+                for listeners in (old_listeners, transport.listeners):
+                    listener = listeners.get(key) if listeners is not None else None
+                    if listener is not None:
+                        out.add(('listeners', listener.device))
         changed = set()
         devices = delta.devices()
         for name in devices.keys:
@@ -525,11 +657,14 @@ class TransportRuntime:
                 link = root.links.get(lid)
                 if link is not None:
                     changed.update((link.a[0], link.b[0]))
-        out: set[Any] = set()
+        # No bootstrap/snapshot walk for an unrelated agent-state delta.
+        if not changed:
+            return out
+        self._index(transport)
         for device in changed:
             out.update(self._by_device.get(device, ()))
-        if any(device in self._listener_devices for device in changed):
-            out.add(0)  # reserved maintenance entity; connection ids start at 1
+            if device in self._listener_devices:
+                out.add(('listeners', device))
         return out
 
     def _valid_side(
@@ -625,6 +760,14 @@ class TransportRuntime:
         if transport is None:
             return state
         connections = transport.connections
+        # Compaction is an explicit derivation input, not a mutable flag
+        # consulted while deriving ordinary connection reachability.
+        for cid in sorted(
+            e[1] for e in entities if isinstance(e, tuple) and e[0] == 'compact'
+        ):
+            old = connections.get(cid)
+            if old is not None and old.state == c.DOWN:
+                connections = connections.remove(cid)
         ids = (
             sorted(connections)
             if '*' in entities
@@ -636,8 +779,16 @@ class TransportRuntime:
                 new = self._derive(state, old)
                 if new is not old:
                     connections = connections.set(cid, new)
+        self._index(transport)
         listeners = transport.listeners
-        for key, listener in transport.listeners.items():
+        keys = set(listeners) if '*' in entities or 0 in entities else set()
+        for entity in entities:
+            if isinstance(entity, tuple) and entity[0] == 'listeners':
+                keys.update(self._listener_devices.get(entity[1], ()))
+        for key in sorted(keys):
+            listener = listeners.get(key)
+            if listener is None:
+                continue
             owner = _agent(state, listener.device, listener.agent)
             node = configured(state, listener.device, listener.endpoint)
             if (
@@ -810,6 +961,9 @@ class TransportRuntime:
         return None
 
     def _session_event(self, conn: c.ConnectionState) -> None:
+        errors = []
+        if conn.state == c.DOWN:
+            self._down_waiting[conn.id] = {}
         for device, agent, generation, local, remote, initiator in (
             (
                 conn.a_device,
@@ -829,27 +983,33 @@ class TransportRuntime:
             ),
         ):
             if (
-                device is not None
-                and agent is not None
-                and self._live(device, agent, generation)
+                device is None
+                or agent is None
+                or not self._live(device, agent, generation)
             ):
-                if local is not None and remote is not None and scoped(remote):
-                    remote = replace(remote, scope=local.scope)
-                if not self.sim.agents.deliver(
-                    device,
-                    agent,
-                    c.SessionEvent(
-                        self.sim.env.now,
-                        conn.id,
-                        conn.state,
-                        conn.reason,
-                        local,
-                        remote,
-                        initiator,
-                        generation=generation,
-                    ),
-                ):
-                    self._inbox_rejected += 1
+                continue
+            if local is not None and remote is not None and scoped(remote):
+                remote = replace(remote, scope=local.scope)
+            entry = c.SessionEvent(
+                self.sim.env.now,
+                conn.id,
+                conn.state,
+                conn.reason,
+                local,
+                remote,
+                initiator,
+                generation=generation,
+            )
+            if conn.state == c.DOWN:
+                self._down_waiting[conn.id][device, agent, generation] = entry
+            try:
+                self._control(device, agent, entry)
+            except Exception as error:
+                errors.append(error)
+        if conn.state == c.DOWN:
+            self._acknowledged(conn.id)
+        if errors:
+            raise errors[0]
 
     def _retire_session(self, cid: int) -> None:
         runtime = self._sessions.pop(cid, None)
@@ -878,20 +1038,42 @@ class TransportRuntime:
                 if before is not None and (
                     after is None or before.generation != after.generation
                 ):
-                    self._cancel_datagrams(device, name, before.generation)
+                    self.cancel_agent(device, name, before.generation)
+                    if self.sim.pipeline.suspended:
+                        # Fresh-runtime restart precedes pipeline dispatch.
+                        # Retained sessions still need their generation check.
+                        pending: set[Any] = set(
+                            self.connections_of(device, name, before.generation)
+                        )
+                        if device in self._listener_devices:
+                            pending.add(('listeners', device))
+                        self.sim.pipeline.mark(self._kind, pending, time)
             if new is None:
                 self._ports.pop(device, None)
         if not delta.transport_changed():
             return
-        old_transport = delta.old.transport
-        for cid, conn in delta.new.transport.connections.sorted_items():
-            before = old_transport.connections.get(cid) if old_transport else None
-            if before is conn:
+        old_transport, new_transport = delta.old.transport, delta.new.transport
+        old_connections = old_transport.connections if old_transport else None
+        new_connections = new_transport.connections if new_transport else None
+        errors = []
+        for cid in sorted(
+            diff_pmap(old_connections, new_connections, by_identity=True).keys
+        ):
+            conn = new_connections.get(cid) if new_connections is not None else None
+            before = old_connections.get(cid) if old_connections is not None else None
+            if conn is None:
+                self._retire_session(cid)
+                self._down_waiting.pop(cid, None)
+                self._closed_ready.pop(cid, None)
+                self._compact_ids.discard(cid)
                 continue
             if conn.state == c.DOWN:
                 self._retire_session(cid)
                 if before is None or before.state != c.DOWN:
-                    self._session_event(conn)
+                    try:
+                        self._session_event(conn)
+                    except Exception as error:
+                        errors.append(error)
                 continue
             runtime = self._sessions.setdefault(cid, _Session())
             if conn.state == c.CONNECTING:
@@ -926,7 +1108,10 @@ class TransportRuntime:
                 self._cancel(runtime.timer)
                 runtime.timer = None
                 if before is None or before.state != c.ESTABLISHED:
-                    self._session_event(conn)
+                    try:
+                        self._session_event(conn)
+                    except Exception as error:
+                        errors.append(error)
                 for side in (0, 1):
                     reachable = (
                         conn.a_to_b_reachable if side == 0 else conn.b_to_a_reachable
@@ -938,6 +1123,8 @@ class TransportRuntime:
                         direction.stalled = True
                     else:
                         self._kick(conn, side)
+        if errors:
+            raise errors[0]
 
     def _handshake(self, cid: int, expected: c.Listener | None) -> None:
         conn = self.sim.network.state.transport.connections[cid]
@@ -1098,6 +1285,15 @@ class TransportRuntime:
             if not self.sim.agents.deliver(device, agent, entry):
                 self._inbox_rejected += 1
                 direction.stalled = True
+                if not queued.inbox_reported:
+                    queued.inbox_reported = True
+                    self._reject(
+                        conn.a_device if side == 0 else conn.b_device,
+                        conn.a_agent if side == 0 else conn.b_agent,
+                        conn.a_generation if side == 0 else conn.b_generation,
+                        'INBOX_FULL',
+                        connection=cid,
+                    )
                 break  # accepted data stays admitted; retry until timeout
             direction.queue.popleft()
             direction.size -= queued.message.size
@@ -1128,13 +1324,13 @@ class TransportRuntime:
             # change), so the tree edit is left to its run. Retire runtime
             # events now: a same-time NORMAL timeout may precede that band.
             self._index(transport)
-            for cid in sorted(self._by_device.get(device, ())):
-                conn = transport.connections[cid]
-                if self._direction(conn, device, agent, generation) is not None:
-                    self._retire_session(cid)
+            self._retire_owner((device, agent, generation))
             return
+        self._index(transport)
+        self._retire_owner((device, agent, generation))
         listeners = transport.listeners
-        for key, listener in transport.listeners.items():
+        for key in sorted(self._listener_devices.get(device, ())):
+            listener = listeners[key]
             if (listener.device, listener.agent, listener.generation) == (
                 device,
                 agent,
@@ -1142,11 +1338,9 @@ class TransportRuntime:
             ):
                 listeners = listeners.remove(key)
         connections = transport.connections
-        for cid, conn in connections.items():
-            if (
-                conn.state != c.DOWN
-                and self._direction(conn, device, agent, generation) is not None
-            ):
+        for cid in self.connections_of(device, agent, generation):
+            conn = connections[cid]
+            if conn.state != c.DOWN:
                 connections = connections.set(
                     cid,
                     replace(
@@ -1175,6 +1369,7 @@ class TransportRuntime:
         return {
             'inflight_datagrams': self._inflight,
             'datagrams_dropped': self._dropped,
+            'datagrams_lost_physical': self._lost_physical,
             'rejections': self._rejected,
             'inbox_rejections': self._inbox_rejected,
             'queued_messages': messages,
@@ -1183,6 +1378,9 @@ class TransportRuntime:
             'scheduled_events': self._scheduled,
             'stale_events': self._stale,
             'compacted_events': self._compacted,
+            'down_awaiting_consumption': len(self._down_waiting),
+            'down_retained': len(self._closed_ready),
+            'down_pending_compaction': len(self._compact_ids),
         }
 
 

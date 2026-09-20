@@ -69,6 +69,15 @@ class SubscriptionIndex:
         def visit(branch: _Branch, before: Any, after: Any, path: Path) -> None:
             if before is after:
                 return
+            # Opaque state is identity-compared, including descendant paths:
+            # replacing it invalidates the subtree without walking its leaves.
+            if (
+                len(path) == 3
+                and path[0] == 'agents'
+                and path[2] in ('state', 'srdb_view')
+            ):
+                invalidate(branch, path)
+                return
             if (
                 before is None
                 or after is None
