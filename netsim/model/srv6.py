@@ -1239,18 +1239,22 @@ def require_valid(state: NetworkState) -> None:
 
 
 def consumers_affected(old: NetworkState, new: NetworkState) -> set[str]:
-    """Conservatively invalidate every policy consumer for SR/underlay edits.
+    """Invalidate consumers using recorded device dependencies where complete.
 
-    Includes failed lookups: a formerly missing SID, interface or route can
-    appear anywhere. Derived policy *states* and FIB outputs are excluded to
-    prevent self-triggering FIB rounds. G3 may record positive and negative
-    SID queries (device, SID), symbolic queries (device, interface/behavior),
-    policy keys and RIB lookups; no dependency is needed to use this fallback.
+    RIB/neighbor lookups (including misses) and loopback/endpoint observations
+    name their consulted devices. Changes on other devices cannot alter those
+    answers. Keep the global fallback for SID inventory (literal lookup scans
+    all owners), links, device configuration/lifecycle, non-loopback interfaces
+    (peer/bundle lookup reads both endpoints), and policy inputs. Missing
+    validation records also take the fallback. Derived policy/FIB outputs do
+    not feed back into validation.
     """
+    from netsim.model.interfaces import LoopbackNode
     from netsim.model.state import diff_pmap
 
     delta = diff_pmap(old.devices, new.devices, by_identity=True)
-    changed = bool(delta.added or delta.removed or old.links != new.links)
+    global_change = bool(delta.added or delta.removed or old.links != new.links)
+    scoped_devices: set[str] = set()
     view_consumers: set[str] = set()
     for name in delta.changed:
         a, b = old.devices[name], new.devices[name]
@@ -1267,18 +1271,49 @@ def consumers_affected(old: NetworkState, new: NetworkState) -> set[str]:
                     view_consumers.add(name)
         if (
             a.srv6_sids != b.srv6_sids
-            or a.interfaces != b.interfaces
-            or a.neighbors != b.neighbors
-            or a.ribs != b.ribs
             or a.config != b.config
+            or policy_inputs(a.srv6_policies) != policy_inputs(b.srv6_policies)
         ):
-            changed = True
-        pa, pb = a.srv6_policies, b.srv6_policies
-        if policy_inputs(pa) != policy_inputs(pb):
-            changed = True
-    if not changed:
+            global_change = True
+        if a.interfaces != b.interfaces:
+            changes = diff_pmap(a.interfaces, b.interfaces)
+            if all(
+                isinstance(node, LoopbackNode)
+                for interface in changes.keys
+                for node in (a.interfaces.get(interface), b.interfaces.get(interface))
+                if node is not None
+            ):
+                scoped_devices.add(name)
+            else:
+                global_change = True
+        if a.neighbors != b.neighbors or a.ribs != b.ribs:
+            scoped_devices.add(name)
+    if not (global_change or scoped_devices):
         return view_consumers
-    return set(consumer_index(old, new)) | view_consumers
+    consumers = consumer_index(old, new)
+    if global_change:
+        return set(consumers) | view_consumers
+    return view_consumers | {
+        name for name in consumers if _uses_devices(new.devices[name], scoped_devices)
+    }
+
+
+def _uses_devices(dev: DeviceState, changed: set[str]) -> bool:
+    # Local FIB programs capture device inputs beyond the validation record.
+    if dev.name in changed:
+        return True
+    table = dev.srv6_policies
+    if table is None:
+        return False
+    for key in table.policies:
+        result = table.states.get(key)
+        if result is None or not result.dependencies:
+            return True
+        # Keep all recorded kinds, including negative and learned-view queries:
+        # this deliberately over-invalidates rather than infer missing scopes.
+        if any(device in changed for device, _, _, _ in result.dependencies):
+            return True
+    return False
 
 
 def consumer_index(old: NetworkState, new: NetworkState) -> frozenset[str]:
