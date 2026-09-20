@@ -32,3 +32,6 @@ htmlcov/
 
 # Personal Superset lifecycle overrides
 .superset/config.local.json
+
+# Local experiment output (not part of the package)
+output/

@@ -390,3 +390,45 @@ class TestScc:
         cycle[str(n - 1)] = ['0']
         comps = flows._tarjan(nodes, cycle)
         assert len(comps) == 1 and len(comps[0]) == n
+
+
+class TestTinyRates:
+    def test_tiny_rate_alone_is_conserved(self):
+        net, R = build_diamond()
+        net.add_demand('tiny', 'R1', '10.0.0.4', 1e-8)
+        net.converge()
+        r = net.placement
+        assert r.demands['tiny'].delivered == pytest.approx(1e-8, rel=1e-9)
+        assert r.demands['tiny'].drops == ()
+
+    def test_mixed_magnitudes_keep_every_share(self):
+        net, R = build_diamond()
+        net.add_demand('big', 'R1', '10.0.0.4', 1e8)
+        net.add_demand('tiny', 'R1', '10.0.0.4', 1e-8)
+        net.add_demand('mid', 'R3', '10.0.0.4', 3.0)
+        net.converge()
+        r = net.placement
+        for name, rate in (('big', 1e8), ('tiny', 1e-8), ('mid', 3.0)):
+            d = r.demands[name]
+            assert d.delivered + sum(x[2] for x in d.drops) == pytest.approx(
+                rate, rel=1e-9
+            )
+        assert r.delivered_total == pytest.approx(1e8 + 1e-8 + 3.0)
+
+    def test_lossy_tiny_share_is_not_rounded_away(self):
+        net, R = build_diamond()
+        net.set_capacity_model(LOSSY)
+        net.add_demand(
+            'hog', 'R1', '10.0.0.3', 100e6, priority=1
+        )  # fills the 100 Mbit/s link
+        net.add_demand(
+            'tiny', 'R1', '10.0.0.3', 1e-3, priority=0
+        )  # 1e-11 of the residual
+        net.converge()
+        r = net.placement
+        tiny = r.demands['tiny']
+        assert tiny.delivered + sum(x[2] for x in tiny.drops) == pytest.approx(
+            1e-3, rel=1e-9
+        )
+        hog = r.demands['hog']
+        assert hog.delivered + sum(x[2] for x in hog.drops) == pytest.approx(100e6)

@@ -293,6 +293,21 @@ def _egress_edges(
     return fw.TRANSMIT, entry, edges, drops
 
 
+def _bounded_fraction(value: float) -> Fraction:
+    """The exact fraction of a non-negative float (floats are dyadic
+    rationals, so this is always representable). Nothing is rounded to a
+    coarse denominator: a tiny share beside a large one stays nonzero and
+    per-demand conservation holds to floating-point precision."""
+    exact = Fraction(value)
+    return exact if exact > 0 else Fraction(0)
+
+
+def _share(rate: float, total: Fraction) -> Fraction:
+    """``rate / total`` as an exact fraction; the shares of one class sum to
+    exactly one when *total* is the exact sum of the rates."""
+    return Fraction(rate) / total if total > 0 else Fraction(0)
+
+
 def _edge_loc(edge_id: int) -> str:
     """Drop location for a directed edge; device names cannot contain ``:``."""
     return f'edge:{edge_id}'
@@ -429,9 +444,9 @@ def walk_class(
                     attempted = float(share) * scale * wire_per_payload
                     if attempted > wire_cap:
                         carried_share = (
-                            Fraction(
+                            _bounded_fraction(
                                 max(wire_cap, 0.0) / (scale * wire_per_payload)
-                            ).limit_denominator(1_000_000)
+                            )
                             if scale > 0
                             else Fraction(0)
                         )
@@ -670,15 +685,14 @@ def derive_placement(
         for key in sorted(groups):
             members = groups[key]
             sources: dict[str, Fraction] = defaultdict(Fraction)
-            total = sum(d.rate for d in members)
-            if total <= 0:
+            exact_total = sum((Fraction(d.rate) for d in members), Fraction(0))
+            total = float(exact_total)
+            if exact_total <= 0:
                 for d in members:
                     account(d, {}, {}, 0.0, {})
                 continue
             for d in members:
-                sources[d.source] += Fraction(d.rate).limit_denominator(
-                    1_000_000
-                ) / Fraction(total).limit_denominator(1_000_000)
+                sources[d.source] += _share(d.rate, exact_total)
             cached = previous.classes.get(key) if previous is not None else None
             src_items = tuple(sorted(sources.items()))
             if (
