@@ -265,22 +265,11 @@ def test_seven_csids_consume_two_containers_and_pop_at_sixth(af):
     assert trace.hops[-1].packet == packet
 
 
-@pytest.mark.parametrize(
-    'numbered',
-    [
-        True,
-        pytest.param(
-            False,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason='netsim/model/routing.py:603 _substitute replaces an unnumbered '
-                'locator peer adjacency with the remote SID neighbor lookup; encap '
-                'route becomes UNRESOLVED and falls back to plain IP (G5 owns routing)',
-            ),
-        ),
-    ],
-)
-def test_composite_routes_to_node_but_same_bare_function_executes_at_ingress(numbered):
+@pytest.mark.parametrize('numbered', [True, False])
+@pytest.mark.parametrize('af', [4, 6])
+def test_composite_routes_to_node_but_same_bare_function_executes_at_ingress(
+    numbered, af
+):
     net, _ = diamond(numbered=numbered)
     local = ua(net, 1, 3, '5f00:0:e002::')
     remote = ua(net, 2, 4, '5f00:0:e002::')
@@ -288,12 +277,23 @@ def test_composite_routes_to_node_but_same_bare_function_executes_at_ingress(num
     un(net, 2)  # /64 composite must beat this local /48 End.
     last = un(net, 4, flavors=sr.USD)
     assert local.sid == remote.sid != composite.sid
-    packet = inner_template().to_packet()
+    packet = inner_template(af).to_packet()
     for first, expected_path, first_da, limits in (
         (local, ('R1', 'R3', 'R4'), '5f00:0:4::', [63, 62]),
         (composite, ('R1', 'R2', 'R4'), '5f00:0:2:e002:4::', [64, 63]),
     ):
         encap = install_path(net, (first, last))
+        fib = net['R1'].fib(af)
+        entry = fib.lookup(packet.dst)
+        (leg,) = fib.group(entry).adjacencies
+        assert leg.encap == encap
+        if first == composite:
+            assert (6, ip('5f00:0:2::'), 48) in entry.depends_on.prefixes
+            assert (6, encap.entries[0]) in entry.depends_on.lookups
+            if not numbered:
+                assert leg.nexthop is None
+                assert leg.mac == net['R2']['toR1'].mac
+                assert net.view('R1').neighbor_mac('toR2', encap.entries[0]) is None
         trace = net.trace('R1', packet)
         assert trace == interpreted_trace(net, packet, encap)
         assert (trace.outcome, trace.path) == (fw.DELIVER, expected_path)
