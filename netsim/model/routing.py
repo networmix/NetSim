@@ -19,12 +19,14 @@ from typing import Any, Iterator, Protocol
 from netsim.model.addressing import IPV4, IPV6, mask_for
 from netsim.model.contracts import ClientId
 from netsim.model.forwarding import (
+    CROSS_CONNECT,
     DROP_ACTIONS,
     DROP_BLACKHOLE,
     DROP_PROHIBIT,
     DROP_UNREACHABLE,
     FORWARD,
     RECEIVE,
+    RELOOKUP,
     SRV6_LOCAL,
     Adjacency,
     DependsOn,
@@ -32,8 +34,11 @@ from netsim.model.forwarding import (
     FibEntry,
     NexthopGroup,
     Prefix,
+    local_sid,
 )
 from netsim.model.lpm import FrozenPrefixTable, PrefixTable
+from netsim.model.packets import IPv4Packet, IPv6Packet, encapsulate
+from netsim.model.srv6 import LocalSid, Srv6Encap
 from netsim.model.state import PMap, PMapBuilder, empty_pmap, record
 
 # Special next-hops (RFC 8349 special-next-hop plus SRv6 local behaviours).
@@ -465,7 +470,13 @@ class _Resolver:
             if len(specials) > 1:
                 return None, (), AMBIGUOUS_ACTION
             action = _SPECIAL_ACTION[next(iter(specials))]
-            entry = FibEntry(prefix, action, None, contributing, self._deps())
+            sid = None
+            if action == SRV6_LOCAL:
+                sids = {nh.behavior for nh in nexthops if nh.special == SRV6_LOCAL_NH}
+                if len(sids) != 1 or not isinstance(next(iter(sids)), LocalSid):
+                    return None, (), AMBIGUOUS_ACTION
+                sid = next(iter(sids))
+            entry = FibEntry(prefix, action, None, contributing, self._deps(), sid=sid)
             return entry, (), None
         legs: list[_Leg] = []
         unresolved = 0
@@ -493,6 +504,24 @@ class _Resolver:
 
     def _resolve_nexthop(self, af: int, nh: Nexthop) -> tuple[_Leg, ...]:
         ctx = self.ctx
+        if isinstance(nh.srv6, Srv6Encap):
+            try:
+                packet = encapsulate(
+                    IPv4Packet(0, 0, 17),
+                    nh.srv6.entries,
+                    behavior=nh.srv6.behavior,
+                    source=0,
+                    hop_limit=255,
+                    flow_label=0,
+                    transit=False,
+                )
+            except ValueError:
+                return ()
+            return tuple(
+                _Leg(leg.interface, leg.nexthop, leg.mac, leg.share, nh.srv6, leg.af)
+                for leg in self._resolve_outer(packet, set())
+                if leg.encap is None  # Gate B rejects nested encapsulation.
+            )
         if nh.interface is not None:
             self.frames[-1].interfaces.add(nh.interface)
             if not ctx.interface_exists(nh.interface) or not ctx.l3_usable(
@@ -512,6 +541,70 @@ class _Resolver:
             assert nh.af is not None
             return self._resolve_recursive(nh.af, nh.address)
         return ()
+
+    def _resolve_outer(
+        self,
+        packet: IPv6Packet,
+        visited: set[tuple[int, int]],
+    ) -> tuple[_Leg, ...]:
+        """Resolve the first wire entry, executing this device's local SIDs.
+
+        The same pure local_sid function runs on received packets. End.X
+        resolves its bound adjacency directly; End looks up its updated DA.
+        Every lookup, including failed queries, enters the dependency frame.
+        """
+        address = packet.dst
+        sl = packet.srh.segments_left if packet.srh is not None else -1
+        if (address, sl) in visited:
+            return ()
+        visited.add((address, sl))
+        self.frames[-1].lookups.add((IPV6, address))
+        rib = self.ctx.rib(IPV6)
+        min_len = 0 if self.policy.resolve_via_default else 1
+        for net, plen, _ in rib.prefixes.lookup_iter(
+            address,
+            min_len=min_len,
+            exclude=lambda net, plen: (IPV6, (net, plen)) in self.stack,
+        ):
+            entry, legs = self.resolve_prefix(IPV6, (net, plen))
+            if entry is None:
+                if self.policy.lpm_fallthrough:
+                    continue
+                return ()
+            if entry.action == SRV6_LOCAL:
+                result = local_sid(packet, entry.sid)
+                if result.action == CROSS_CONNECT:
+                    assert result.adjacency is not None
+                    adj = result.adjacency
+                    return self._resolve_nexthop(
+                        IPV6,
+                        Nexthop.via(adj.interface, adj.nexthop, IPV6),
+                    )
+                if result.action == RELOOKUP and isinstance(result.packet, IPv6Packet):
+                    return self._resolve_outer(result.packet, visited)
+                # A terminal first entry has no outer egress to compile.
+                return ()
+            if entry.action != FORWARD:
+                return ()
+            return self._substitute(IPV6, address, legs)
+        return ()
+
+    def _substitute(
+        self,
+        af: int,
+        address: int,
+        legs: tuple[_Leg, ...],
+    ) -> tuple[_Leg, ...]:
+        out = []
+        for leg in legs:
+            if leg.nexthop is None and leg.encap is None:
+                mac = self.ctx.neighbor_mac(leg.interface, address)
+                if mac is None:
+                    continue
+                out.append(_Leg(leg.interface, address, mac, leg.share, af=af))
+            else:
+                out.append(leg)
+        return tuple(out)
 
     def _resolve_recursive(self, af: int, address: int) -> tuple[_Leg, ...]:
         rib = self.ctx.rib(af)
@@ -536,20 +629,7 @@ class _Resolver:
                 return ()
             if entry.action != FORWARD:
                 return ()
-            out: list[_Leg] = []
-            for leg in legs:
-                if leg.nexthop is None:
-                    # On-link substitution: a connected (interface-only) leg means
-                    # the address itself is directly attached.
-                    mac = self.ctx.neighbor_mac(leg.interface, address)
-                    if mac is None:
-                        continue
-                    out.append(
-                        _Leg(leg.interface, address, mac, leg.share, leg.encap, af=af)
-                    )
-                else:
-                    out.append(leg)
-            return tuple(out)
+            return self._substitute(af, address, legs)
         return ()
 
     def _deps(self) -> DependsOn:
@@ -585,6 +665,18 @@ def _nh_sort_key(nh: Nexthop) -> tuple:
         nh.interface or '',
         nh.address if nh.address is not None else -1,
         nh.weight,
+        _encap_sort_key(nh.srv6),
+    )
+
+
+def _encap_sort_key(encap: Any) -> tuple:
+    if not isinstance(encap, Srv6Encap):
+        return ()
+    return (
+        encap.entries,
+        encap.behavior,
+        encap.source if encap.source is not None else -1,
+        encap.policy if encap.policy is not None else (),
     )
 
 
@@ -610,6 +702,7 @@ def _merge(legs: list[_Leg]) -> tuple[_Leg, ...]:
             key=lambda leg: (
                 leg.interface,
                 leg.nexthop if leg.nexthop is not None else -1,
+                _encap_sort_key(leg.encap),
             ),
         )
     )
@@ -676,7 +769,10 @@ def resolve_fib(
             finals.append((prefix, entry))
     ordered = sorted(
         adjacency_tuples,
-        key=lambda adjs: tuple((a.interface, a.nexthop or -1, a.weight) for a in adjs),
+        key=lambda adjs: tuple(
+            (a.interface, a.nexthop or -1, a.weight, _encap_sort_key(a.encap))
+            for a in adjs
+        ),
     )
     group_ids = {adjs: i for i, adjs in enumerate(ordered)}
     groups: dict[int, NexthopGroup] = {

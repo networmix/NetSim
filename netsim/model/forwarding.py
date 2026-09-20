@@ -92,6 +92,8 @@ class FibEntry:
     depends_on: DependsOn = field(default_factory=DependsOn)
     program: Any = None
     """SR action program (Gate B); ``None`` for plain forwarding."""
+    sid: Any = field(default=None, repr=False)
+    """LocalSid for SRV6_LOCAL; hidden from repr to preserve plain-IP fingerprints."""
 
 
 @record
@@ -133,8 +135,14 @@ class NeighborTable:
 
 from typing import Protocol  # noqa: E402
 
-from netsim.model.hashing import BalancerKind, LoadBalancer  # noqa: E402
+from netsim.model.hashing import (  # noqa: E402
+    BalancerKind,
+    LoadBalancer,
+    flow_label_for,
+)
 from netsim.model.packets import (  # noqa: E402
+    AFTER_DECAP,
+    AFTER_ENCAP,
     ETHERTYPE_IPV4,
     ETHERTYPE_IPV6,
     ORIGINATED,
@@ -144,13 +152,36 @@ from netsim.model.packets import (  # noqa: E402
     IPPacket,
     IPv4Packet,
     IPv6Packet,
+    decapsulate,
+    encapsulate,
     ip_bytes,
+    validate_chain,
 )
 
 TRANSMIT = 'TRANSMIT'
 DELIVER = 'DELIVER'
 DROP = 'DROP'
 SRV6_UNSUPPORTED = 'SRV6_UNSUPPORTED'
+
+from netsim.model.srv6 import (  # noqa: E402
+    END,
+    END_DT46,
+    END_X,
+    NEXT_CSID,
+    PSP,
+    SID_UNKNOWN,
+    SRH_MALFORMED,
+    SRH_SL_NONZERO,
+    UPPER_LAYER_NOT_ALLOWED,
+    USD,
+    LocalSid,
+    Srv6Encap,
+)
+from netsim.model.srv6_compress import csid_arg, shift_csid  # noqa: E402
+
+RELOOKUP = 'RELOOKUP'
+CROSS_CONNECT = 'CROSS_CONNECT'
+DECAP_LOOKUP = 'DECAP_LOOKUP'
 
 
 class DeviceView(Protocol):
@@ -196,6 +227,134 @@ class StepResult:
     mac_src: int | None = None
 
 
+@record
+class SidResult:
+    """A pure local action's explicit continuation, shared with the resolver."""
+
+    action: str
+    packet: IPPacket | None = None
+    adjacency: Adjacency | None = None
+    reason: str | None = None
+
+
+def local_sid(packet: IPPacket, sid: LocalSid | None) -> SidResult:
+    """RFC 8986 sections 4.1, 4.2, 4.8, 4.16; RFC 9800 section 4.1.
+
+    Does no FIB, neighbor or interface lookup. In particular End.X returns
+    CROSS_CONNECT even if its updated DA matches another local SID.
+    """
+    if validate_chain(packet) is not None or not isinstance(packet, IPv6Packet):
+        return SidResult(DROP, reason=SRH_MALFORMED)
+    if sid is None or sid.behavior not in (END, END_X, END_DT46):
+        return SidResult(DROP, reason=SRV6_UNSUPPORTED)
+    if sid.flavors & ~(PSP | USD | NEXT_CSID) or (
+        sid.behavior == END_DT46 and sid.flavors & (PSP | USD)
+    ):
+        return SidResult(DROP, reason=SRV6_UNSUPPORTED)
+    cross = sid.behavior == END_X
+    adjacency = (
+        Adjacency(sid.interface, sid.nexthop, None, af=6)
+        if cross and sid.interface is not None
+        else None
+    )
+    if cross and adjacency is None:
+        return SidResult(DROP, reason=ADJ_UNRESOLVED)
+    if sid.flavors & NEXT_CSID:
+        # RFC 9800 section 4.1.1 N01-N09 runs even without an SRH, before SL.
+        try:
+            arg = csid_arg(packet.dst, sid.structure)
+        except ValueError:
+            return SidResult(DROP, reason=SRH_MALFORMED)
+        if arg:
+            if sid.behavior == END_DT46:
+                return SidResult(DROP, reason=SRH_MALFORMED)
+            if packet.hop_limit <= 1:
+                return SidResult(DROP, reason=TTL_EXPIRED)
+            try:
+                da, _ = shift_csid(packet.dst, sid.structure)
+            except ValueError:
+                return SidResult(DROP, reason=SRH_MALFORMED)
+            packet = dataclasses.replace(packet, dst=da, hop_limit=packet.hop_limit - 1)
+            return SidResult(CROSS_CONNECT if cross else RELOOKUP, packet, adjacency)
+    srh = packet.srh
+    sl = 0 if srh is None else srh.segments_left
+    if sid.behavior == END_DT46:
+        if sl != 0:
+            return SidResult(DROP, reason=SRH_SL_NONZERO)
+    elif sl != 0:
+        assert srh is not None
+        if packet.hop_limit <= 1:
+            return SidResult(DROP, reason=TTL_EXPIRED)
+        # RFC 8754 section 4.3.1 permits reduced SRH SL = LE + 1.
+        sl -= 1
+        pop = sl == 0 and bool(sid.flavors & PSP)
+        packet = dataclasses.replace(
+            packet,
+            dst=srh.entries[sl],
+            hop_limit=packet.hop_limit - 1,
+            srh=None if pop else dataclasses.replace(srh, segments_left=sl),
+            next_header=srh.next_header if pop else packet.next_header,
+        )
+        return SidResult(CROSS_CONNECT if cross else RELOOKUP, packet, adjacency)
+    elif not sid.flavors & USD:
+        return SidResult(DROP, reason=UPPER_LAYER_NOT_ALLOWED)
+    try:
+        inner = decapsulate(packet)
+    except ValueError as error:
+        return SidResult(DROP, reason=str(error))
+    return SidResult(CROSS_CONNECT if cross else DECAP_LOOKUP, inner, adjacency)
+
+
+def steer(
+    view: DeviceView,
+    packet: IPPacket,
+    ingress: str | None,
+    stage: int,
+) -> Srv6Encap | None:
+    """Gate B2 extension point; called once on ingress and after decapsulation."""
+    return None
+
+
+def srv6_settings(view: DeviceView, encap: Srv6Encap) -> tuple[int | None, int, int]:
+    """Read the immutable view's SR source, hop limit and domain hash seed.
+
+    G1's _View owns ``dev`` and ``state``. Keeping this adapter here avoids
+    editing network.py while the other slice extends its view API.
+    """
+    from netsim.model.interfaces import LoopbackNode
+
+    dev = getattr(view, 'dev', None)
+    config = getattr(dev, 'config', None)
+    source = (
+        encap.source
+        if encap.source is not None
+        else getattr(config, 'srv6_source', None)
+    )
+    if source is None and dev is not None:
+        candidates = [
+            addr[0]
+            for _, node in dev.interfaces.sorted_items()
+            if isinstance(node, LoopbackNode)
+            for addr in node.config.ipv6
+        ]
+        source = min(candidates) if candidates else None
+    # _View currently exposes no network seed. The default label domain is 0;
+    # an extended view can supply flow_label_seed without using the device's
+    # independent ECMP seed (which would change a flow's label between headends).
+    seed = getattr(view, 'flow_label_seed', 0)
+    return source, getattr(config, 'srv6_hop_limit', 64), seed
+
+
+def _bind_adjacency(view: DeviceView, adj: Adjacency) -> Adjacency:
+    if adj.nexthop is not None:
+        mac = view.neighbor_mac(adj.interface, adj.nexthop)
+    else:
+        dev = getattr(view, 'dev', None)
+        neighbors = getattr(dev, 'neighbors', None)
+        mac = neighbors.peer_mac(adj.interface) if neighbors is not None else None
+    return dataclasses.replace(adj, mac=mac)
+
+
 def _l3_usable(node: Any, af: int) -> bool:
     from netsim.model.interfaces import l3_usable
 
@@ -233,45 +392,132 @@ def live_legs(
 
 
 def forward_ip(
-    view: DeviceView, packet: IPPacket, ingress: str | None, stage: int
+    view: DeviceView,
+    packet: IPPacket,
+    ingress: str | None,
+    stage: int,
+    *,
+    encap: Srv6Encap | None = None,
 ) -> StepResult:
-    """LOOKUP → TTL → SELECT_GROUP → MTU → SELECT_MEMBER → TRANSMIT."""
+    """Execute the action program, shared by trace and Simulation.send.
+
+    ``encap`` supplies an uncompiled ENCAP action (also useful to steering).
+    Compiled FIB legs retain the same Srv6Encap and execute its transformations
+    before selecting a resolved leg using the resulting outer flow key.
+    """
+    compiled: NexthopGroup | None = None
+    sr = stage in (AFTER_ENCAP, AFTER_DECAP) or (
+        isinstance(packet, IPv6Packet)
+        and (
+            packet.srh is not None
+            or isinstance(packet.payload, (IPv4Packet, IPv6Packet))
+        )
+    )
+    do_steer = stage in (ORIGINATED, TRANSIT, AFTER_DECAP)
+    # Bounds same-device ENCAP -> DECAP -> ENCAP cycles independently of TTL.
+    for _ in range(256):
+        if do_steer:
+            if encap is None:
+                encap = steer(view, packet, ingress, stage)
+            do_steer = False
+        if encap is not None:
+            sr = True
+            try:
+                source, hop_limit, seed = srv6_settings(view, encap)
+                if source is None:
+                    return StepResult(DROP, NO_SOURCE)
+                packet = encapsulate(
+                    packet,
+                    encap.entries,
+                    behavior=encap.behavior,
+                    source=source,
+                    hop_limit=hop_limit,
+                    flow_label=flow_label_for(FlowKey.from_packet(packet), seed),
+                    transit=stage == TRANSIT,
+                )
+            except ValueError as error:
+                return StepResult(DROP, str(error))
+            stage = AFTER_ENCAP
+            encap = None
+        af = 4 if isinstance(packet, IPv4Packet) else 6
+        fib = view.fib(af)
+        entry = fib.lookup(packet.dst) if fib is not None else None
+        if entry is None:
+            return StepResult(DROP, NO_ROUTE)
+        if entry.action == RECEIVE:
+            return StepResult(DELIVER, packet=packet)
+        if entry.action in DROP_ACTIONS:
+            reason = ACTION_DROP_REASON[entry.action]
+            if entry.action == DROP_UNREACHABLE and any(
+                row[2].name == 'srv6-local' for row in entry.contributing
+            ):
+                reason = SID_UNKNOWN
+            return StepResult(DROP, reason)
+        if entry.action == SRV6_LOCAL:
+            sr = True
+            result = local_sid(packet, entry.sid)
+            if result.action in (DROP, DELIVER):
+                return StepResult(result.action, result.reason, packet=result.packet)
+            assert result.packet is not None
+            packet = result.packet
+            if result.action == CROSS_CONNECT:
+                assert result.adjacency is not None
+                return _transmit(
+                    view, packet, _bind_adjacency(view, result.adjacency), sr=True
+                )
+            if result.action == DECAP_LOOKUP:
+                stage, compiled, do_steer = AFTER_DECAP, None, True
+            else:
+                stage = AFTER_ENCAP  # local behavior already paid its hop-limit cost
+            continue
+        group = compiled if compiled is not None else fib.group(entry) if fib else None
+        if group is None or not group.adjacencies:
+            return StepResult(DROP, NO_ROUTE)
+        if compiled is None and any(a.encap is not None for a in group.adjacencies):
+            # Gate B1 has one list; choose distinct transformations before underlay
+            # ECMP. The per-flow/policy slice can supply weighted list choice here.
+            choices = tuple(dict.fromkeys(a.encap for a in group.adjacencies))
+            if len(choices) != 1 or not isinstance(choices[0], Srv6Encap):
+                return StepResult(DROP, SRV6_UNSUPPORTED)
+            encap = choices[0]
+            compiled = group
+            continue
+        # RFC 1812 section 4.2.2.9: transit only, never after local SID or decap.
+        if stage == TRANSIT:
+            ttl = packet.ttl if isinstance(packet, IPv4Packet) else packet.hop_limit
+            if ttl <= 1:
+                return StepResult(DROP, TTL_EXPIRED)
+            packet = (
+                dataclasses.replace(packet, ttl=ttl - 1)
+                if isinstance(packet, IPv4Packet)
+                else dataclasses.replace(packet, hop_limit=ttl - 1)
+            )
+        key = FlowKey.from_packet(packet)
+        legs, weights = live_legs(view, group, af)
+        adj = legs[view.load_balancer(BalancerKind.ECMP).select(key, weights)]
+        return _transmit(view, packet, adj, sr=sr)
+    return StepResult(DROP, LOOP)
+
+
+def _transmit(
+    view: DeviceView,
+    packet: IPPacket,
+    adj: Adjacency,
+    *,
+    sr: bool = False,
+) -> StepResult:
+    """Shared egress checks; a CROSS_CONNECT enters here without a DA lookup."""
     from netsim.model.interfaces import OperState, PortChannelNode
 
     af = 4 if isinstance(packet, IPv4Packet) else 6
-    fib = view.fib(af)
-    entry = fib.lookup(packet.dst) if fib is not None else None
-    if entry is None:
-        return StepResult(DROP, NO_ROUTE)
-    if entry.action == RECEIVE:
-        return StepResult(DELIVER, packet=packet)
-    if entry.action in DROP_ACTIONS:
-        return StepResult(DROP, ACTION_DROP_REASON[entry.action])
-    if entry.action == SRV6_LOCAL:
-        return StepResult(DROP, SRV6_UNSUPPORTED)
-    # TTL: transit packets only (RFC 1812 §4.2.2.9 for receive is handled above).
-    if stage == TRANSIT:
-        ttl = packet.ttl if isinstance(packet, IPv4Packet) else packet.hop_limit
-        if ttl <= 1:
-            return StepResult(DROP, TTL_EXPIRED)
-        packet = (
-            dataclasses.replace(packet, ttl=ttl - 1)
-            if isinstance(packet, IPv4Packet)
-            else dataclasses.replace(packet, hop_limit=ttl - 1)
-        )
-    group = fib.group(entry) if fib is not None else None
-    if group is None or not group.adjacencies:
-        return StepResult(DROP, NO_ROUTE)
     key = FlowKey.from_packet(packet)
-    ecmp = view.load_balancer(BalancerKind.ECMP)
-    legs, weights = live_legs(view, group, af)
-    adj = legs[ecmp.select(key, weights)]
     egress = view.interface(adj.interface)
     if egress is None or not _l3_usable(egress, af):
         return StepResult(DROP, EGRESS_DOWN, egress=adj.interface)
     if adj.mac is None:
         return StepResult(DROP, ADJ_UNRESOLVED, egress=adj.interface)
-    if ip_bytes(packet) > egress.config.mtu:
+    # Preserve Gate A's MTU-before-member drop precedence for plain IP.
+    if not sr and ip_bytes(packet) > egress.config.mtu:
         return StepResult(DROP, MTU_EXCEEDED, egress=adj.interface)
     member = adj.interface
     if isinstance(egress, PortChannelNode):
@@ -280,6 +526,8 @@ def forward_ip(
             return StepResult(DROP, EGRESS_DOWN, egress=adj.interface)
         lag = view.load_balancer(BalancerKind.AGGREGATE_PORT)
         member = members[lag.select(key, (1,) * len(members))]
+    if sr and ip_bytes(packet) > egress.config.mtu:
+        return StepResult(DROP, MTU_EXCEEDED, egress=adj.interface)
     tx = view.link_for(member)
     if tx is None:
         return StepResult(DROP, EGRESS_DOWN, egress=adj.interface, member=member)
