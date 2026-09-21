@@ -557,3 +557,160 @@ def test_context_uses_only_the_owners_connection_index(monkeypatch, unrelated):
         and view.queued_messages == 2
         and view.queued_bytes == 5
     )
+
+
+# --- review round 3 -----------------------------------------------------------
+
+
+def _mutable_values():
+    from collections import deque
+
+    class Key:
+        """A frozen, hashable key wrapping a mutable container."""
+
+        __slots__ = ('name', 'contents')
+
+        def __init__(self, name, contents):
+            object.__setattr__(self, 'name', name)
+            object.__setattr__(self, 'contents', contents)
+
+        def __hash__(self):
+            return hash(self.name)
+
+        def __eq__(self, other):
+            return isinstance(other, Key) and other.name == self.name
+
+    class Counted(int):
+        pass  # an int subclass with an instance __dict__
+
+    counted = Counted(1)
+    counted.note = ['changed']  # type: ignore[attr-defined]
+    return {
+        'deque': deque([1]),
+        'pmap-key': PMap({Key('k', [1]): 0}),
+        'leaf-subclass': counted,
+        'nested-deque': (1, (deque([1]),)),
+    }
+
+
+@pytest.mark.parametrize('name', ['deque', 'pmap-key', 'leaf-subclass', 'nested-deque'])
+def test_validators_are_fail_closed(name):
+    """RC3 finding 1: C-level containers, mutable PMap keys and scalar
+    subclasses with instance attributes are rejected by both validators."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _mutable_values()[name]
+    with pytest.raises(TypeError):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted(value, None)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), ('x',))
+
+
+@pytest.mark.parametrize('name', ['deque', 'pmap-key', 'leaf-subclass'])
+def test_admission_rejects_unrecognized_mutable_state(name):
+    value = _mutable_values()[name]
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0 and nodes['b'].state is None
+
+
+def test_payload_and_timer_name_boundaries_are_fail_closed():
+    from collections import deque
+
+    with pytest.raises(TypeError):
+        c.Datagram('eth1', deque([1]))
+    with pytest.raises(TypeError):
+        c.Message(1, deque([1]))
+    with pytest.raises(TypeError):
+        c.TimerOp(deque(['t']), 1.0)  # type: ignore[arg-type]
+    assert c.TimerOp('t', 1.0).name == 't'
+
+
+def test_causes_arriving_while_parked_get_a_run_after_retry():
+    """RC3 finding 2: a subscription change that lands while a receipt is
+    parked is delivered in its own run once the retry succeeds."""
+    bad = {'value': False}
+    calls = []
+
+    def callback(ctx):
+        kinds = tuple(cause.kind for cause in ctx.causes)
+        calls.append(kinds)
+        if bad['value']:
+            raise ValueError('reject')
+        remembered = ctx.agent_state
+        if not ctx.agent_state or c.CAUSE_SUBSCRIPTION in kinds:
+            remembered = ('enabled', ctx.config.enabled)
+        return c.AgentOutput(state=remembered)
+
+    sim = fixture(Plugin(paths=(('config', 'enabled'),), callback=callback))
+    sim.settle()
+    bad['value'] = True
+    sim.agents.deliver('r', 'test', c.TimerFired(0, 'first'))
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    sim.network.device('r').configure(enabled=False)
+    sim.settle()
+    bad['value'] = False
+    sim.retry()
+    sim.settle()
+    assert calls == [('init',), ('timer',), ('timer',), ('subscription',)]
+    assert sim.state.devices['r'].agents['test'].state == ('enabled', False)
+    assert sim.agents.budget()['pending_runs'] == 0
+    assert not any(sim.agents._causes.values())
+
+
+def test_nht_cost_change_while_parked_is_delivered_after_retry():
+    from dataclasses import replace
+
+    from netsim import Environment
+    from netsim.runtime import Simulation
+    from tests.model.test_network import A, build_diamond
+    from tests.model.test_nht import route
+
+    net, routers = build_diamond()
+    dev = routers['R1']
+    row = route('192.0.2.0/24', metric=10)
+    dev.rib_client(c.IGP).add_routes((row,))
+    key = c.NhtKey(c.ClientId('test'), 4, A('192.0.2.1'))
+    bad = {'value': False}
+    seen = []
+
+    def callback(ctx):
+        causes = tuple(x.kind for x in ctx.causes)
+        result = ctx.nht.get(key)
+        cost = result.cost if result else None
+        seen.append((causes, cost))
+        if bad['value']:
+            raise ValueError('reject')
+        if ctx.agent_state is None:
+            return c.AgentOutput(
+                state=('cost', None), nht_ops=(c.NhtOp(c.REGISTER_NHT, key),)
+            )
+        return c.AgentOutput(
+            state=('cost', cost) if c.CAUSE_NHT in causes else ctx.agent_state
+        )
+
+    net.add_agent('R1', Plugin(callback=callback))
+    sim = Simulation(Environment(), net)
+    sim.settle()
+    before = dev.fib(4)
+    bad['value'] = True
+    sim.agents.deliver('R1', 'test', c.TimerFired(0, 'first'))
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    dev.rib_client(c.IGP).add_routes((replace(row, metric=20),))
+    sim.settle()
+    assert dev.fib(4) is before  # metric-only change: FIB object unchanged
+    bad['value'] = False
+    sim.retry()
+    sim.settle()
+    assert seen[-1][0] == ('nht',) and seen[-1][1] == 20
+    assert dev.node.agents['test'].state == ('cost', 20)
+    assert not any(sim.agents._causes.values())

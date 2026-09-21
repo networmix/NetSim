@@ -870,8 +870,10 @@ class AgentRuntime:
                 self._publish_outbox(key, output, now)
             except Exception as error:
                 errors.append(error)
-            # Later arrivals survive a retry's captured prefix and get a run.
-            if self._inboxes.get(key):
+            # Later arrivals (inbox entries or causes such as a subscription
+            # or NHT change that landed while the receipt was parked) survive
+            # the captured prefix and get their own run.
+            if self._inboxes.get(key) or self._causes.get(key):
                 try:
                     self.sim.pipeline.mark(self._kind, {key[:2]}, now)
                 except Exception as error:

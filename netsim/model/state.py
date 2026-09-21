@@ -496,53 +496,92 @@ _LEAF_TYPES = (int, float, str, bytes, bool, type(None), FloatArray)
 _FORBIDDEN = (list, dict, set, bytearray, memoryview)
 
 
+_LEAF_EXACT = frozenset((int, float, str, bytes, bool, type(None), FloatArray))
+
+# Node classes of the immutability walk (fail-closed: anything else raises).
+_LEAF = 0
+_PREFIX_TABLE = 1
+_PMAP = 2
+_TUPLE = 3
+_FROZENSET = 4
+_RECORD = 5
+
+
+def _classify(o: Any, p: str) -> int:
+    """Classify a node for the immutability walks, or raise ``TypeError``.
+
+    The classification is fail-closed: a value is admitted only when it is
+    an exact leaf type (or a leaf subclass without instance ``__dict__``,
+    such as ``MacAddress``), an enum member, a frozen dataclass, a tuple,
+    a frozenset, a ``PMap``, a frozen prefix table or a type that declares
+    ``__netsim_immutable__``. Everything else (mutable builtins, C-level
+    containers such as ``deque``, iterators, arbitrary objects) is rejected.
+    """
+    t = type(o)
+    if t in _LEAF_EXACT:
+        return _LEAF
+    if isinstance(o, _FORBIDDEN):
+        raise TypeError(f'mutable {t.__name__} at {p}')
+    if _is_enum(o):
+        return _LEAF
+    if isinstance(o, _LEAF_TYPES):
+        # A scalar subclass with instance attributes is mutable through them.
+        if hasattr(o, '__dict__'):
+            raise TypeError(f'mutable {t.__name__} (leaf subclass) at {p}')
+        return _LEAF
+    if isinstance(o, FrozenPrefixTable):
+        if t is not FrozenPrefixTable:
+            # PrefixTable (the mutable builder) subclasses the frozen table.
+            raise TypeError(f'mutable {t.__name__} at {p}')
+        return _PREFIX_TABLE
+    if isinstance(o, PMap):
+        return _PMAP
+    if t is tuple or (isinstance(o, tuple) and not hasattr(o, '__dict__')):
+        return _TUPLE
+    if t is frozenset or (isinstance(o, frozenset) and not hasattr(o, '__dict__')):
+        return _FROZENSET
+    if dataclasses.is_dataclass(o) and not isinstance(o, type):
+        params = getattr(o, '__dataclass_params__', None)
+        if params is None or not params.frozen:
+            raise TypeError(f'non-frozen dataclass {t.__name__} at {p}')
+        return _RECORD
+    if getattr(t, '__netsim_immutable__', False):
+        return _LEAF
+    raise TypeError(f'unrecognized object {t.__name__} at {p}')
+
+
 def validate_immutable(obj: Any, path: str = 'root') -> None:
     """Raise ``TypeError`` if *obj* is not transitively immutable.
 
     Allowed: ints, floats, strs, bytes, bools, None, ``FloatArray``,
-    tuples, frozensets, ``PMap``, enums, and frozen dataclasses whose
-    fields are all allowed.
+    tuples, frozensets, ``PMap`` (keys and values), enums, frozen prefix
+    tables and frozen dataclasses whose fields are all allowed. The walk is
+    fail-closed: any other object is rejected.
     """
     stack: list[tuple[Any, str]] = [(obj, path)]
     seen: set[int] = set()
     while stack:
         o, p = stack.pop()
-        if isinstance(o, _LEAF_TYPES):
+        kind = _classify(o, p)
+        if kind == _LEAF:
             continue
-        if isinstance(o, _FORBIDDEN):
-            raise TypeError(f'mutable {type(o).__name__} at {p}')
         if id(o) in seen:
             continue
         seen.add(id(o))
-        if isinstance(o, FrozenPrefixTable):
-            if type(o) is not FrozenPrefixTable:
-                # PrefixTable (the mutable builder) subclasses the frozen table.
-                raise TypeError(f'mutable {type(o).__name__} at {p}')
+        if kind == _PREFIX_TABLE:
             for plen, table in o.shards().items():
                 for net_, value in table.items():
                     stack.append((value, f'{p}[{net_}/{plen}]'))
-            continue
-        if isinstance(o, PMap):
+        elif kind == _PMAP:
             for k, v in o.items():
+                stack.append((k, f'{p}.key({k!r})'))
                 stack.append((v, f'{p}[{k!r}]'))
-            continue
-        if isinstance(o, (tuple, frozenset)):
+        elif kind in (_TUPLE, _FROZENSET):
             for i, v in enumerate(o):
                 stack.append((v, f'{p}[{i}]'))
-            continue
-        if dataclasses.is_dataclass(o) and not isinstance(o, type):
-            params = getattr(o, '__dataclass_params__', None)
-            if params is None or not params.frozen:
-                raise TypeError(f'non-frozen dataclass {type(o).__name__} at {p}')
+        else:
             for f in dataclasses.fields(o):
                 stack.append((getattr(o, f.name), f'{p}.{f.name}'))
-            continue
-        if hasattr(o, '__dict__') or hasattr(o, '__slots__'):
-            # Enums and other immutable-by-convention singletons are allowed
-            # only if they declare themselves so.
-            if getattr(type(o), '__netsim_immutable__', False) or _is_enum(o):
-                continue
-            raise TypeError(f'unrecognized object {type(o).__name__} at {p}')
 
 
 def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
@@ -553,10 +592,11 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
     whole-tree walk: a value returned by identity costs nothing, a record
     that reuses most of its previous fields costs only its changed subtrees
     (the incremental trusted-builder rule of the design), and a mutable
-    container anywhere in a *new* subtree is still rejected. Pairing follows
-    structure: dataclass fields by name (same type only), ``PMap`` entries by
-    key, tuples by index when lengths match; anything unpaired is walked in
-    full. ``old`` must itself have been admitted through this function or
+    value anywhere in a *new* subtree is still rejected with the same
+    fail-closed classification as ``validate_immutable``. Pairing follows
+    structure: dataclass fields by name (same type only), ``PMap`` entries
+    by key, tuples by index when lengths match; anything unpaired is walked
+    in full. ``old`` must itself have been admitted through this function or
     ``validate_immutable``.
     """
     stack: list[tuple[Any, Any, str]] = [(new, old, path)]
@@ -565,40 +605,33 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
         o, prev, p = stack.pop()
         if o is prev:
             continue  # trusted by identity: admitted before
-        if isinstance(o, _LEAF_TYPES):
+        kind = _classify(o, p)
+        if kind == _LEAF:
             continue
-        if isinstance(o, _FORBIDDEN):
-            raise TypeError(f'mutable {type(o).__name__} at {p}')
         if id(o) in seen:
             continue
         seen.add(id(o))
-        if isinstance(o, FrozenPrefixTable):
-            if type(o) is not FrozenPrefixTable:
-                raise TypeError(f'mutable {type(o).__name__} at {p}')
+        if kind == _PREFIX_TABLE:
             prev_shards = prev.shards() if type(prev) is FrozenPrefixTable else {}
             for plen, table in o.shards().items():
                 prev_table = prev_shards.get(plen, {})
                 for net_, value in table.items():
                     stack.append((value, prev_table.get(net_), f'{p}[{net_}/{plen}]'))
-            continue
-        if isinstance(o, PMap):
+        elif kind == _PMAP:
             paired = isinstance(prev, PMap)
             for k, v in o.items():
+                # Keys are validated in full: a key equal to a previous key
+                # need not be the same object.
+                stack.append((k, None, f'{p}.key({k!r})'))
                 stack.append((v, prev.get(k) if paired else None, f'{p}[{k!r}]'))
-            continue
-        if isinstance(o, tuple):
+        elif kind == _TUPLE:
             paired = isinstance(prev, tuple) and len(prev) == len(o)
             for i, v in enumerate(o):
                 stack.append((v, prev[i] if paired else None, f'{p}[{i}]'))
-            continue
-        if isinstance(o, frozenset):
+        elif kind == _FROZENSET:
             for i, v in enumerate(o):
                 stack.append((v, None, f'{p}[{i}]'))
-            continue
-        if dataclasses.is_dataclass(o) and not isinstance(o, type):
-            params = getattr(o, '__dataclass_params__', None)
-            if params is None or not params.frozen:
-                raise TypeError(f'non-frozen dataclass {type(o).__name__} at {p}')
+        else:
             paired = type(prev) is type(o)
             for f in dataclasses.fields(o):
                 stack.append(
@@ -608,11 +641,6 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
                         f'{p}.{f.name}',
                     )
                 )
-            continue
-        if hasattr(o, '__dict__') or hasattr(o, '__slots__'):
-            if getattr(type(o), '__netsim_immutable__', False) or _is_enum(o):
-                continue
-            raise TypeError(f'unrecognized object {type(o).__name__} at {p}')
 
 
 def _is_enum(o: Any) -> bool:

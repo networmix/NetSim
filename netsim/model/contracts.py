@@ -669,6 +669,8 @@ class TimerOp:
     delay: float | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError(f'timer name must be a str, got {type(self.name).__name__}')
         if self.delay is not None:
             _check_duration('delay', self.delay, positive=True)
 
