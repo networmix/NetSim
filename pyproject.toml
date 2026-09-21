@@ -57,7 +57,7 @@ exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=netsim --cov-fail-under=85 --cov-report term-missing --benchmark-disable --benchmark-disable-gc --benchmark-min-rounds=5 --benchmark-warmup=on"
-timeout = 10
+timeout = 60  # a hang guard: shared CI runners take up to 10x longer than a workstation
 markers = [
     "slow: marks tests as slow",
     "benchmark: marks tests as benchmarks",
