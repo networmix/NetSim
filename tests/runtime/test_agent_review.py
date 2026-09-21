@@ -1179,7 +1179,7 @@ def _round8_cases():
 
     @dataclass(frozen=True, slots=True)
     class ClassShadow(Base):
-        pending: ClassVar[object] = None  # type: ignore[assignment]
+        pending: ClassVar[object]  # type: ignore[assignment]
 
         def __init__(self, pending):
             Base.__init__(self, pending)
