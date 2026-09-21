@@ -477,7 +477,9 @@ class PlacementEvent(Event):
         return self.carried[edge_id] / cap if cap > 0 else float('inf')
 
     def row(self) -> dict[str, Any]:
-        d = super().row()
+        # Explicit base call: zero-argument super() does not work inside a
+        # slots dataclass before Python 3.14 (the decorator recreates the class).
+        d = Event.row(self)
         d['dropped'] = dict(self.dropped)
         return d
 

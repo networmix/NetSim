@@ -876,6 +876,30 @@ def test_operation_records_reject_slotted_str_subclasses():
 # --- review round 5 -----------------------------------------------------------
 
 
+def _malformed_fraction(cls, number):
+    """A ``cls`` (Fraction or subclass) whose numerator is *number*, an int
+    subclass. Python 3.14's public constructor keeps the components that
+    ``as_integer_ratio`` returns; older interpreters normalize them, so the
+    stdlib's internal constructor is used and the case is skipped where even
+    that yields an exact int."""
+
+    class Ratio:
+        def as_integer_ratio(self):
+            return number, 2
+
+    try:
+        value = cls(Ratio())
+    except TypeError:
+        value = (
+            cls._from_coprime_ints(number, 2)
+            if hasattr(cls, '_from_coprime_ints')
+            else cls(number, 2)
+        )
+    if type(value.numerator) is int:
+        pytest.skip('this interpreter normalizes Fraction components')
+    return value
+
+
 def _round5_cases():
     from enum import Enum
     from fractions import Fraction
@@ -897,10 +921,6 @@ def _round5_cases():
     number = Number(1)
     number.notes = [1]  # type: ignore[attr-defined]
 
-    class Ratio:
-        def as_integer_ratio(self):
-            return number, 2
-
     class IteratorSlots(float):
         __slots__ = iter(('notes',))  # consumed at class creation
 
@@ -909,7 +929,7 @@ def _round5_cases():
     return {
         'enum-initializer-attribute': Announcement.UPDATE,
         'enum-later-attribute': Plain.ONE,
-        'fraction-components': Fraction(Ratio()),  # type: ignore[arg-type]
+        'fraction-components': lambda: _malformed_fraction(Fraction, number),
         'iterator-slots': slotted,
     }
 
@@ -929,6 +949,8 @@ def test_classifier_reads_real_storage_and_components(name):
     from netsim.model.state import validate_admitted, validate_immutable
 
     value = _round5_cases()[name]
+    if callable(value):
+        value = value()  # built lazily: may skip on older interpreters
     with pytest.raises(TypeError):
         validate_immutable(value)
     with pytest.raises(TypeError):
@@ -995,15 +1017,8 @@ def _round6_cases():
     number = Number(1)
     number.notes = [1]  # type: ignore[attr-defined]
 
-    class Ratio:
-        def as_integer_ratio(self):
-            return number, 2
-
     class PlainFraction(Fraction):
         __slots__ = ()
-
-    class FractionTag(Enum):
-        VALUE = Fraction(Ratio())  # type: ignore[arg-type]
 
     class SlottedTag(Enum):
         __slots__ = ('notes',)
@@ -1012,9 +1027,15 @@ def _round6_cases():
         def __init__(self, code):
             self.notes = [1]
 
+    def fraction_in_enum():
+        class FractionTag(Enum):
+            VALUE = _malformed_fraction(Fraction, number)
+
+        return FractionTag.VALUE
+
     return {
-        'fraction-subclass': PlainFraction(Ratio()),  # type: ignore[arg-type]
-        'fraction-in-enum': FractionTag.VALUE,
+        'fraction-subclass': lambda: _malformed_fraction(PlainFraction, number),
+        'fraction-in-enum': fraction_in_enum,
         'enum-slot': SlottedTag.VALUE,
     }
 
@@ -1026,6 +1047,8 @@ def test_classifier_composes_fraction_and_enum_rules(name):
     from netsim.model.state import validate_admitted, validate_immutable
 
     value = _round6_cases()[name]
+    if callable(value):
+        value = value()  # built lazily: may skip on older interpreters
     with pytest.raises(TypeError):
         validate_immutable(value)
     with pytest.raises(TypeError):
