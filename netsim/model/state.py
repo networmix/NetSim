@@ -560,12 +560,16 @@ def _enum_ok(o: Any) -> bool:
 _OBJECT_SIZE = object.__basicsize__
 
 
-def _check_record_type(t: type, p: str) -> None:
+def _check_record_type(t: type, p: str) -> frozenset[str]:
     """A frozen record may inherit only frozen dataclasses and storage-free
     Python mixins: a base with a larger instance layout than ``object``
     (``deque``, ``list``, ``int`` ... whether or not CPython builds it as a
     heap type) carries a payload no field walk visits, and a mixin with an
-    instance ``__dict__`` or slot descriptors is writable storage."""
+    instance ``__dict__`` or slot descriptors is writable storage. Every
+    slot anywhere in the MRO must be one of the record's effective fields
+    (a field redeclared as ``InitVar`` or ``ClassVar`` leaves its inherited
+    slot behind). Returns the effective field names."""
+    names = frozenset(f.name for f in dataclasses.fields(t))
     for cls in t.__mro__:
         if cls is object:
             continue
@@ -573,7 +577,17 @@ def _check_record_type(t: type, p: str) -> None:
         if '__dataclass_params__' in own:
             if not own['__dataclass_params__'].frozen:
                 raise TypeError(f'non-frozen dataclass base {cls.__name__} at {p}')
-            continue  # its fields are walked
+            for k, v in own.items():
+                if (
+                    isinstance(v, types.MemberDescriptorType)
+                    and k != '__weakref__'
+                    and k not in names
+                ):
+                    raise TypeError(
+                        f'record {t.__name__} keeps slot {k!r} of {cls.__name__} '
+                        f'outside its fields at {p}'
+                    )
+            continue
         if cls.__basicsize__ != _OBJECT_SIZE or cls.__itemsize__:
             raise TypeError(
                 f'record {t.__name__} inherits payload storage from '
@@ -587,9 +601,10 @@ def _check_record_type(t: type, p: str) -> None:
             raise TypeError(
                 f'record {t.__name__} inherits storage from {cls.__name__} at {p}'
             )
+    return names
 
 
-def _classify(o: Any, p: str) -> int:
+def _classify(o: Any, p: str, records: dict[type, frozenset[str]]) -> int:
     """Classify a node for the immutability walks, or raise ``TypeError``.
 
     Fail-closed: a value is admitted only when it is an exact leaf type, a
@@ -650,13 +665,14 @@ def _classify(o: Any, p: str) -> int:
             )
         if not params.frozen:
             raise TypeError(f'non-frozen dataclass {t.__name__} at {p}')
-        _check_record_type(t, p)
+        names = records.get(t)
+        if names is None:
+            names = records[t] = _check_record_type(t, p)
         # Instance storage must be accounted for by the fields the walk
         # visits: a populated cached_property or any other extra entry in
         # the instance dictionary is caller-owned state.
         instance_dict = getattr(o, '__dict__', None)
         if instance_dict:
-            names = {f.name for f in dataclasses.fields(o)}
             extra = [k for k in instance_dict if k not in names]
             if extra:
                 raise TypeError(
@@ -683,9 +699,10 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
     """
     stack: list[tuple[Any, str]] = [(obj, path)]
     seen: set[int] = set()
+    records: dict[type, frozenset[str]] = {}  # per walk, never shared
     while stack:
         o, p = stack.pop()
-        kind = _classify(o, p)
+        kind = _classify(o, p, records)
         if kind == _LEAF:
             if isinstance(o, enum.Enum):
                 stack.append((o.value, f'{p}.value'))
@@ -732,11 +749,12 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
     """
     stack: list[tuple[Any, Any, str]] = [(new, old, path)]
     seen: set[int] = set()
+    records: dict[type, frozenset[str]] = {}  # per walk, never shared
     while stack:
         o, prev, p = stack.pop()
         if o is prev:
             continue  # trusted by identity: admitted before
-        kind = _classify(o, p)
+        kind = _classify(o, p, records)
         if kind == _LEAF:
             if isinstance(o, enum.Enum):
                 stack.append((o.value, None, f'{p}.value'))

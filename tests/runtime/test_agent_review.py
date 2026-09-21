@@ -1157,3 +1157,70 @@ def test_legitimate_record_inheritance_still_validates():
     validate_immutable(value)
     validate_admitted(value, None)
     validate_admitted(value, value)
+
+
+# --- review round 8 -----------------------------------------------------------
+
+
+def _round8_cases():
+    from dataclasses import InitVar
+    from typing import ClassVar
+
+    @dataclass(frozen=True, slots=True)
+    class Base:
+        pending: object
+
+    @dataclass(frozen=True, slots=True)
+    class InitShadow(Base):
+        pending: InitVar[object]  # type: ignore[assignment]
+
+        def __post_init__(self, pending):
+            Base.__init__(self, pending)
+
+    @dataclass(frozen=True, slots=True)
+    class ClassShadow(Base):
+        pending: ClassVar[object] = None  # type: ignore[assignment]
+
+        def __init__(self, pending):
+            Base.__init__(self, pending)
+
+    return {'initvar-shadow': InitShadow([1]), 'classvar-shadow': ClassShadow([1])}
+
+
+@pytest.mark.parametrize('name', ['initvar-shadow', 'classvar-shadow'])
+def test_inherited_slots_must_be_effective_fields(name):
+    """RC8: a slot left behind by a redeclared field is unvisited storage."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _round8_cases()[name]
+    assert dataclasses.fields(value) == () and value.pending == [1]
+    with pytest.raises(TypeError, match='outside its fields'):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), None)
+    with pytest.raises(TypeError):
+        c.Message(1, value)
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+
+
+def test_slotted_record_inheritance_with_kept_fields_validates():
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    @dataclass(frozen=True, slots=True)
+    class Base:
+        a: int = 1
+
+    @dataclass(frozen=True, slots=True)
+    class Child(Base):
+        b: tuple = ()
+
+    value = (Child(), Child(2, (1,)))
+    validate_immutable(value)
+    validate_admitted(value, None)
