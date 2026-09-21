@@ -548,12 +548,13 @@ _ENUM_ATTRS = frozenset(('_value_', '_name_', '__objclass__', '_sort_order_', '_
 
 def _enum_ok(o: Any) -> bool:
     """An enum member is admitted only with the enum machinery's own
-    instance attributes: a member that gained attributes (in an initializer
-    or later) carries caller-owned state. Members are class-level
-    singletons: like declared-immutable types they are trusted by their
-    declaration, never copied into the tree."""
+    instance attributes and no user-declared slot storage: a member that
+    gained attributes (in an initializer, through a slot, or later) carries
+    caller-owned state. Members are class-level singletons: like
+    declared-immutable types they are trusted by their declaration, never
+    copied into the tree. The member's value is classified by the walk."""
     extras = set(vars(o)) - _ENUM_ATTRS
-    return not extras
+    return not extras and not _extra_storage(type(o))
 
 
 def _classify(o: Any, p: str) -> int:
@@ -569,8 +570,11 @@ def _classify(o: Any, p: str) -> int:
     storage, arbitrary objects) is rejected.
     """
     t = type(o)
-    if t is Fraction:
-        # Public constructors keep the components ``as_integer_ratio`` returned.
+    if isinstance(o, Fraction):
+        # Public constructors keep the components ``as_integer_ratio``
+        # returned; a subclass must also be storage-free.
+        if t is not Fraction and _extra_storage(t):
+            raise TypeError(f'mutable {t.__name__} (leaf subclass with storage) at {p}')
         if type(o.numerator) is not int or type(o.denominator) is not int:
             raise TypeError(f'Fraction with non-exact int components at {p}')
         return _LEAF
@@ -638,7 +642,7 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
         o, p = stack.pop()
         kind = _classify(o, p)
         if kind == _LEAF:
-            if isinstance(o, enum.Enum) and type(o.value) not in _LEAF_EXACT:
+            if isinstance(o, enum.Enum):
                 stack.append((o.value, f'{p}.value'))
             continue
         if id(o) in seen:
@@ -648,6 +652,8 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
             if type(o.bits) is not int:
                 raise TypeError(f'prefix table bits is not an exact int at {p}')
             for plen, table in o.shards().items():
+                if type(plen) is not int:
+                    raise TypeError(f'prefix length is not an exact int at {p}')
                 for net_, value in table.items():
                     if not _prefix_key_ok(net_, plen):
                         raise TypeError(f'prefix key is not an exact int at {p}')
@@ -687,7 +693,7 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
             continue  # trusted by identity: admitted before
         kind = _classify(o, p)
         if kind == _LEAF:
-            if isinstance(o, enum.Enum) and type(o.value) not in _LEAF_EXACT:
+            if isinstance(o, enum.Enum):
                 stack.append((o.value, None, f'{p}.value'))
             continue
         if id(o) in seen:
@@ -698,6 +704,8 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
                 raise TypeError(f'prefix table bits is not an exact int at {p}')
             prev_shards = prev.shards() if type(prev) is FrozenPrefixTable else {}
             for plen, table in o.shards().items():
+                if type(plen) is not int:
+                    raise TypeError(f'prefix length is not an exact int at {p}')
                 prev_table = prev_shards.get(plen, {})
                 for net_, value in table.items():
                     if not _prefix_key_ok(net_, plen):

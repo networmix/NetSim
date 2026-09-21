@@ -980,3 +980,87 @@ def test_plain_enums_remain_admitted():
         A = 'a'
 
     validate_immutable((Kind.ONE, Tag.A, OperState.UP))
+
+
+# --- review round 6 -----------------------------------------------------------
+
+
+def _round6_cases():
+    from enum import Enum
+    from fractions import Fraction
+
+    class Number(int):
+        pass
+
+    number = Number(1)
+    number.notes = [1]  # type: ignore[attr-defined]
+
+    class Ratio:
+        def as_integer_ratio(self):
+            return number, 2
+
+    class PlainFraction(Fraction):
+        __slots__ = ()
+
+    class FractionTag(Enum):
+        VALUE = Fraction(Ratio())  # type: ignore[arg-type]
+
+    class SlottedTag(Enum):
+        __slots__ = ('notes',)
+        VALUE = 1
+
+        def __init__(self, code):
+            self.notes = [1]
+
+    return {
+        'fraction-subclass': PlainFraction(Ratio()),  # type: ignore[arg-type]
+        'fraction-in-enum': FractionTag.VALUE,
+        'enum-slot': SlottedTag.VALUE,
+    }
+
+
+@pytest.mark.parametrize('name', ['fraction-subclass', 'fraction-in-enum', 'enum-slot'])
+def test_classifier_composes_fraction_and_enum_rules(name):
+    """RC6: component checks apply to every Fraction, enum values go through
+    the classifier, and enum slot storage counts as instance attributes."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _round6_cases()[name]
+    with pytest.raises(TypeError):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), None)
+    with pytest.raises(TypeError):
+        c.Datagram('eth1', value)
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+
+
+def test_prefix_table_metadata_is_exact_even_for_empty_shards():
+    from netsim.model.lpm import FrozenPrefixTable
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    class Length(int):
+        pass
+
+    length = Length(8)
+    length.notes = [1]  # type: ignore[attr-defined]
+    masks = tuple(0 for _ in range(33))
+    table = FrozenPrefixTable(32, {length: {}}, masks)  # public constructor copies
+    assert table.lengths() == () and len(table) == 0
+    validate_immutable(table)
+    # A table that somehow retains a subclass length is rejected by the walks.
+    raw = FrozenPrefixTable._owned(32, {length: {}}, masks)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        validate_immutable(raw)
+    with pytest.raises(TypeError):
+        validate_admitted(raw, None)
+    filled = FrozenPrefixTable(32, {length: {Length(0): 'v'}}, masks)
+    assert all(type(k) is int for k in filled.lengths())
+    validate_immutable(filled)

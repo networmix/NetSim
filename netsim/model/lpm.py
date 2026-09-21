@@ -33,8 +33,18 @@ class FrozenPrefixTable(Generic[V]):
     def __init__(
         self, bits: int, tables: dict[int, dict[int, V]], masks: tuple[int, ...]
     ) -> None:
-        # Public construction copies: a frozen table never aliases caller dicts.
-        self._init(bits, {plen: dict(t) for plen, t in tables.items()}, masks)
+        # Public construction copies: a frozen table never aliases caller
+        # dicts, and keys are exact ints (never a caller's int subclass);
+        # empty shards are dropped so no key survives without an entry.
+        self._init(
+            bits,
+            {
+                int(plen): {int(net): value for net, value in t.items()}
+                for plen, t in tables.items()
+                if t
+            },
+            masks,
+        )
 
     def _init(
         self,
