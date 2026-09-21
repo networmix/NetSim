@@ -871,3 +871,112 @@ def test_operation_records_reject_slotted_str_subclasses():
     nodes = sim.state.devices['r'].agents
     assert nodes['a'].runs == 1 and nodes['b'].runs == 0
     assert sim.agents.budget()['armed_timers'] == 0
+
+
+# --- review round 5 -----------------------------------------------------------
+
+
+def _round5_cases():
+    from enum import Enum
+    from fractions import Fraction
+
+    class Announcement(Enum):
+        UPDATE = 1
+
+        def __init__(self, code):
+            self.prefixes = [1]
+
+    class Plain(Enum):
+        ONE = 1
+
+    Plain.ONE.later = [1]  # type: ignore[attr-defined]
+
+    class Number(int):
+        pass
+
+    number = Number(1)
+    number.notes = [1]  # type: ignore[attr-defined]
+
+    class Ratio:
+        def as_integer_ratio(self):
+            return number, 2
+
+    class IteratorSlots(float):
+        __slots__ = iter(('notes',))  # consumed at class creation
+
+    slotted = IteratorSlots(1)
+    slotted.notes = [1]  # type: ignore[attr-defined]
+    return {
+        'enum-initializer-attribute': Announcement.UPDATE,
+        'enum-later-attribute': Plain.ONE,
+        'fraction-components': Fraction(Ratio()),  # type: ignore[arg-type]
+        'iterator-slots': slotted,
+    }
+
+
+@pytest.mark.parametrize(
+    'name',
+    [
+        'enum-initializer-attribute',
+        'enum-later-attribute',
+        'fraction-components',
+        'iterator-slots',
+    ],
+)
+def test_classifier_reads_real_storage_and_components(name):
+    """RC5: enum instance attributes, Fraction components and descriptor-level
+    slot storage are checked; a __slots__ declaration alone is not trusted."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _round5_cases()[name]
+    with pytest.raises(TypeError):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), None)
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+
+
+def test_prefix_table_bits_and_float_array_bytes_are_owned():
+    from netsim.model.lpm import PrefixTable
+    from netsim.model.state import FloatArray, validate_immutable
+
+    class Number(int):
+        pass
+
+    bits = Number(32)
+    bits.notes = [1]  # type: ignore[attr-defined]
+    frozen = PrefixTable(bits).freeze()  # type: ignore[arg-type]
+    assert type(frozen.bits) is int
+    validate_immutable(frozen)
+
+    class Blob(bytes):
+        def __bytes__(self):
+            return self  # an overridden conversion hook keeps the caller's object
+
+    blob = Blob(bytes(8))
+    blob.notes = [1]  # type: ignore[attr-defined]
+    array = FloatArray(blob)
+    assert type(array._data) is bytes and array._data is not blob
+    validate_immutable(array)
+
+
+def test_plain_enums_remain_admitted():
+    from enum import Enum, IntEnum
+
+    from netsim.model.interfaces import OperState
+    from netsim.model.state import validate_immutable
+
+    class Kind(IntEnum):
+        ONE = 1
+
+    class Tag(Enum):
+        A = 'a'
+
+    validate_immutable((Kind.ONE, Tag.A, OperState.UP))

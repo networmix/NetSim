@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import os
+import types
 from collections.abc import ItemsView, KeysView, ValuesView
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -449,7 +450,10 @@ class FloatArray:
         if not isinstance(data, bytes):
             raise TypeError('FloatArray needs bytes')
         if type(data) is not bytes:
-            data = bytes(data)  # never retain a caller's bytes subclass
+            # Copy the buffer itself; ``bytes(subclass)`` may return the
+            # caller's object through an overridden ``__bytes__``.
+            data = memoryview(data).tobytes()
+        assert type(data) is bytes
         if len(data) % self._SIZE:
             raise ValueError('FloatArray bytes must be a multiple of 8')
         self._data = data
@@ -518,21 +522,38 @@ _RECORD = 5
 
 def _extra_storage(t: type) -> bool:
     """Whether instances of *t* can hold attributes beyond their builtin
-    base's value: an instance ``__dict__`` (no ``__slots__`` somewhere in
-    the user-defined part of the MRO) or a non-empty slot. Builtin bases
-    and ``Enum`` machinery are exempt; audited aliases such as
-    ``MacAddress`` (``__slots__ = ()``) and ``NamedTuple`` classes pass."""
+    base's value. The check reads the real descriptors of every
+    user-defined class in the MRO: an instance ``__dict__`` descriptor or
+    any slot member descriptor means writable storage (a ``__slots__``
+    declaration is not trusted: Python consumes an iterator-valued one at
+    class creation). Builtin bases and ``Enum`` machinery are exempt;
+    audited aliases such as ``MacAddress`` (``__slots__ = ()``) and
+    ``NamedTuple`` classes pass."""
     for cls in t.__mro__:
         if cls in _BUILTIN_BASES or cls.__module__ == 'enum':
             continue
-        slots = cls.__dict__.get('__slots__')
-        if slots is None:
+        namespace = cls.__dict__
+        if '__dict__' in namespace:
             return True
-        if isinstance(slots, str):
-            slots = (slots,)
-        if any(name != '__weakref__' for name in slots):
-            return True
+        for name, value in namespace.items():
+            if name == '__weakref__':
+                continue
+            if isinstance(value, types.MemberDescriptorType):
+                return True
     return False
+
+
+_ENUM_ATTRS = frozenset(('_value_', '_name_', '__objclass__', '_sort_order_', '_hash_'))
+
+
+def _enum_ok(o: Any) -> bool:
+    """An enum member is admitted only with the enum machinery's own
+    instance attributes: a member that gained attributes (in an initializer
+    or later) carries caller-owned state. Members are class-level
+    singletons: like declared-immutable types they are trusted by their
+    declaration, never copied into the tree."""
+    extras = set(vars(o)) - _ENUM_ATTRS
+    return not extras
 
 
 def _classify(o: Any, p: str) -> int:
@@ -548,11 +569,18 @@ def _classify(o: Any, p: str) -> int:
     storage, arbitrary objects) is rejected.
     """
     t = type(o)
+    if t is Fraction:
+        # Public constructors keep the components ``as_integer_ratio`` returned.
+        if type(o.numerator) is not int or type(o.denominator) is not int:
+            raise TypeError(f'Fraction with non-exact int components at {p}')
+        return _LEAF
     if t in _LEAF_EXACT:
         return _LEAF
     if isinstance(o, _FORBIDDEN):
         raise TypeError(f'mutable {t.__name__} at {p}')
     if isinstance(o, enum.Enum):
+        if not _enum_ok(o):
+            raise TypeError(f'enum member {o!r} with instance attributes at {p}')
         return _LEAF  # the member's value is walked by the caller
     if isinstance(o, _LEAF_TYPES):
         if _extra_storage(t):
@@ -617,6 +645,8 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
             continue
         seen.add(id(o))
         if kind == _PREFIX_TABLE:
+            if type(o.bits) is not int:
+                raise TypeError(f'prefix table bits is not an exact int at {p}')
             for plen, table in o.shards().items():
                 for net_, value in table.items():
                     if not _prefix_key_ok(net_, plen):
@@ -664,6 +694,8 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
             continue
         seen.add(id(o))
         if kind == _PREFIX_TABLE:
+            if type(o.bits) is not int:
+                raise TypeError(f'prefix table bits is not an exact int at {p}')
             prev_shards = prev.shards() if type(prev) is FrozenPrefixTable else {}
             for plen, table in o.shards().items():
                 prev_table = prev_shards.get(plen, {})

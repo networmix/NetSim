@@ -42,6 +42,10 @@ class FrozenPrefixTable(Generic[V]):
         tables: dict[int, Mapping[int, V]],
         masks: tuple[int, ...],
     ) -> None:
+        if type(bits) is not int:
+            bits = int(bits)  # exact metadata, never a caller's int subclass
+        if bits not in (32, 128):
+            raise ValueError('bits must be 32 or 128')
         self._bits = bits
         # Own an exact tuple of exact ints: a caller-owned list or int
         # subclass could change lookups after the table was committed.
