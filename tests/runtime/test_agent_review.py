@@ -1064,3 +1064,96 @@ def test_prefix_table_metadata_is_exact_even_for_empty_shards():
     filled = FrozenPrefixTable(32, {length: {Length(0): 'v'}}, masks)
     assert all(type(k) is int for k in filled.lengths())
     validate_immutable(filled)
+
+
+# --- review round 7 -----------------------------------------------------------
+
+
+def _round7_cases():
+    from collections import deque
+    from functools import cached_property
+
+    @dataclass(frozen=True)
+    class FrozenQueue(deque):  # type: ignore[type-arg]
+        label: str = 'updates'
+
+    @dataclass(frozen=True)
+    class CachedRecord:
+        label: str = 'updates'
+
+        @cached_property
+        def pending(self):
+            return [1]
+
+    class Mixin:
+        pass  # a plain mixin has an instance __dict__
+
+    @dataclass(frozen=True)
+    class MixedRecord(Mixin):
+        label: str = 'x'
+
+    queue = FrozenQueue()
+    queue.append([1])
+    record = CachedRecord()
+    assert record.pending == [1]  # populated before admission
+    return {
+        'container-base': queue,
+        'cached-property': record,
+        'dict-mixin-base': MixedRecord(),
+    }
+
+
+@pytest.mark.parametrize(
+    'name', ['container-base', 'cached-property', 'dict-mixin-base']
+)
+def test_records_admit_only_field_storage(name):
+    """RC7: a frozen record's instance storage must be its walked fields."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _round7_cases()[name]
+    with pytest.raises(TypeError):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), None)
+    with pytest.raises(TypeError):
+        c.Datagram('eth1', value)
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+
+
+def test_legitimate_record_inheritance_still_validates():
+    from typing import Generic, TypeVar
+
+    from netsim.model.state import record, validate_admitted, validate_immutable
+
+    T = TypeVar('T')
+
+    class Slotless:
+        __slots__ = ()  # a storage-free mixin
+
+    @dataclass(frozen=True)
+    class Base:
+        a: int = 1
+
+    @dataclass(frozen=True)
+    class Child(Base, Slotless):
+        b: str = 'x'
+
+    @dataclass(frozen=True)
+    class Boxed(Generic[T]):
+        item: T
+
+    @record
+    class Slotted:
+        label: str = 'x'
+
+    value = (Child(), Boxed((1, 2)), Slotted(), Base())
+    validate_immutable(value)
+    validate_admitted(value, None)
+    validate_admitted(value, value)

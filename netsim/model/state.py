@@ -557,6 +557,38 @@ def _enum_ok(o: Any) -> bool:
     return not extras and not _extra_storage(type(o))
 
 
+_OBJECT_SIZE = object.__basicsize__
+
+
+def _check_record_type(t: type, p: str) -> None:
+    """A frozen record may inherit only frozen dataclasses and storage-free
+    Python mixins: a base with a larger instance layout than ``object``
+    (``deque``, ``list``, ``int`` ... whether or not CPython builds it as a
+    heap type) carries a payload no field walk visits, and a mixin with an
+    instance ``__dict__`` or slot descriptors is writable storage."""
+    for cls in t.__mro__:
+        if cls is object:
+            continue
+        own = cls.__dict__
+        if '__dataclass_params__' in own:
+            if not own['__dataclass_params__'].frozen:
+                raise TypeError(f'non-frozen dataclass base {cls.__name__} at {p}')
+            continue  # its fields are walked
+        if cls.__basicsize__ != _OBJECT_SIZE or cls.__itemsize__:
+            raise TypeError(
+                f'record {t.__name__} inherits payload storage from '
+                f'{cls.__name__} at {p}'
+            )
+        if '__dict__' in own or any(
+            isinstance(v, types.MemberDescriptorType)
+            for k, v in own.items()
+            if k != '__weakref__'
+        ):
+            raise TypeError(
+                f'record {t.__name__} inherits storage from {cls.__name__} at {p}'
+            )
+
+
 def _classify(o: Any, p: str) -> int:
     """Classify a node for the immutability walks, or raise ``TypeError``.
 
@@ -618,6 +650,19 @@ def _classify(o: Any, p: str) -> int:
             )
         if not params.frozen:
             raise TypeError(f'non-frozen dataclass {t.__name__} at {p}')
+        _check_record_type(t, p)
+        # Instance storage must be accounted for by the fields the walk
+        # visits: a populated cached_property or any other extra entry in
+        # the instance dictionary is caller-owned state.
+        instance_dict = getattr(o, '__dict__', None)
+        if instance_dict:
+            names = {f.name for f in dataclasses.fields(o)}
+            extra = [k for k in instance_dict if k not in names]
+            if extra:
+                raise TypeError(
+                    f'record {t.__name__} with non-field instance storage '
+                    f'{extra[0]!r} at {p}'
+                )
         return _RECORD
     if getattr(t, '__netsim_immutable__', False):
         return _LEAF
