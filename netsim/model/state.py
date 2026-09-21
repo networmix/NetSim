@@ -10,6 +10,7 @@ transitively immutable; ``validate_immutable`` checks that in debug mode.
 from __future__ import annotations
 
 import dataclasses
+import enum
 import os
 from collections.abc import ItemsView, KeysView, ValuesView
 from dataclasses import dataclass, field
@@ -447,6 +448,8 @@ class FloatArray:
     def __init__(self, data: bytes) -> None:
         if not isinstance(data, bytes):
             raise TypeError('FloatArray needs bytes')
+        if type(data) is not bytes:
+            data = bytes(data)  # never retain a caller's bytes subclass
         if len(data) % self._SIZE:
             raise ValueError('FloatArray bytes must be a multiple of 8')
         self._data = data
@@ -500,6 +503,9 @@ _FORBIDDEN = (list, dict, set, bytearray, memoryview)
 _LEAF_EXACT = frozenset(
     (int, float, str, bytes, bool, type(None), FloatArray, Fraction)
 )
+_BUILTIN_BASES = frozenset(
+    (object, int, float, str, bytes, bool, tuple, frozenset, Fraction, enum.Enum)
+)
 
 # Node classes of the immutability walk (fail-closed: anything else raises).
 _LEAF = 0
@@ -510,27 +516,47 @@ _FROZENSET = 4
 _RECORD = 5
 
 
+def _extra_storage(t: type) -> bool:
+    """Whether instances of *t* can hold attributes beyond their builtin
+    base's value: an instance ``__dict__`` (no ``__slots__`` somewhere in
+    the user-defined part of the MRO) or a non-empty slot. Builtin bases
+    and ``Enum`` machinery are exempt; audited aliases such as
+    ``MacAddress`` (``__slots__ = ()``) and ``NamedTuple`` classes pass."""
+    for cls in t.__mro__:
+        if cls in _BUILTIN_BASES or cls.__module__ == 'enum':
+            continue
+        slots = cls.__dict__.get('__slots__')
+        if slots is None:
+            return True
+        if isinstance(slots, str):
+            slots = (slots,)
+        if any(name != '__weakref__' for name in slots):
+            return True
+    return False
+
+
 def _classify(o: Any, p: str) -> int:
     """Classify a node for the immutability walks, or raise ``TypeError``.
 
-    The classification is fail-closed: a value is admitted only when it is
-    an exact leaf type (or a leaf subclass without instance ``__dict__``,
-    such as ``MacAddress``), an enum member, a frozen dataclass, a tuple,
-    a frozenset, a ``PMap``, a frozen prefix table or a type that declares
+    Fail-closed: a value is admitted only when it is an exact leaf type, a
+    leaf, tuple or frozenset subclass without extra storage (no instance
+    ``__dict__``, no non-empty slots: ``MacAddress``, ``NamedTuple``), an
+    enum member (its value is walked), a class decorated itself as a frozen
+    dataclass, a ``PMap``, a frozen prefix table or a type that declares
     ``__netsim_immutable__``. Everything else (mutable builtins, C-level
-    containers such as ``deque``, iterators, arbitrary objects) is rejected.
+    containers such as ``deque``, iterators, subclasses with attribute
+    storage, arbitrary objects) is rejected.
     """
     t = type(o)
     if t in _LEAF_EXACT:
         return _LEAF
     if isinstance(o, _FORBIDDEN):
         raise TypeError(f'mutable {t.__name__} at {p}')
-    if _is_enum(o):
-        return _LEAF
+    if isinstance(o, enum.Enum):
+        return _LEAF  # the member's value is walked by the caller
     if isinstance(o, _LEAF_TYPES):
-        # A scalar subclass with instance attributes is mutable through them.
-        if hasattr(o, '__dict__'):
-            raise TypeError(f'mutable {t.__name__} (leaf subclass) at {p}')
+        if _extra_storage(t):
+            raise TypeError(f'mutable {t.__name__} (leaf subclass with storage) at {p}')
         return _LEAF
     if isinstance(o, FrozenPrefixTable):
         if t is not FrozenPrefixTable:
@@ -539,18 +565,35 @@ def _classify(o: Any, p: str) -> int:
         return _PREFIX_TABLE
     if isinstance(o, PMap):
         return _PMAP
-    if t is tuple or (isinstance(o, tuple) and not hasattr(o, '__dict__')):
+    if isinstance(o, tuple):
+        if t is not tuple and _extra_storage(t):
+            raise TypeError(
+                f'mutable {t.__name__} (tuple subclass with storage) at {p}'
+            )
         return _TUPLE
-    if t is frozenset or (isinstance(o, frozenset) and not hasattr(o, '__dict__')):
+    if isinstance(o, frozenset):
+        if t is not frozenset and _extra_storage(t):
+            raise TypeError(
+                f'mutable {t.__name__} (frozenset subclass with storage) at {p}'
+            )
         return _FROZENSET
     if dataclasses.is_dataclass(o) and not isinstance(o, type):
-        params = getattr(o, '__dataclass_params__', None)
-        if params is None or not params.frozen:
+        params = t.__dict__.get('__dataclass_params__')
+        if params is None:
+            raise TypeError(
+                f'{t.__name__} at {p} inherits a frozen record but is not a '
+                'frozen dataclass itself'
+            )
+        if not params.frozen:
             raise TypeError(f'non-frozen dataclass {t.__name__} at {p}')
         return _RECORD
     if getattr(t, '__netsim_immutable__', False):
         return _LEAF
     raise TypeError(f'unrecognized object {t.__name__} at {p}')
+
+
+def _prefix_key_ok(net_: Any, plen: Any) -> bool:
+    return type(net_) is int and type(plen) is int
 
 
 def validate_immutable(obj: Any, path: str = 'root') -> None:
@@ -567,6 +610,8 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
         o, p = stack.pop()
         kind = _classify(o, p)
         if kind == _LEAF:
+            if isinstance(o, enum.Enum) and type(o.value) not in _LEAF_EXACT:
+                stack.append((o.value, f'{p}.value'))
             continue
         if id(o) in seen:
             continue
@@ -574,6 +619,8 @@ def validate_immutable(obj: Any, path: str = 'root') -> None:
         if kind == _PREFIX_TABLE:
             for plen, table in o.shards().items():
                 for net_, value in table.items():
+                    if not _prefix_key_ok(net_, plen):
+                        raise TypeError(f'prefix key is not an exact int at {p}')
                     stack.append((value, f'{p}[{net_}/{plen}]'))
         elif kind == _PMAP:
             for k, v in o.items():
@@ -610,6 +657,8 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
             continue  # trusted by identity: admitted before
         kind = _classify(o, p)
         if kind == _LEAF:
+            if isinstance(o, enum.Enum) and type(o.value) not in _LEAF_EXACT:
+                stack.append((o.value, None, f'{p}.value'))
             continue
         if id(o) in seen:
             continue
@@ -619,6 +668,8 @@ def validate_admitted(new: Any, old: Any, path: str = 'root') -> None:
             for plen, table in o.shards().items():
                 prev_table = prev_shards.get(plen, {})
                 for net_, value in table.items():
+                    if not _prefix_key_ok(net_, plen):
+                        raise TypeError(f'prefix key is not an exact int at {p}')
                     stack.append((value, prev_table.get(net_), f'{p}[{net_}/{plen}]'))
         elif kind == _PMAP:
             paired = isinstance(prev, PMap)

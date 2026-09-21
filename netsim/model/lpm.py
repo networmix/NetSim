@@ -43,6 +43,10 @@ class FrozenPrefixTable(Generic[V]):
         masks: tuple[int, ...],
     ) -> None:
         self._bits = bits
+        # Own an exact tuple of exact ints: a caller-owned list or int
+        # subclass could change lookups after the table was committed.
+        if type(masks) is not tuple or any(type(m) is not int for m in masks):
+            masks = tuple(int(m) for m in masks)
         self._masks = masks
         self._tables = tables
         self._lengths: tuple[int, ...] = tuple(sorted(tables, reverse=True))
@@ -176,6 +180,8 @@ class PrefixTable(FrozenPrefixTable[V]):
         super().__init__(bits, {}, masks)
 
     def insert(self, net: int, plen: int, value: V) -> None:
+        if type(net) is not int or type(plen) is not int:
+            net, plen = int(net), int(plen)  # keys are exact ints, never subclasses
         if not 0 <= plen <= self._bits:
             raise ValueError(f'prefix length {plen} out of range')
         if net & ~self._masks[plen]:

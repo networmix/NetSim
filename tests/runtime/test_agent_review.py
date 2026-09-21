@@ -715,3 +715,159 @@ def test_nht_cost_change_while_parked_is_delivered_after_retry():
     assert seen[-1][0] == ('nht',) and seen[-1][1] == 20
     assert dev.node.agents['test'].state == ('cost', 20)
     assert not any(sim.agents._causes.values())
+
+
+# --- review round 4 -----------------------------------------------------------
+
+
+def _round4_cases():
+    from enum import Enum
+    from fractions import Fraction
+
+    @dataclass(frozen=True)
+    class Frozen:
+        value: int
+
+    class Undecorated(Frozen):
+        pass  # inherits frozen params but accepts new attributes
+
+    class SlotFloat(float):
+        __slots__ = ('extra',)
+
+    class SlotStr(str):
+        __slots__ = ('extra',)
+
+    class SlotSet(frozenset):
+        __slots__ = ('extra',)
+
+    class SlotFraction(Fraction):
+        __slots__ = ('extra',)
+
+    class Update(Enum):
+        ANNOUNCEMENT = [1]
+
+    cases = {}
+    for name, cls, seed in (
+        ('float-slot', SlotFloat, 1.0),
+        ('str-slot', SlotStr, 'x'),
+        ('frozenset-slot', SlotSet, (1,)),
+        ('fraction-slot', SlotFraction, 1),
+    ):
+        obj = cls(seed)
+        obj.extra = [1]  # type: ignore[attr-defined]
+        cases[name] = obj
+    sub = Undecorated(1)
+    sub.extra = [1]  # type: ignore[attr-defined]
+    cases['record-subclass'] = sub
+    cases['enum-mutable-value'] = Update.ANNOUNCEMENT
+    return cases
+
+
+@pytest.mark.parametrize(
+    'name',
+    [
+        'float-slot',
+        'str-slot',
+        'frozenset-slot',
+        'fraction-slot',
+        'record-subclass',
+        'enum-mutable-value',
+    ],
+)
+def test_classifier_rejects_storage_carrying_subclasses_and_enum_values(name):
+    """RC4: absence of __dict__ is not immutability; enum values are walked."""
+    from netsim.model.state import validate_admitted, validate_immutable
+
+    value = _round4_cases()[name]
+    with pytest.raises(TypeError):
+        validate_immutable(value)
+    with pytest.raises(TypeError):
+        validate_admitted((value,), None)
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(state=value)),
+    )
+    with pytest.raises(agents.AgentBatchError):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+
+
+def test_classifier_accepts_audited_leaves_records_and_named_tuples():
+    from enum import IntEnum
+    from fractions import Fraction
+    from typing import NamedTuple
+
+    from netsim.model.addressing import MacAddress
+    from netsim.model.state import FloatArray, validate_admitted, validate_immutable
+
+    class Pair(NamedTuple):
+        a: int
+        b: str
+
+    class Kind(IntEnum):
+        ONE = 1
+
+    value = (
+        MacAddress(1),
+        Fraction(1, 3),
+        Pair(1, 'x'),
+        Kind.ONE,
+        FloatArray(bytes(16)),
+        PMap({i: (i,) for i in range(600)}),  # promoted, sharded map
+        frozenset({1, 2}),
+    )
+    validate_immutable(value)
+    validate_admitted(value, None)
+    validate_admitted(value, value)
+
+
+def test_prefix_table_owns_exact_keys_and_masks_and_float_array_exact_bytes():
+    """RC4: keys, masks and array bytes never alias caller subclasses."""
+    from netsim.model.lpm import FrozenPrefixTable, PrefixTable
+    from netsim.model.state import FloatArray, validate_immutable
+
+    class Net(int):
+        pass
+
+    key = Net(0x0A000000)
+    key.notes = [1]  # type: ignore[attr-defined]
+    table = PrefixTable(32)
+    table.insert(key, 8, 'ten')
+    frozen = table.freeze()
+    (net, plen, _) = frozen.items()[0]
+    assert type(net) is int and type(plen) is int
+    validate_immutable(frozen)
+    masks = [0] * 33
+    owned = FrozenPrefixTable(32, {}, masks)  # type: ignore[arg-type]
+    masks[32] = 1
+    assert type(owned._masks) is tuple and owned._masks[32] == 0
+
+    class Blob(bytes):
+        pass
+
+    blob = Blob(bytes(8))
+    blob.notes = [1]  # type: ignore[attr-defined]
+    array = FloatArray(blob)
+    assert type(array._data) is bytes
+    validate_immutable(array)
+
+
+def test_operation_records_reject_slotted_str_subclasses():
+    class Name(str):
+        __slots__ = ('notes',)
+
+    name = Name('t')
+    name.notes = [1]  # type: ignore[attr-defined]
+    sim = fixture(
+        Plugin(c.ClientId('a')),
+        Plugin(
+            c.ClientId('b'),
+            callback=lambda ctx: c.AgentOutput(timers=(c.TimerOp(name, 1.0),)),
+        ),
+    )
+    with pytest.raises(agents.AgentBatchError, match='leaf subclass'):
+        sim.settle()
+    nodes = sim.state.devices['r'].agents
+    assert nodes['a'].runs == 1 and nodes['b'].runs == 0
+    assert sim.agents.budget()['armed_timers'] == 0
