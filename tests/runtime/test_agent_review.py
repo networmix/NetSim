@@ -322,6 +322,7 @@ def test_admission_walks_only_new_subtrees_and_identity_return_is_free():
         return c.AgentOutput(state=step)
 
     sim = fixture(Plugin(callback=callback))
+    sim.network.debug_validate = False  # admission cost without whole-root walks
     sim.settle()
     assert len(reads) == 1001  # validated once, transitively
     reads.clear()
@@ -352,7 +353,7 @@ def test_admission_rejects_nested_mutable_values_without_losing_peer(field):
         Plugin(c.ClientId('a')),
         Plugin(c.ClientId('b'), callback=lambda ctx: c.AgentOutput(**{field: value})),
     )
-    assert not sim.network.debug_validate
+    sim.network.debug_validate = False  # the admission check alone must catch it
     with pytest.raises(agents.AgentBatchError, match='mutable list'):
         sim.settle()
     nodes = sim.state.devices['r'].agents

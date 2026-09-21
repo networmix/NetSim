@@ -13,6 +13,7 @@ import dataclasses
 import os
 from collections.abc import ItemsView, KeysView, ValuesView
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -492,11 +493,13 @@ class FloatArray:
 # Immutability validation
 # ---------------------------------------------------------------------------
 
-_LEAF_TYPES = (int, float, str, bytes, bool, type(None), FloatArray)
+_LEAF_TYPES = (int, float, str, bytes, bool, type(None), FloatArray, Fraction)
 _FORBIDDEN = (list, dict, set, bytearray, memoryview)
 
 
-_LEAF_EXACT = frozenset((int, float, str, bytes, bool, type(None), FloatArray))
+_LEAF_EXACT = frozenset(
+    (int, float, str, bytes, bool, type(None), FloatArray, Fraction)
+)
 
 # Node classes of the immutability walk (fail-closed: anything else raises).
 _LEAF = 0
